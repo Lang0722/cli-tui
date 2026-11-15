@@ -98,6 +98,10 @@ func (c userCell) Lines(width int, st *Styles) []Line {
 		out = append(out, Line{}.Fill(width, band))
 	}
 	src := strings.Split(sanitize(c.text), "\n")
+	if c.images > 0 && strings.TrimSpace(c.text) == "" {
+		src = nil // image-only prompt: just the "[Image #N]" rows
+		out = out[:len(out)-1]
+	}
 	for i, l := range src {
 		f := L(P("  "))
 		if i == 0 {
@@ -174,11 +178,29 @@ type separatorCell struct {
 }
 
 func (c separatorCell) Lines(width int, st *Styles) []Line {
+	now := time.Now()
 	when := c.at.Format("15:04")
-	if y, m, d := c.at.Date(); time.Now().YearDay() != c.at.YearDay() || time.Now().Year() != y {
-		when = fmt.Sprintf("%s %d at %s", m.String()[:3], d, when)
+	switch {
+	case c.at.Year() != now.Year():
+		when = c.at.Format("Jan 2, 2006 at ") + when
+	case c.at.YearDay() != now.YearDay():
+		when = c.at.Format("Jan 2 at ") + when
 	}
-	return []Line{L(P("  "), S("Worked for "+fmtElapsed(c.elapsed)+" • "+when, st.Dim))}
+	return Wrap(L(S("Worked for "+fmtWorked(c.elapsed)+" • "+when, st.Dim)), width, L(P("  ")), L(P("  ")))
+}
+
+// fmtWorked is Codex' separator duration: "<1s", "5s", "2m 5s", "1h 0m 5s".
+func fmtWorked(d time.Duration) string {
+	s := int(d.Seconds())
+	switch {
+	case s >= 3600:
+		return fmt.Sprintf("%dh %dm %ds", s/3600, (s%3600)/60, s%60)
+	case s >= 60:
+		return fmt.Sprintf("%dm %ds", s/60, s%60)
+	case s == 0:
+		return "<1s"
+	}
+	return fmt.Sprintf("%ds", s)
 }
 
 // blankCell inserts nothing but the cell separator (used for spacing).
@@ -197,8 +219,10 @@ func (c planCell) Lines(width int, st *Styles) []Line {
 			done++
 		}
 	}
-	out := []Line{L(S("• ", st.Plain), S("Updated Plan", st.Bold),
-		S(fmt.Sprintf(" · %d/%d complete", done, len(c.update.Plan)), st.Dim))}
+	// Codex' scrollback (full) view; the "· N/M complete" count is only in
+	// its compact fullscreen view.
+	_ = done
+	out := []Line{L(S("• ", st.Plain), S("Updated Plan", st.Bold))}
 	first := true
 	pre := func() Line {
 		if first {
@@ -241,15 +265,21 @@ type toolCell struct {
 	duration time.Duration
 }
 
-func (c *toolCell) Lines(width int, st *Styles) []Line { return c.render(width, st, 5) }
+func (c *toolCell) Lines(width int, st *Styles) []Line { return c.render(width, st, outputPreview) }
 
-func (c *toolCell) TranscriptLines(width int, st *Styles) []Line { return c.render(width, st, 0) }
+func (c *toolCell) TranscriptLines(width int, st *Styles) []Line {
+	return c.render(width, st, outputFull)
+}
 
-// render follows Codex' MCP/dynamic tool cells:
+// render follows Codex' MCP tool cell (history_cell/mcp.rs):
 //
-//   - Calling                 • Called server.tool(args)   • Failed server.tool(args)
-//     └ server.tool(args)       └ result                     └ error
-func (c *toolCell) render(width int, st *Styles, limit int) []Line {
+//   - Calling server.tool(args)        • Called server.tool(args)
+//     └ result (3-row preview)
+//
+// When the invocation doesn't fit after the header it moves to its own
+// "└" row (wrapped at width-4) and the result continues at 4 spaces.
+// Failures keep "Called" with a red bullet and "Error: …" output.
+func (c *toolCell) render(width int, st *Styles, mode outputMode) []Line {
 	name := c.begin.Tool
 	if c.begin.Server != "" {
 		name = c.begin.Server + "." + name
@@ -258,35 +288,50 @@ func (c *toolCell) render(width int, st *Styles, limit int) []Line {
 	if a := strings.TrimSpace(c.begin.Arguments); a != "" {
 		inv = append(inv, S("("+oneLine(a)+")", st.Dim))
 	}
-	if !c.done {
-		bullet := S("• ", st.Dim)
-		if blinkOff() {
-			bullet = S("◦ ", st.Dim)
-		}
-		out := []Line{append(L(bullet), st.Shimmer("Calling")...)}
-		return append(out, Wrap(inv, width, L(S("  └ ", st.Dim)), L(P("    ")))...)
-	}
-	var head Line
+	interrupted := c.isError && c.result == "interrupted"
+	var bullet Span
+	title := "Called"
 	switch {
-	case c.isError && c.result == "interrupted":
-		head = L(S("• ", st.RedB), S("Interrupted ", st.Bold))
+	case !c.done:
+		bullet, title = S("•", st.Dim), "Calling"
+		if blinkOff() {
+			bullet = S("◦", st.Dim)
+		}
 	case c.isError:
-		head = L(S("• ", st.RedB), S("Failed ", st.Bold))
+		bullet = S("•", st.RedB)
+		if interrupted {
+			title = "Interrupted"
+		}
 	default:
-		head = L(S("• ", st.GreenB), S("Called ", st.Bold))
+		bullet = S("•", st.GreenB)
 	}
-	if c.duration > 0 {
-		inv = append(inv, S(" · "+fmtElapsed(c.duration), st.Dim))
+	head := L(bullet, P(" "), S(title, st.Bold), P(" "))
+	var out []Line
+	inline := inv.Width() <= width-head.Width()
+	if inline {
+		out = append(out, append(head, inv...))
+	} else {
+		out = append(out, head[:3])
+		out = append(out, Wrap(inv, max(1, width-4), L(S("  └ ", st.Dim)), L(P("    ")))...)
 	}
-	out := Wrap(append(head, inv...), width, nil, L(P("    ")))
+	if !c.done {
+		return out
+	}
 	res := strings.TrimRight(sanitize(c.result), "\n")
-	if c.isError && c.result == "interrupted" {
+	switch {
+	case interrupted:
 		res = "Interrupted before this tool returned a result."
+	case c.isError:
+		res = "Error: " + res
 	}
 	if res == "" {
-		res = "(no output)"
+		return out
 	}
-	return append(out, outputLines(strings.Split(res, "\n"), width, st, c.isError, limit)...)
+	detail := outputLines(strings.Split(res, "\n"), width, st, c.isError, mode)
+	if !inline && len(detail) > 0 {
+		detail[0] = append(L(P("    ")), detail[0][1:]...) // "    " instead of "  └ "
+	}
+	return append(out, detail...)
 }
 
 func oneLine(s string) string {
@@ -297,38 +342,110 @@ func oneLine(s string) string {
 	return s
 }
 
-// outputLines renders tool/exec output under a "└" elbow. With limit > 0
-// it keeps the first and last limit lines around Codex' ellipsis
-// "… +N lines (⌃t to view transcript)"; limit 0 shows everything.
-func outputLines(lines []string, width int, st *Styles, failed bool, limit int) []Line {
+// outputMode selects how much tool/exec output a cell shows.
+type outputMode int
+
+const (
+	outputFull    outputMode = iota // transcript: everything
+	outputPreview                   // agent commands and tools: first 3 screen rows
+	outputMiddle                    // user "!" commands: 50 screen rows, middle elided
+)
+
+const (
+	previewRows     = 3  // Codex tool_output PREVIEW_LINES
+	userShellRows   = 50 // Codex USER_SHELL_TOOL_CALL_MAX_LINES
+	transcriptHint  = "⌃t to view transcript"
+	maxPreviewBytes = 16 * 1024 // Codex MAX_PREVIEW_LINE_BYTES
+)
+
+// outputLines renders tool/exec output under a "└" elbow, following Codex:
+// limits count wrapped screen rows (not logical lines), so one huge line
+// cannot flood the scrollback.
+//
+//	preview: first 3 rows, then "+N lines (⌃t to view transcript)"
+//	middle:  head and tail rows around "… +N lines (⌃t to view transcript)"
+func outputLines(lines []string, width int, st *Styles, failed bool, mode outputMode) []Line {
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
 	}
-	style := st.Dim
 	if len(lines) == 0 {
 		return []Line{L(S("  └ ", st.Dim), S("(no output)", st.Dim))}
 	}
-	var shown []Line
-	add := func(ls []string) {
-		for _, l := range ls {
-			shown = append(shown, L(S(l, style)))
+	body := max(1, width-4)
+	wrap := func(l string) []Line { return Wrap(L(S(l, st.Dim)), body, nil, nil) }
+	var rows []Line
+	switch mode {
+	case outputPreview:
+		omitted := 0
+		for i, l := range lines {
+			remaining := previewRows - len(rows)
+			if remaining == 0 {
+				omitted += len(lines) - i
+				break
+			}
+			// Bound the input before wrapping (a single line can be huge).
+			if len(l) > maxPreviewBytes {
+				l = l[:maxPreviewBytes]
+			}
+			l = takeWidth(l, body*(remaining+1))
+			w := wrap(l)
+			if len(w) > remaining || len(l) < len(lines[i]) {
+				omitted++ // this line is only partly shown
+				rows = append(rows, w[:min(len(w), remaining)]...)
+				omitted += len(lines) - i - 1
+				break
+			}
+			rows = append(rows, w...)
+		}
+		if omitted > 0 {
+			rows = append(rows, L(S(fmt.Sprintf("+%d %s (%s)", omitted, pluralWord(omitted, "line"), transcriptHint), st.Dim)).Truncate(body))
+		}
+	case outputMiddle:
+		per := make([][]Line, len(lines))
+		total := 0
+		for i, l := range lines {
+			per[i] = wrap(l)
+			total += len(per[i])
+		}
+		if total <= userShellRows {
+			for _, w := range per {
+				rows = append(rows, w...)
+			}
+			break
+		}
+		avail := userShellRows - 1 // one row for the ellipsis
+		headBudget := avail / 2
+		tailBudget := avail - headBudget
+		head, hr := 0, 0
+		for head < len(per) && hr+len(per[head]) <= headBudget {
+			hr += len(per[head])
+			head++
+		}
+		tail, tr := len(per), 0
+		for tail > head && tr+len(per[tail-1]) <= tailBudget {
+			tr += len(per[tail-1])
+			tail--
+		}
+		for _, w := range per[:head] {
+			rows = append(rows, w...)
+		}
+		n := tail - head
+		rows = append(rows, L(S(fmt.Sprintf("… +%d %s (%s)", n, pluralWord(n, "line"), transcriptHint), st.Dim)).Truncate(body))
+		for _, w := range per[tail:] {
+			rows = append(rows, w...)
+		}
+	default:
+		for _, l := range lines {
+			rows = append(rows, wrap(l)...)
 		}
 	}
-	if limit > 0 && len(lines) > 2*limit {
-		add(lines[:limit])
-		n := len(lines) - 2*limit
-		shown = append(shown, L(S(fmt.Sprintf("… +%d %s (⌃t to view transcript)", n, pluralWord(n, "line")), st.Dim)))
-		add(lines[len(lines)-limit:])
-	} else {
-		add(lines)
-	}
-	var out []Line
-	for i, l := range shown {
-		f := L(P("    "))
+	out := make([]Line, 0, len(rows))
+	for i, r := range rows {
+		pre := L(P("    "))
 		if i == 0 {
-			f = L(S("  └ ", st.Dim))
+			pre = L(S("  └ ", st.Dim))
 		}
-		out = append(out, Wrap(l, width, f, L(P("    ")))...)
+		out = append(out, append(pre, r...))
 	}
 	return out
 }

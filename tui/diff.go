@@ -187,14 +187,12 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 		out = append(out, append(head, counts(st, tadd, tdel)...))
 	}
 
-	numW := 1
-	for _, f := range files {
+	budget := maxRows
+	for i, f := range files {
+		numW := 1 // gutter width is per file, like Codex
 		for _, r := range f.rows {
 			numW = max(numW, len(strconv.Itoa(r.num)))
 		}
-	}
-	budget := maxRows
-	for i, f := range files {
 		indent := "    "
 		if !single {
 			if i > 0 {
@@ -215,7 +213,8 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 			}
 			budget--
 			if r.kind == 0 {
-				out = append(out, L(P(indent), S(strings.Repeat(" ", numW-1)+"⋮", st.Dim)))
+				// Codex puts the hunk gap marker in the sign column.
+				out = append(out, L(P(indent), S(strings.Repeat(" ", numW+1)+"⋮", st.Dim)))
 				continue
 			}
 			num := fmt.Sprintf("%*d ", numW, r.num)
@@ -254,7 +253,7 @@ func diffLine(r diffRow, num, indent string, numW int, lexer chroma.Lexer, width
 	}
 	first := L(P(indent), S(num, st.Dim), sign)
 	rest := L(P(indent + strings.Repeat(" ", numW+2)))
-	rows := Wrap(body, width, first, rest)
+	rows := WrapChars(body, width, first, rest) // Codex hard-wraps diff lines
 	if tinted {
 		for i := range rows {
 			rows[i] = rows[i].Fill(width, tint)
@@ -283,5 +282,5 @@ func (c patchFailedCell) Lines(width int, st *Styles) []Line {
 		msg = "(error details unavailable)"
 	}
 	out := []Line{L(S("✘ ", st.RedB), S("Failed to apply patch", st.Red))}
-	return append(out, outputLines(strings.Split(msg, "\n"), width, st, true, toolCallMaxLines)...)
+	return append(out, outputLines(strings.Split(msg, "\n"), width, st, true, outputPreview)...)
 }

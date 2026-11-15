@@ -92,16 +92,23 @@ func (v *selectionView) Lines(width, maxH int, st *Styles) []Line {
 		if isCur {
 			l = append(l, S(" (current)", st.Dim))
 		}
-		if desc != "" {
-			l = append(l, P(pad), S(desc, st.Dim))
+		if desc == "" {
+			out = append(out, l.Truncate(width))
+			continue
 		}
-		out = append(out, l.Truncate(width))
+		// Descriptions wrap under their column (Codex list selection).
+		descCol := l.Width() + len(pad)
+		if descCol+10 > width {
+			out = append(out, append(l, P(pad), S(desc, st.Dim)).Truncate(width))
+			continue
+		}
+		out = append(out, Wrap(L(S(desc, st.Dim)), width, append(l, P(pad)), L(P(strings.Repeat(" ", descCol))))...)
 	}
-	hint := L(P("  "), S("enter", st.Bold), S(" select · ", st.Dim), S("esc", st.Bold), S(" back", st.Dim))
+	hint := L(P("  "), S("Press ", st.Dim), S("enter", st.Bold), S(" to confirm or ", st.Dim), S("esc", st.Bold), S(" to go back", st.Dim))
 	if v.searchable() {
 		hint = append(hint, S(" · type to search", st.Dim))
 	}
-	return append(out, Line{}, hint)
+	return append(out, Line{}, Line{}, hint)
 }
 
 type selAction int

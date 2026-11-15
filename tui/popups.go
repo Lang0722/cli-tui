@@ -91,24 +91,31 @@ func (p *slashPopup) Lines(width int, st *Styles) []Line {
 	if len(p.matches) == 0 {
 		return []Line{L(P("  "), S("no matches", st.Dim.Italic(true)))}
 	}
-	nameW := 0
+	nameW := 0 // width of "/name"
 	for _, c := range p.matches {
 		nameW = max(nameW, strw(c.Name)+1)
 	}
+	descCol := 2 + nameW + 2 // "› " + "/name" + gap
 	start := windowStart(p.selected, len(p.matches), popupRows)
 	var out []Line
 	for i := start; i < min(len(p.matches), start+popupRows); i++ {
 		c := p.matches[i]
-		pad := strings.Repeat(" ", nameW-strw(c.Name))
+		pad := strings.Repeat(" ", nameW-strw(c.Name)-1+2)
 		var l Line
+		descStyle := st.Dim
 		if i == p.selected {
 			l = append(L(S("› ", st.AccentB), S("/", st.AccentB)), highlightMatch(c.Name, p.query, st.AccentB.Underline(true), st.AccentB)...)
-			l = append(l, P(pad+"  "), S(c.Description, st.Accent))
+			descStyle = st.Accent
 		} else {
 			l = append(L(P("  "), S("/", st.Plain)), highlightMatch(c.Name, p.query, st.Bold, st.Plain)...)
-			l = append(l, P(pad+"  "), S(c.Description, st.Dim))
 		}
-		out = append(out, l.Truncate(width))
+		// Codex wraps long descriptions under the description column.
+		l = append(l, P(pad))
+		if descCol+8 > width {
+			out = append(out, append(l, S(c.Description, descStyle)).Truncate(width))
+			continue
+		}
+		out = append(out, Wrap(L(S(c.Description, descStyle)), width, l, L(P(strings.Repeat(" ", descCol))))...)
 	}
 	return out
 }

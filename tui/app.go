@@ -906,7 +906,7 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			// Interrupt, and arm quit in case the backend never answers.
 			m.submit(protocol.Interrupt{})
 			m.ctrlCArmed = time.Now().Add(2 * time.Second)
-			m.hint, m.hintUntil = "ctrl + c again to quit", m.ctrlCArmed
+			m.hint, m.hintUntil = "⌃c again to quit", m.ctrlCArmed
 		default:
 			m.ctrlCArmed = time.Now().Add(2 * time.Second)
 			m.hint, m.hintUntil = "ctrl + c again to quit", m.ctrlCArmed
@@ -918,7 +918,7 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 				return m.quit()
 			}
 			m.ctrlCArmed = time.Now().Add(2 * time.Second)
-			m.hint, m.hintUntil = "ctrl + d again to quit", m.ctrlCArmed
+			m.hint, m.hintUntil = "⌃d again to quit", m.ctrlCArmed
 			return nil
 		}
 	case "esc":
@@ -1404,7 +1404,7 @@ func (m *model) statusLines(w int) []Line {
 	l = append(l, S(" ("+fmtElapsed(time.Since(m.turnStart))+" • ", st.Dim), S("esc", st.Dim.Bold(true)), S(" to interrupt)", st.Dim))
 	out := []Line{{}, l.Truncate(w)}
 	if m.statusDetail != "" {
-		out = append(out, L(S("  └ ", st.Dim), S(m.statusDetail, st.Dim)).Truncate(w))
+		out = append(out, Wrap(L(S(sanitize(m.statusDetail), st.Dim)), w, L(S("  └ ", st.Dim)), L(P("    ")))...)
 	}
 	return out
 }
@@ -1417,11 +1417,23 @@ func (m *model) queuedLines(w int) []Line {
 	st := m.st
 	out := []Line{{}, L(S("• ", st.Dim), S("Queued follow-up inputs", st.Plain))}
 	for _, q := range m.queued {
-		first := strings.SplitN(q.text, "\n", 2)[0]
+		text := sanitize(q.text)
 		if len(q.images) > 0 {
-			first = fmt.Sprintf("[%d image(s)] %s", len(q.images), first)
+			text = fmt.Sprintf("[%d image(s)] %s", len(q.images), text)
 		}
-		out = append(out, L(S("  ↳ ", st.Dim), S(first, st.Dim.Italic(true))).Truncate(w))
+		// Codex wraps each message and shows up to 3 rows, then "…".
+		var rows []Line
+		for i, l := range strings.Split(text, "\n") {
+			f := L(P("    "))
+			if i == 0 {
+				f = L(S("  ↳ ", st.Dim))
+			}
+			rows = append(rows, Wrap(L(S(l, st.Dim.Italic(true))), w, f, L(P("    ")))...)
+		}
+		if len(rows) > 3 {
+			rows = append(rows[:3], L(P("    "), S("…", st.Dim)))
+		}
+		out = append(out, rows...)
 	}
 	out = append(out, L(P("    "), S("⇧←", st.Bold), S(" edit last queued message", st.Dim)))
 	return out
@@ -1445,6 +1457,8 @@ func (m *model) footerLine(w int) Line {
 		left = L(P("  "), S("Shell mode", st.Accent), d(" · "), k("esc"), d(" to exit"))
 	case m.running && !m.composer.Empty():
 		left = L(P("  "), k("tab"), d(" to queue message"))
+	case m.shortcuts:
+		left = L(P("  "), k("?"), d(" / "), k("esc"), d(" close"))
 	case m.composer.Empty():
 		left = L(P("  "), k("?"), d(" for shortcuts"))
 	default:
@@ -1490,7 +1504,7 @@ func (m *model) shortcutLines(w int) []Line {
 		items [][2]string
 	}{
 		{"Compose", [][2]string{{"/", "Commands"}, {"@", "Mention files"}, {"!", "Shell command"}, {newline, "New line"},
-			{"⌃v", "Paste image"}, {"⌃g", "External editor"}, {"⌃r", "Search history"}, {"esc esc", "Edit previous message"}}},
+			{"⌃v", "Paste image"}, {"⌃g", "External editor"}, {"⌃r", "Search history"}, {"esc esc", "Edit last message"}}},
 		{"Session", [][2]string{{"tab", tab}, {"⇧←", "Edit queued message"}, {"esc", "Interrupt"}, {"⌃c", ctrlc}, {"⌃o", "Copy last response"}, {"⌃l", "Clear screen"}, {"⌃z", "Suspend"}}},
 		{"Transcript", [][2]string{{"⌃t", "Open transcript"}, {"/", "Find (in transcript)"}, {"pgup / pgdn", "Scroll"}, {"home / end", "Top / latest"}}},
 	}
@@ -1514,40 +1528,65 @@ func (m *model) shortcutLines(w int) []Line {
 		}
 	}
 	out := []Line{{}, L(P("  "), S("Keyboard shortcuts", st.Bold)), {}}
-	perRow := len(groups)
-	for perRow > 1 {
-		t := 2
-		for g := 0; g < perRow; g++ {
-			t += colW[g] + 4
+	// Lay groups out in as many columns as fit (3, 2 or 1); with fewer
+	// columns the remaining groups stack in the last one, like Codex.
+	stack := func(gs []int) []Line {
+		var col []Line
+		for k, g := range gs {
+			if k > 0 {
+				col = append(col, Line{})
+			}
+			col = append(col, cols[g]...)
 		}
-		if t <= w {
+		return col
+	}
+	layout := func(n int) [][]Line {
+		var res [][]Line
+		for c := 0; c < n-1; c++ {
+			res = append(res, cols[c])
+		}
+		var rest []int
+		for g := n - 1; g < len(groups); g++ {
+			rest = append(rest, g)
+		}
+		return append(res, stack(rest))
+	}
+	var columns [][]Line
+	for n := len(groups); n >= 1; n-- {
+		columns = layout(n)
+		t := 2
+		for _, c := range columns {
+			cw := 0
+			for _, l := range c {
+				cw = max(cw, l.Width())
+			}
+			t += cw + 4
+		}
+		if t <= w || n == 1 {
 			break
 		}
-		perRow--
 	}
-	for start := 0; start < len(groups); start += perRow {
-		end := min(len(groups), start+perRow)
-		h := 0
-		for g := start; g < end; g++ {
-			h = max(h, len(cols[g]))
+	widths := make([]int, len(columns))
+	h := 0
+	for c, col := range columns {
+		for _, l := range col {
+			widths[c] = max(widths[c], l.Width())
 		}
-		for r := 0; r < h; r++ {
-			l := L(P("  "))
-			for g := start; g < end; g++ {
-				var part Line
-				if r < len(cols[g]) {
-					part = cols[g][r]
-				}
-				l = append(l, part...)
-				if g < end-1 {
-					l = append(l, P(strings.Repeat(" ", colW[g]-part.Width()+4)))
-				}
+		h = max(h, len(col))
+	}
+	for r := 0; r < h; r++ {
+		l := L(P("  "))
+		for c, col := range columns {
+			var part Line
+			if r < len(col) {
+				part = col[r]
 			}
-			out = append(out, l.Truncate(w))
+			l = append(l, part...)
+			if c < len(columns)-1 {
+				l = append(l, P(strings.Repeat(" ", widths[c]-part.Width()+4)))
+			}
 		}
-		if end < len(groups) {
-			out = append(out, Line{})
-		}
+		out = append(out, l.Truncate(w))
 	}
 	return out
 }

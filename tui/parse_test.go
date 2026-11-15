@@ -208,7 +208,7 @@ func TestMarkdownTable(t *testing.T) {
 	st := newStyles()
 	src := "| Task | Status |\n|---|---|\n| Parse | done |\n| Test | `wip` |"
 	got := plainMD(RenderMarkdown(src, st, 80))
-	want := []string{" Task    Status", "━━━━━━  ━━━━━━━", " Parse   done", "──────  ───────", " Test    wip"}
+	want := []string{" Task     Status", "━━━━━━━  ━━━━━━━━", " Parse    done", "───────  ────────", " Test     wip"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("table:\n got %q\nwant %q", got, want)
 	}
@@ -244,7 +244,7 @@ func TestCodeHighlight(t *testing.T) {
 
 func TestNotATable(t *testing.T) {
 	got := plainMD(RenderMarkdown("a | b\n---", newStyles(), 80))
-	if len(got) != 2 || got[1] != "———" {
+	if len(got) != 3 || got[2] != "———" {
 		t.Errorf("pipe line + rule became a table: %q", got)
 	}
 }
@@ -300,5 +300,50 @@ func TestMiddleTruncate(t *testing.T) {
 	got := middleTruncate("src/shared/components/parser_alpha.rs", 24)
 	if strw(got) > 24 || !strings.HasSuffix(got, "/parser_alpha.rs") || !strings.Contains(got, "…") {
 		t.Errorf("middleTruncate = %q", got)
+	}
+}
+
+func TestMarkdownFidelityRound2(t *testing.T) {
+	st := newStyles()
+	got := plainMD(RenderMarkdown("# Title\nIntro text\nSummary:\n- item\n## Next\n> quote\n> - in list\nlazy line\n\n> Level 1\n> > Level 2", st, 80))
+	want := []string{"# Title", "", "Intro text", "Summary:", "", "• item", "", "## Next", "", "> quote", ">", "> • in list", ">   lazy line", "", "> Level 1", ">", "> > Level 2"}
+	g := strings.Join(got, "|")
+	g = strings.ReplaceAll(g, "> |", ">|")
+	if g != strings.Join(want, "|") {
+		t.Errorf("blocks:\n got %q\nwant %q", got, want)
+	}
+	inl := map[string]string{
+		"see <https://x.io/a> now":        "see https://x.io/a now",
+		`[hover me](https://x.io "Ex")`:   "hover me",
+		"![alt text](https://x.io/i.png)": "alt text",
+	}
+	for in, want := range inl {
+		if got := inline(in, st.Plain, st).Plain(); got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+	// aligned table
+	tb := plainMD(RenderMarkdown("| a | b | c |\n|:-|:-:|-:|\n| 1 | 2 | 3 |", st, 80))
+	if tb[2] != " 1       2       3" { // '2' centered at col 9, '3' right-aligned at col 17
+
+		t.Errorf("alignment row %q", tb[2])
+	}
+}
+
+func TestWrapCharsWidth(t *testing.T) {
+	for _, in := range []string{"aaaa bbbb cccc", "漢字漢字漢字漢字", "a漢b字c漢"} {
+		for w := 4; w < 12; w++ { // prefix 2 + room for one wide char
+			rows := WrapChars(L(P(in)), w, L(P("  ")), L(P("  ")))
+			got := ""
+			for _, r := range rows {
+				if r.Width() > w {
+					t.Errorf("%q w=%d row %q too wide", in, w, r.Plain())
+				}
+				got += strings.TrimPrefix(r.Plain(), "  ")
+			}
+			if got != in {
+				t.Errorf("%q w=%d lost text: %q", in, w, got)
+			}
+		}
 	}
 }

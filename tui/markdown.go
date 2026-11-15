@@ -15,6 +15,7 @@ type mdLine struct {
 	Line  Line
 	Hang  Line
 	Fixed bool
+	Keep  bool // never trimmed (blank rows inside code blocks)
 }
 
 var (
@@ -30,20 +31,34 @@ var (
 )
 
 // RenderMarkdown converts markdown source into styled rows for a body of
-// the given width (tables are laid out to fit it). Rendering is
+// the given width (tables are laid out to fit it). Like Codex, one blank
+// row separates block elements (heading, paragraph, list, quote, rule,
+// code, table) whether or not the source had one. Rendering is
 // forward-only except for tables, which streaming holds back until they are
 // complete (see tableHoldback), so rows for a prefix of the source stay
 // stable as more text arrives.
 func RenderMarkdown(src string, st *Styles, width int) []mdLine {
-	src = sanitize(src)
-	lines := strings.Split(src, "\n")
+	return renderBlocks(strings.Split(sanitize(src), "\n"), st, width)
+}
+
+func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 	var out []mdLine
-	prevBlank := true
-	// list nesting: source indents of the open list levels
-	var listIndents []int
+	last := ""            // kind of the previous block
+	sawBlank := false     // a blank source line since the previous block
+	var listIndents []int // source indents of the open list levels
+
+	// start begins a new block of kind k, inserting the separator row.
+	start := func(k string) {
+		if last != "" && len(out) > 0 && (len(out[len(out)-1].Line) > 0 || out[len(out)-1].Fixed) {
+			out = append(out, mdLine{})
+		}
+		last, sawBlank = k, false
+	}
 
 	for i := 0; i < len(lines); i++ {
 		raw := lines[i]
+		trimmed := strings.TrimSpace(raw)
+
 		if m := reFence.FindStringSubmatch(raw); m != nil && !(m[1][0] == '`' && strings.Contains(raw[strings.Index(raw, m[1])+len(m[1]):], "`")) {
 			// (a backtick fence's info string can't contain backticks, so
 			// "```js``` is inline code" is a paragraph, not a fence)
@@ -56,44 +71,82 @@ func RenderMarkdown(src string, st *Styles, width int) []mdLine {
 				}
 				code = append(code, lines[j])
 			}
+			start("code")
+			listIndents = listIndents[:0]
+			if len(code) == 0 {
+				i = j
+				continue // empty (or just opened, while streaming) fence
+			}
 			for _, l := range highlightLines(strings.Join(code, "\n"), lexerFor(lang, ""), st.Code, st) {
-				out = append(out, mdLine{Line: l})
+				out = append(out, mdLine{Line: l, Keep: true})
 			}
 			i = j // skip the closing fence (or run to the end while streaming)
-			prevBlank = false
 			continue
 		}
-		trimmed := strings.TrimSpace(raw)
 		if trimmed == "" {
-			if !prevBlank {
-				out = append(out, mdLine{})
-			}
-			prevBlank = true
+			sawBlank = true
 			continue
 		}
-		prevBlank = false
 
-		// Table: a row with pipes followed by a delimiter row.
+		// Blockquote: consecutive ">" lines plus lazy continuation lines,
+		// rendered recursively and prefixed with "> " (Codex nests "> > ").
+		if strings.HasPrefix(trimmed, ">") {
+			var inner []string
+			j := i
+			for ; j < len(lines); j++ {
+				t := strings.TrimSpace(lines[j])
+				if strings.HasPrefix(t, ">") {
+					t = strings.TrimPrefix(t, ">")
+					t = strings.TrimPrefix(t, " ")
+					inner = append(inner, t)
+					continue
+				}
+				// lazy continuation: plain text right after quoted text
+				if t != "" && len(inner) > 0 && strings.TrimSpace(inner[len(inner)-1]) != "" &&
+					!reBullet.MatchString(lines[j]) && !reOrdered.MatchString(lines[j]) && !reHeading.MatchString(t) && reFence.FindStringIndex(lines[j]) == nil {
+					inner = append(inner, t)
+					continue
+				}
+				break
+			}
+			start("quote")
+			listIndents = listIndents[:0]
+			q := st.Green
+			for _, r := range renderBlocks(inner, st, max(1, width-2)) {
+				line := append(L(S("> ", q)), r.Line...)
+				hang := append(L(S("> ", q)), r.Hang...)
+				out = append(out, mdLine{Line: line, Hang: hang, Fixed: r.Fixed, Keep: r.Keep || len(r.Line) == 0})
+			}
+			i = j - 1
+			continue
+		}
+
+		// Table: a row with pipes followed by a delimiter row with the same
+		// number of cells.
 		if strings.Contains(raw, "|") && i+1 < len(lines) && reTableSep.MatchString(lines[i+1]) &&
 			len(splitRow(lines[i+1])) == len(splitRow(raw)) {
+			aligns := parseAligns(lines[i+1])
 			j := i + 2
 			rows := [][]string{splitRow(raw)}
 			for ; j < len(lines) && strings.Contains(lines[j], "|") && strings.TrimSpace(lines[j]) != ""; j++ {
 				rows = append(rows, splitRow(lines[j]))
 			}
-			out = append(out, renderTable(rows, width, st)...)
+			start("table")
+			listIndents = listIndents[:0]
+			out = append(out, renderTable(rows, aligns, width, st)...)
 			i = j - 1
 			continue
 		}
 
 		isList := reBullet.MatchString(raw) || reOrdered.MatchString(raw)
-		if !isList {
-			listIndents = listIndents[:0]
-		}
 		switch {
-		case reRule.MatchString(raw) && !reBullet.MatchString(raw):
+		case reRule.MatchString(raw) && !isList:
+			start("rule")
+			listIndents = listIndents[:0]
 			out = append(out, mdLine{Line: L(S("———", st.Dim))})
 		case reHeading.MatchString(trimmed):
+			start("heading")
+			listIndents = listIndents[:0]
 			m := reHeading.FindStringSubmatch(trimmed)
 			hs := st.Bold
 			if len(m[1]) == 1 {
@@ -102,13 +155,11 @@ func RenderMarkdown(src string, st *Styles, width int) []mdLine {
 			l := L(S(m[1]+" ", hs))
 			l = append(l, inline(m[2], hs, st)...)
 			out = append(out, mdLine{Line: l})
-		case reQuote.MatchString(raw) && strings.HasPrefix(trimmed, ">"):
-			m := reQuote.FindStringSubmatch(raw)
-			depth := strings.Count(m[1], ">")
-			pre := strings.Repeat("> ", depth)
-			q := st.Green
-			out = append(out, mdLine{Line: append(L(S(pre, q)), inline(strings.TrimSpace(m[2]), q, st)...), Hang: L(S(pre, q))})
 		case isList:
+			if last != "list" || sawBlank && len(listIndents) == 0 {
+				start("list")
+			}
+			last, sawBlank = "list", false
 			var indentSrc int
 			var marker, body string
 			markerStyle := st.Plain
@@ -141,15 +192,31 @@ func RenderMarkdown(src string, st *Styles, width int) []mdLine {
 			pre := L(P(indent), S(marker, markerStyle))
 			out = append(out, mdLine{Line: append(pre, inline(body, bodyStyle, st)...), Hang: L(P(indent + strings.Repeat(" ", strw(marker))))})
 		default:
+			// Paragraph text. A line right after a list item (no blank) is
+			// a lazy continuation of that item; after a blank line an
+			// indented paragraph continues the item, otherwise the list ends.
 			lead := raw[:len(raw)-len(strings.TrimLeft(raw, " "))]
-			if len(listIndents) > 0 {
-				lead = "" // paragraph continuation inside a list item
+			hang := L(P(lead))
+			switch {
+			case last == "list" && (!sawBlank || len(lead) >= 2):
+				n := len(listIndents)
+				lead = strings.Repeat(" ", 4*(n-1)+2)
+				hang = L(P(lead))
+				if sawBlank {
+					out = append(out, mdLine{})
+				}
+				sawBlank = false
+			case last == "para" && !sawBlank:
+				// soft break inside the same paragraph
+			default:
+				start("para")
+				listIndents = listIndents[:0]
 			}
 			l := L(P(lead))
-			out = append(out, mdLine{Line: append(l, inline(trimmed, st.Plain, st)...), Hang: L(P(lead))})
+			out = append(out, mdLine{Line: append(l, inline(trimmed, st.Plain, st)...), Hang: hang})
 		}
 	}
-	for len(out) > 0 && len(out[len(out)-1].Line) == 0 && !out[len(out)-1].Fixed {
+	for len(out) > 0 && len(out[len(out)-1].Line) == 0 && !out[len(out)-1].Fixed && !out[len(out)-1].Keep {
 		out = out[:len(out)-1]
 	}
 	return out
@@ -192,11 +259,28 @@ func splitRow(line string) []string {
 	return append(cells, strings.TrimSpace(cur.String()))
 }
 
+func parseAligns(sep string) []byte {
+	var out []byte
+	for _, c := range splitRow(sep) {
+		c = strings.TrimSpace(c)
+		switch {
+		case strings.HasPrefix(c, ":") && strings.HasSuffix(c, ":"):
+			out = append(out, 'c')
+		case strings.HasSuffix(c, ":"):
+			out = append(out, 'r')
+		default:
+			out = append(out, 'l')
+		}
+	}
+	return out
+}
+
 // renderTable lays a pipe table out like Codex: header cells bold in the
-// accent color, "━" under each column, "─" between rows, two spaces between
-// columns, a leading space in each cell. If the columns cannot get a
-// usable width, rows become key/value records separated by "─" rules.
-func renderTable(rows [][]string, width int, st *Styles) []mdLine {
+// accent color, "━" under each column, "─" between rows, two spaces
+// between columns, one space of padding on both sides of each cell (content
+// at least 3 wide), GFM alignment. When the columns can't fit without
+// breaking words, rows become key/value records instead.
+func renderTable(rows [][]string, aligns []byte, width int, st *Styles) []mdLine {
 	ncol := 0
 	for _, r := range rows {
 		ncol = max(ncol, len(r))
@@ -207,35 +291,49 @@ func renderTable(rows [][]string, width int, st *Styles) []mdLine {
 		}
 		return nil
 	}
-	natural := make([]int, ncol)
+	const gap, pad, minContent = 2, 2, 3
+	natural := make([]int, ncol) // content widths
+	minimum := make([]int, ncol) // longest word, so words never break
 	for _, r := range rows {
 		for c := 0; c < ncol; c++ {
-			natural[c] = max(natural[c], cell(r, c).Width()+1, 2)
+			l := cell(r, c)
+			natural[c] = max(natural[c], l.Width(), minContent)
+			for _, w := range strings.Fields(l.Plain()) {
+				minimum[c] = max(minimum[c], min(strw(w), 24))
+			}
+			minimum[c] = max(minimum[c], minContent)
 		}
 	}
-	const gap, minCol = 2, 7
 	total := func(ws []int) int {
 		t := gap * (ncol - 1)
 		for _, w := range ws {
-			t += w
+			t += w + pad
 		}
 		return t
 	}
 	ws := append([]int(nil), natural...)
+	if total(minimum) > width {
+		return renderRecords(rows, ncol, width, st)
+	}
 	for total(ws) > width {
-		// Shrink the widest column first.
-		wi := 0
+		wi := -1
 		for c := range ws {
-			if ws[c] > ws[wi] {
+			if ws[c] > minimum[c] && (wi < 0 || ws[c] > ws[wi]) {
 				wi = c
 			}
 		}
-		if ws[wi] <= minCol {
+		if wi < 0 {
 			return renderRecords(rows, ncol, width, st)
 		}
 		ws[wi]--
 	}
 
+	align := func(c int) byte {
+		if c < len(aligns) {
+			return aligns[c]
+		}
+		return 'l'
+	}
 	var out []mdLine
 	emitRow := func(r []string, header bool) {
 		cols := make([][]Line, ncol)
@@ -247,7 +345,7 @@ func renderTable(rows [][]string, width int, st *Styles) []mdLine {
 					content[k].Style = content[k].Style.Inherit(st.AccentB)
 				}
 			}
-			cols[c] = Wrap(content, ws[c], L(P(" ")), L(P(" ")))
+			cols[c] = Wrap(content, ws[c], nil, nil)
 			h = max(h, len(cols[c]))
 		}
 		for k := 0; k < h; k++ {
@@ -257,10 +355,19 @@ func renderTable(rows [][]string, width int, st *Styles) []mdLine {
 				if k < len(cols[c]) {
 					part = cols[c][k]
 				}
-				if c < ncol-1 {
-					part = append(part, P(strings.Repeat(" ", max(0, ws[c]-part.Width())+gap)))
+				free := max(0, ws[c]-part.Width())
+				left := 0
+				switch align(c) {
+				case 'r':
+					left = free
+				case 'c':
+					left = free / 2
 				}
+				l = append(l, P(" "+strings.Repeat(" ", left)))
 				l = append(l, part...)
+				if c < ncol-1 {
+					l = append(l, P(strings.Repeat(" ", free-left+1+gap)))
+				}
 			}
 			out = append(out, mdLine{Line: l, Fixed: true})
 		}
@@ -268,7 +375,7 @@ func renderTable(rows [][]string, width int, st *Styles) []mdLine {
 	rule := func(ch string) {
 		var parts []string
 		for _, w := range ws {
-			parts = append(parts, strings.Repeat(ch, w))
+			parts = append(parts, strings.Repeat(ch, w+pad))
 		}
 		out = append(out, mdLine{Line: L(S(strings.Join(parts, strings.Repeat(" ", gap)), st.Dim)), Fixed: true})
 	}
@@ -283,11 +390,14 @@ func renderTable(rows [][]string, width int, st *Styles) []mdLine {
 	return out
 }
 
+// renderRecords shows each row as "key  value" lines separated by "─"
+// rules; when even that is too narrow, values go under their keys.
 func renderRecords(rows [][]string, ncol, width int, st *Styles) []mdLine {
 	keyW := 0
 	for c := 0; c < ncol && c < len(rows[0]); c++ {
 		keyW = max(keyW, strw(rows[0][c]))
 	}
+	stacked := keyW+3+12 > width
 	keyW = min(keyW, max(4, width/3))
 	var out []mdLine
 	for i, r := range rows[1:] {
@@ -302,6 +412,13 @@ func renderRecords(rows [][]string, ncol, width int, st *Styles) []mdLine {
 			var val Line
 			if c < len(r) {
 				val = inline(r[c], st.Plain, st)
+			}
+			if stacked {
+				out = append(out, mdLine{Line: L(P(" "), S(key, st.AccentB)).Truncate(width), Fixed: true})
+				for _, row := range Wrap(val, width, L(P("  ")), L(P("  "))) {
+					out = append(out, mdLine{Line: row, Fixed: true})
+				}
+				continue
 			}
 			k := L(P(" "), S(takeWidth(key, keyW)+strings.Repeat(" ", max(0, keyW-strw(key))+2), st.AccentB))
 			for _, row := range Wrap(val, width, k, L(P(strings.Repeat(" ", keyW+3)))) {
@@ -405,6 +522,27 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 			flush()
 			strike = !strike
 			i += 2
+		case c == '<' && (strings.HasPrefix(s[i:], "<http://") || strings.HasPrefix(s[i:], "<https://")):
+			// CommonMark autolink <https://...>
+			if end := strings.IndexByte(s[i:], '>'); end > 0 && !strings.ContainsAny(s[i:i+end], " \t") {
+				flush()
+				url := s[i+1 : i+end]
+				out = append(out, S(url, st.Link.Inherit(cur()).Hyperlink(url)))
+				i += end + 1
+				continue
+			}
+			buf.WriteByte(c)
+			i++
+		case c == '!' && i+1 < len(s) && s[i+1] == '[':
+			// Image: Codex shows the alt text.
+			if alt, _, n, ok := parseLink(s[i+1:]); ok {
+				flush()
+				out = append(out, inline(alt, cur(), st)...)
+				i += 1 + n
+				continue
+			}
+			buf.WriteByte(c)
+			i++
 		case c == '[':
 			if label, url, n, ok := parseLink(s[i:]); ok {
 				flush()
@@ -478,9 +616,18 @@ func parseLink(s string) (label, url string, n int, ok bool) {
 			depth--
 			if depth == 0 {
 				url = strings.TrimSpace(s[end+2 : j])
-				if url == "" || strings.ContainsAny(url, " \t") {
+				// Optional title: [label](url "title") / 'title' / (title).
+				if k := strings.IndexAny(url, " \t"); k > 0 {
+					title := strings.TrimSpace(url[k:])
+					if len(title) < 2 || !strings.ContainsRune(`"'(`, rune(title[0])) {
+						return "", "", 0, false
+					}
+					url = url[:k]
+				}
+				if url == "" {
 					return "", "", 0, false
 				}
+				url = strings.Trim(url, "<>")
 				return s[1:end], url, j + 1, true
 			}
 		}

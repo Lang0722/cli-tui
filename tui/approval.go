@@ -38,13 +38,15 @@ func newExecApproval(ev protocol.ExecApprovalRequest, agent string) *approval {
 	if strw(short) > 50 {
 		short = takeWidth(short, 49) + "…"
 	}
+	opts := []approvalOption{{"Yes, proceed", "y", protocol.DecisionApproved}}
+	if !strings.Contains(cmd, "\n") {
+		// Codex hides the prefix rule for multi-line commands.
+		opts = append(opts, approvalOption{"Yes, and don't ask again for commands that start with `" + short + "`", "p", protocol.DecisionApprovedForSession})
+	}
+	opts = append(opts, approvalOption{"No, and tell " + agent + " what to do differently", "esc", protocol.DecisionAbort})
 	return &approval{
 		kind: approveExec, callID: ev.CallID, command: ev.Command, cwd: ev.Cwd, reason: ev.Reason,
-		options: []approvalOption{
-			{"Yes, proceed", "y", protocol.DecisionApproved},
-			{"Yes, and don't ask again for commands that start with `" + short + "`", "p", protocol.DecisionApprovedForSession},
-			{"No, and tell " + agent + " what to do differently", "esc", protocol.DecisionAbort},
-		},
+		options: opts,
 	}
 }
 
@@ -102,18 +104,19 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 		body = append(body[:bodyBudget-1], L(P("    "), S("[… "+itoa(extra)+" lines] ", st.Dim), S("⌃a", st.Bold), S(" view all", st.Dim)))
 	}
 	out = append(out, body...)
-	out = append(out, Line{})
+	out = append(out, Line{}, Line{}) // Codex: two rows before the options
 
 	for i, o := range a.options {
 		num := itoa(i+1) + ". "
 		key := S(" ("+o.key+")", st.Dim)
 		var l Line
 		if i == a.selected {
-			l = L(S("› ", st.AccentB), S(num+o.label, st.AccentB), key)
+			l = L(S(num+o.label, st.AccentB), key)
+			out = append(out, Wrap(l, width, L(S("› ", st.AccentB)), L(P(strings.Repeat(" ", 2+len(num)))))...)
 		} else {
-			l = L(P("  "), S(num, st.Dim), S(o.label, st.Plain), key)
+			l = L(S(num, st.Dim), S(o.label, st.Plain), key)
+			out = append(out, Wrap(l, width, L(P("  ")), L(P(strings.Repeat(" ", 2+len(num)))))...)
 		}
-		out = append(out, l.Truncate(width))
 	}
 	out = append(out, Line{}, L(P("  "), S("Press ", st.Dim), S("enter", st.Bold), S(" to confirm or ", st.Dim), S("esc", st.Bold), S(" to cancel", st.Dim)))
 	return out
@@ -124,11 +127,11 @@ func (a *approval) body(width int, cwd string, st *Styles) []Line {
 	var body []Line
 	if a.kind == approveExec {
 		for i, l := range strings.Split(displayCommand(a.command), "\n") {
-			pre := L(P("    "))
+			pre := L(P("  ")) // Codex continues multi-line commands at 2 spaces
 			if i == 0 {
 				pre = L(P("  "), S("$ ", st.Dim))
 			}
-			body = append(body, Wrap(highlightShell(l, st), width, pre, L(P("    ")))...)
+			body = append(body, Wrap(highlightShell(l, st), width, pre, L(P("  ")))...)
 		}
 		if a.cwd != "" && a.cwd != cwd {
 			body = append(body, L(P("  "), S("in "+tildePath(a.cwd), st.Dim)))

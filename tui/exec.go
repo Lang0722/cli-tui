@@ -92,12 +92,17 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 	out := []Line{head}
 
 	type row struct {
-		label string
-		body  string
-		exit  Line
+		label    string
+		body     string
+		exit     Line
+		readOnly bool // came from a call that only reads files
 	}
 	var rows []row
 	for _, x := range c.calls {
+		readOnly := true
+		for _, p := range x.parsed {
+			readOnly = readOnly && p.Kind == protocol.CmdRead
+		}
 		for _, p := range x.parsed {
 			switch p.Kind {
 			case protocol.CmdRead:
@@ -105,20 +110,22 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 				if name == "" {
 					name = p.Cmd
 				}
-				// Merge consecutive reads: "Read a.go, b.go".
-				if n := len(rows); n > 0 && rows[n-1].label == "Read" {
+				// Merge consecutive reads ("Read a.go, b.go") across read-only
+				// calls only, like Codex; a call that also searches lists
+				// each read on its own row.
+				if n := len(rows); n > 0 && rows[n-1].label == "Read" && rows[n-1].readOnly && readOnly {
 					if !strings.Contains(", "+rows[n-1].body+", ", ", "+name+", ") {
 						rows[n-1].body += ", " + name
 					}
 					continue
 				}
-				rows = append(rows, row{"Read", name, nil})
+				rows = append(rows, row{"Read", name, nil, readOnly})
 			case protocol.CmdListFiles:
 				body := p.Path
 				if body == "" {
 					body = p.Cmd
 				}
-				rows = append(rows, row{"List", body, nil})
+				rows = append(rows, row{"List", body, nil, false})
 			case protocol.CmdSearch:
 				body := p.Cmd
 				if p.Query != "" {
@@ -127,7 +134,7 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 						body += " in " + p.Path
 					}
 				}
-				rows = append(rows, row{"Search", body, nil})
+				rows = append(rows, row{"Search", body, nil, false})
 			}
 		}
 		// Codex: " (exit N)" in red; exit 1 from a search just means "no
@@ -137,7 +144,11 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 			if len(x.parsed) == 1 && x.parsed[0].Kind == protocol.CmdSearch && x.exit == 1 {
 				style = st.Dim
 			}
-			rows[len(rows)-1].exit = L(S(fmt.Sprintf(" (exit %d)", x.exit), style))
+			label := fmt.Sprintf(" (exit %d)", x.exit)
+			if len(x.parsed) > 1 {
+				label = fmt.Sprintf(" (command exit %d)", x.exit)
+			}
+			rows[len(rows)-1].exit = L(S(label, style))
 		}
 	}
 	for i, r := range rows {
@@ -178,13 +189,19 @@ func commandLines(x *execCall, width int, st *Styles, detail bool) []Line {
 	}
 	cmdRows := strings.Split(displayCommand(x.command), "\n")
 	const maxContinuation = 2
+	// Codex wraps every piece of the command at the header's width
+	// ("• Ran " = 6 columns) and prefixes continuation rows with "  │ ".
+	header := append(append(Line{}, head...), P(" "))
+	wrapW := max(1, width-header.Width())
 	var cmdLines []Line
-	for i, r := range cmdRows {
-		f := L(S("  │ ", st.Dim))
-		if i == 0 {
-			f = append(append(Line{}, head...), P(" "))
+	for _, r := range cmdRows {
+		for _, piece := range Wrap(highlightShell(r, st), wrapW, nil, nil) {
+			pre := L(S("  │ ", st.Dim))
+			if len(cmdLines) == 0 {
+				pre = header
+			}
+			cmdLines = append(cmdLines, append(append(Line{}, pre...), piece...))
 		}
-		cmdLines = append(cmdLines, Wrap(highlightShell(r, st), width, f, L(S("  │ ", st.Dim)))...)
 	}
 	if !detail && len(cmdLines) > 1+maxContinuation {
 		extra := len(cmdLines) - 1 - maxContinuation
@@ -199,20 +216,15 @@ func commandLines(x *execCall, width int, st *Styles, detail bool) []Line {
 			return out
 		}
 	}
-	limit := toolCallMaxLines
+	mode := outputPreview
 	if x.user {
-		limit = userShellMaxLines
+		mode = outputMiddle
 	}
 	if detail {
-		limit = 0
+		mode = outputFull
 	}
-	return append(out, outputLines(lines, width, st, x.exit != 0, limit)...)
+	return append(out, outputLines(lines, width, st, x.exit != 0, mode)...)
 }
-
-const (
-	toolCallMaxLines  = 5  // Codex TOOL_CALL_MAX_LINES
-	userShellMaxLines = 50 // Codex USER_SHELL_TOOL_CALL_MAX_LINES
-)
 
 func itoa(n int) string {
 	neg := n < 0

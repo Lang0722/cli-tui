@@ -263,3 +263,38 @@ func sanitize(s string) string {
 	}
 	return b.String()
 }
+
+// WrapChars hard-wraps at the character (keeping spaces), as Codex does for
+// diff lines and code, with the same prefix scheme as Wrap.
+func WrapChars(l Line, width int, first, rest Line) []Line {
+	fw, rw := first.Width(), rest.Width()
+	if width-fw < 1 || width-rw < 1 {
+		width = max(fw, rw) + 1
+	}
+	var out []Line
+	cur := append(Line{}, first...)
+	avail := width - fw
+	for _, sp := range l {
+		text := sp.Text
+		for text != "" {
+			if avail <= 0 {
+				out = append(out, cur)
+				cur = append(Line{}, rest...)
+				avail = width - rw
+			}
+			head := takeWidth(text, avail)
+			if head == "" {
+				if avail < width-rw || len(out) == 0 && avail < width-fw {
+					avail = 0 // a wide char doesn't fit: break the row first
+					continue
+				}
+				head, _ = splitWidth(text, avail) // narrower than one char
+			}
+			tail := text[len(head):]
+			cur = append(cur, Span{head, sp.Style})
+			avail -= strw(head)
+			text = tail
+		}
+	}
+	return append(out, cur)
+}

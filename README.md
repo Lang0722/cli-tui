@@ -6,9 +6,10 @@ It is tuned for **gnome-terminal (VTE)** and drives *your* agent loop through
 a small event protocol.
 
 **Scope, honestly:** Codex's TUI is about 335k lines of Rust. This is about
-9k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
+14k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
 streaming, composer, approvals, pickers, transcript pager, resume and
-backtrack. Much of the rest of Codex depends on Codex's own services (login,
+backtrack, the configurable status line and window title, and the remappable
+keymap. Much of the rest of Codex depends on Codex's own services (login,
 model catalog, MCP setup, plugins, voice, cloud tasks, the agents dashboard),
 and that part is out of scope. The [parity table](#parity-with-codex) at the
 end lists each area.
@@ -43,7 +44,9 @@ end lists each area.
     ⇧← edit last queued message
 
 › Ask Agent to do anything
-  ? for shortcuts                                    89% context left
+
+  mock-model medium · ~/cli-tui · please add a timeout
+  ? for shortcuts
 ```
 
 ## Try the demo
@@ -71,8 +74,9 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 
 Then try Ctrl+T (transcript), Esc Esc (rewind to an earlier prompt), Ctrl+R
 (history search), `/export`, and quitting followed by `./agenttui resume -last`.
-Sessions live in `~/.local/share/agenttui/mock-sessions`. Use `-sessions DIR`
-to change that, and `-reset-demo` to restore the demo history.
+Sessions live in `$XDG_DATA_HOME/agenttui/mock-sessions` (by default
+`~/.local/share/agenttui/mock-sessions`). Use `-sessions DIR` to change that,
+and `-reset-demo` to restore the demo history.
 
 ## Run
 
@@ -88,6 +92,7 @@ Other flags:
 - `-notify=false`
 - `-no-reflow`
 - `-log FILE`: backend stderr.
+- `-config FILE`: the settings file (default `$XDG_CONFIG_HOME/agenttui/config.toml`). See [Settings](#settings).
 
 Go 1.26+ is required. Dependencies are vendored, so builds work offline.
 
@@ -109,7 +114,11 @@ tui.Run(ctx, tui.Options{Backend: myLoop})
 
 **Subprocess (any language):** exchange one JSON object per line.
 - Ops go to the agent's stdin, events come back on its stdout.
-- `examples/echo_agent.py` is a complete reference of about 100 lines.
+- `examples/echo_agent.py` is a complete reference of about 200 lines. It
+  streams answers, runs `!` commands with streamed output, honours
+  `interrupt` (killing the command's process group), and handles `rewind`.
+  It keeps no history, so it answers `list_sessions` with an empty list and
+  `resume_session` with an `error`.
 - `backend/mock` shows realistic event ordering, session storage, rewind and pickers.
 
 ```
@@ -128,7 +137,7 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 | `selection_response{id,index,text?}` | answers a `selection_request`; `index` -1 means cancelled or answered with `text` |
 | `rewind{user_message_index}` | Esc Esc then Enter: drop that user message (0-based) and everything after it |
 | `slash_command{name,args}` | backend slash commands (`/new`, `/model`, `/compact`, `/init`, `/review`, …) |
-| `list_sessions` / `resume_session{id}` | resume picker / chosen session (an empty id means the most recent) |
+| `list_sessions` / `resume_session{id}` | resume picker / chosen session (an empty id means the most recent). If the session can't be loaded, send an `error`. |
 | `shutdown` | UI exit |
 
 ### Events (backend → UI)
@@ -138,7 +147,8 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 
 | event | renders as |
 |---|---|
-| `session_configured` | the header box. With `initial_messages` the saved conversation is replayed; set `resumed:true` when answering a resume. |
+| `session_configured` | the header box. Set `resumed:true` when answering a resume, and `title` to name the conversation. `initial_messages` replays a saved conversation: a list of event `msg` objects, e.g. `{"type":"user_message","message":"hi","images":["/tmp/a.png"]}` then `{"type":"agent_message","message":"…"}`, exec, patch, plan and tool events. |
+| `session_title{title}` | renames the conversation (status line and window title `thread-name`) |
 | `agent_message_delta` / `agent_message` | `• …` markdown streamed into scrollback line by line. Tables are held back until complete; dropped deltas are repaired from the final message. |
 | `agent_reasoning_delta` / `agent_reasoning` | the latest `**title**` becomes the status header; the text goes to the Ctrl+T transcript |
 | `exec_command_begin` / `output_delta` / `end` | `• Running` → `• Ran cmd`, with the first and last 5 output lines around `… +N lines (⌃t to view transcript)`. Reads, lists and searches merge into `• Explored`, with `(exit N)` on failures. |
@@ -153,6 +163,10 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `stream_error` | a transient detail line under the status row |
 
 ## Keys
+
+These are the defaults. Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+V / Alt+V and the
+`/` `!` `@` prefixes are fixed; everything else can be remapped with `/keymap`
+(see [Settings](#settings)), and the hints on screen follow your bindings.
 
 | key | action |
 |---|---|
@@ -175,8 +189,62 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 the overlay shows ⇧enter or ⌃j accordingly.
 
 Local slash commands: `/status`, `/diff` (opens a pager), `/transcript`,
-`/resume`, `/copy`, `/export [file]`, `/clear`, `/pwd`, `/mention`, `/quit`.
-All other commands are forwarded to the backend.
+`/resume`, `/copy`, `/export [file]`, `/clear`, `/pwd`, `/mention`,
+`/statusline`, `/title`, `/keymap`, `/quit`. All other commands are forwarded
+to the backend.
+
+**Revert.** With an empty composer, Esc Esc opens the transcript in backtrack
+mode; ←/→ (or h/l) pick an earlier prompt and Enter reverts to it. The UI
+sends `rewind{user_message_index}`, drops that prompt and everything after it
+from the transcript, prints "Conversation reverted to this point. File
+changes are unchanged.", and puts the prompt (with its images) back in the
+composer for editing. Reverting is refused while a turn runs or while steered
+input is pending.
+
+## Settings
+
+`$XDG_CONFIG_HOME/agenttui/config.toml` (or `-config FILE`). `/statusline`,
+`/title` and `/keymap` rewrite it; unknown keys or an invalid keymap stop the
+UI at startup with an error.
+
+```toml
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-remaining"]
+status_line_use_colors = true
+terminal_title = ["activity", "thread-name", "project-name"]
+
+[tui.keymap.global]
+open_transcript = "f5"              # one key
+copy = ["ctrl-o", "leader c"]       # alternatives; "leader" is ctrl-x by default
+
+[tui.keymap.composer]
+toggle_shortcuts = []               # unbind
+```
+
+**Status line and window title** (`/statusline`, `/title`): a picker where
+space toggles an item, ←/→ reorder it, typing searches, and a live preview
+shows the result. Enter saves and Esc cancels. `/statusline model git-branch`
+sets items for this session only (without saving), and `/statusline --clear`
+hides the line.
+Status line items are joined with ` · ` above the footer hint; title items
+are joined with ` | `. Items:
+`model` `model-with-reasoning` `reasoning` `current-dir` `project-name`
+`hostname` `git-branch` `branch-changes` `run-state` `context-remaining`
+`context-used` `context-window-size` `used-tokens` `total-input-tokens`
+`total-output-tokens` `app-version` `thread-id` `thread-name` `thread-title`
+`task-progress`; the title adds `app-name` and `activity` (a spinner while
+working, a blinking "Action Required" while input is needed). The defaults
+are `model-with-reasoning, current-dir, thread-name` and
+`activity, thread-name, project-name`.
+
+**Keymap** (`/keymap`): browse actions by group (All, Common, Customized,
+Unbound, App, Composer, Editor, Navigation, Approval) or search them, then
+replace a key, add an alternative, bind a two-stroke chord (`ctrl-x ctrl-t`)
+or a `leader` key, or remove your override. Conflicts are shown before
+anything is saved, and changes apply immediately. `/keymap debug` shows
+exactly what your terminal sends for a key. Contexts are `global`, `chat`,
+`composer`, `editor`, `pager`, `list` and `approval`. Key names look like
+`ctrl-t`, `alt-enter`, `shift-left`, `page-down`, `f5` or `minus`.
 
 ## gnome-terminal notes
 
@@ -228,6 +296,9 @@ snapshots.
   - Diffs with tints and highlighting.
 - **Terminal and session:** title, notifications, resume, `/copy`,
   `/export`, `/clear`.
+- **Settings:** configurable status line and window title (`/statusline`,
+  `/title`); remappable keymap with chords, leader and the `/keymap` editor
+  and inspector.
 
 **Not ported**
 
@@ -239,12 +310,11 @@ snapshots.
 - **Secondary, not done yet:**
   - The fullscreen "owned transcript" mode, with mouse selection and semantic
     copy.
-  - Vim mode and the remappable keymap (`/keymap`, leader chords).
+  - Vim mode.
   - Mermaid and TeX-math rendering.
   - Smooth line-by-line commit animation. Lines appear as soon as they
     complete, which is equivalent to Codex's catch-up mode.
-  - Configurable status line and title items (`/statusline`, `/title`);
-    raw mode (`/raw`); the warnings view (F2).
+  - Raw mode (`/raw`); the warnings view (F2).
   - Inline image previews (Kitty/Sixel; VTE has no Kitty graphics).
   - Paste-burst detection for terminals without bracketed paste. VTE has
     bracketed paste.
@@ -253,10 +323,11 @@ snapshots.
 
 ```
 protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, wire.go)
+config/          settings file (TOML)
 backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, real "!" commands
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
-                 approval, interaction, pager, printer, resume)
+                 approval, interaction, pager, printer, resume, surfaces, keymap)
 cmd/agenttui     entry point
 examples/        echo_agent.py reference backend
 ```

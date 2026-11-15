@@ -154,8 +154,8 @@ type AgentMessage struct {
 }
 
 // AgentReasoningDelta streams reasoning/thinking text. The TUI shows the
-// first bold "**title**" as the status header (like Codex) and keeps the
-// body out of the transcript unless ShowRawReasoning is enabled.
+// latest bold "**title**" as the status header (like Codex) and keeps the
+// body in the Ctrl+T transcript only, unless Options.ShowReasoning is set.
 type AgentReasoningDelta struct {
 	Delta string `json:"delta"`
 }

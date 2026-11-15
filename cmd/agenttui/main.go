@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"agenttui/backend/mock"
 	"agenttui/backend/stdio"
@@ -25,12 +26,16 @@ import (
 )
 
 func main() {
-	args := os.Args[1:]
-	resume := false
-	if len(args) > 0 && args[0] == "resume" {
-		resume = true
-		args = args[1:]
+	// Split off the backend command after "--" before flag parsing, so
+	// "resume" and stray words can be told apart from the backend argv.
+	args, backendArgv := os.Args[1:], []string(nil)
+	for i, a := range args {
+		if a == "--" {
+			args, backendArgv = args[:i], args[i+1:]
+			break
+		}
 	}
+	resume := false
 
 	fs := flag.NewFlagSet("agenttui", flag.ExitOnError)
 	fs.Usage = func() {
@@ -46,18 +51,36 @@ func main() {
 	noReflow := fs.Bool("no-reflow", false, "don't clear and re-emit the transcript when the terminal width changes")
 	last := fs.Bool("last", false, "with resume: resume the most recent session without the picker")
 	id := fs.String("id", "", "with resume: resume this session id")
-	_ = fs.Parse(args)
-
-	if (*last || *id != "") && !resume {
-		fmt.Fprintln(os.Stderr, "-last and -id are only valid after `resume`")
-		os.Exit(2)
+	// "resume" may come before or after the flags: agenttui -sessions X resume
+	for {
+		_ = fs.Parse(args)
+		rest := fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		if rest[0] == "resume" && !resume {
+			resume, args = true, rest[1:]
+			continue
+		}
+		usageErr(fs, fmt.Sprintf("unexpected argument %q (put the backend command after --)", rest[0]))
+	}
+	switch {
+	case (*last || *id != "") && !resume:
+		usageErr(fs, "-last and -id are only valid with resume")
+	case *last && *id != "":
+		usageErr(fs, "use either -last or -id, not both")
+	case len(backendArgv) > 0 && (*resetDemo || flagSet(fs, "sessions")):
+		usageErr(fs, "-reset-demo and -sessions apply to the built-in mock backend, not to a -- backend")
+	case len(backendArgv) == 0 && *logPath != "":
+		usageErr(fs, "-log captures a -- backend's stderr; the mock backend has none")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer cancel()
 
 	var be protocol.Backend
-	if rest := fs.Args(); len(rest) > 0 {
+	var child *stdio.Backend
+	if rest := backendArgv; len(rest) > 0 {
 		var logw io.Writer = io.Discard
 		if *logPath != "" {
 			f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -73,7 +96,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "start backend:", err)
 			os.Exit(1)
 		}
-		be = b
+		be, child = b, b
 	} else {
 		if *resetDemo {
 			if err := mock.ResetDemo(*sessionsDir); err != nil {
@@ -99,8 +122,31 @@ func main() {
 		ResumeLast:        resume && *last,
 		ResumeID:          *id,
 	})
+	if child != nil {
+		// Deliver shutdown and give the agent time to exit cleanly before
+		// SIGTERM/SIGKILL (it would otherwise be killed with the UI).
+		if cerr := child.Close(3 * time.Second); cerr != nil {
+			fmt.Fprintln(os.Stderr, cerr)
+		}
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func usageErr(fs *flag.FlagSet, msg string) {
+	fmt.Fprintln(os.Stderr, "agenttui:", msg)
+	fs.Usage()
+	os.Exit(2)
+}
+
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }

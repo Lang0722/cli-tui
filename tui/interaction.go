@@ -277,8 +277,25 @@ func (m *model) startBacktrack() {
 }
 
 func (m *model) rewindTo(cellIdx int) tea.Cmd {
+	if cellIdx < 0 || cellIdx >= len(m.committed) {
+		return nil
+	}
 	uc, ok := m.committed[cellIdx].(userCell)
 	if !ok {
+		return nil
+	}
+	// Like Codex: only a turn's own prompt can be reopened, and only once
+	// that turn is over. The prompt still goes back into the composer.
+	var reason string
+	switch {
+	case uc.steer:
+		reason = "the selected prompt is a steer and cannot be edited independently"
+	case m.running:
+		reason = "the selected prompt belongs to a turn that is still in progress"
+	}
+	if reason != "" {
+		m.restorePrompt(uc)
+		m.commit(errorCell(m.st, "Failed to edit the selected prompt: "+reason))
 		return nil
 	}
 	n := 0
@@ -290,8 +307,24 @@ func (m *model) rewindTo(cellIdx int) tea.Cmd {
 	m.submit(protocol.Rewind{UserMessageIndex: n})
 	m.committed = m.committed[:cellIdx]
 	m.committed = append(m.committed, infoCell(m.st, "Conversation reverted to this point. File changes are unchanged."))
-	m.composer.Set(uc.text)
+	m.queued = nil // Codex clears the input queue on revert
+	m.restorePrompt(uc)
 	return m.reflow(false)
+}
+
+// restorePrompt puts a sent prompt back into the composer, with its image
+// attachments, ahead of whatever draft is already there.
+func (m *model) restorePrompt(uc userCell) {
+	draft := m.composer.String()
+	m.composer.Clear()
+	m.composer.shell = false
+	for _, p := range uc.images {
+		m.composer.AttachImage(p)
+	}
+	m.composer.insert(uc.text)
+	if strings.TrimSpace(draft) != "" {
+		m.composer.insert("\n" + draft)
+	}
 }
 
 // ---------------------------------------------------------------------------

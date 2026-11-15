@@ -102,9 +102,10 @@ func (t *turn) run(text string) {
 	t.b.mu.Unlock()
 	if !ok {
 		t.emit(protocol.TurnAborted{Reason: "interrupted"})
-		return
+	} else {
+		t.emit(protocol.TaskComplete{})
 	}
-	t.emit(protocol.TaskComplete{})
+	t.b.startPending()
 }
 
 func containsAny(s string, words ...string) bool {

@@ -4,6 +4,10 @@ charm.land/bubbletea/v2
 # charm.land/lipgloss/v2 v2.1.1
 ## explicit; go 1.26.0
 charm.land/lipgloss/v2
+# github.com/BurntSushi/toml v1.6.0
+## explicit; go 1.18
+github.com/BurntSushi/toml
+github.com/BurntSushi/toml/internal
 # github.com/alecthomas/chroma/v2 v2.27.0
 ## explicit; go 1.25
 github.com/alecthomas/chroma/v2

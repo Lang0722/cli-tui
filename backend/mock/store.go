@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -86,6 +87,25 @@ func (s *store) load(id string) (*sessionFile, error) {
 	return &f, nil
 }
 
+// isSessionFile reports whether path is one of the mock's session files
+// (a JSON object whose meta.id matches the file name).
+func (s *store) isSessionFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var head struct {
+		Meta struct {
+			ID string `json:"id"`
+		} `json:"meta"`
+		Events json.RawMessage `json:"events"`
+	}
+	if json.Unmarshal(data, &head) != nil || head.Meta.ID == "" || head.Events == nil {
+		return false
+	}
+	return head.Meta.ID == strings.TrimSuffix(filepath.Base(path), ".json")
+}
+
 func (s *store) save(f *sessionFile) error {
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return err
@@ -94,10 +114,22 @@ func (s *store) save(f *sessionFile) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path(f.Meta.ID) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp := s.path(f.Meta.ID) + fmt.Sprintf(".%d.tmp", os.Getpid())
+	fh, err := os.Create(tmp)
+	if err != nil {
 		return err
 	}
+	if _, err := fh.Write(data); err != nil {
+		fh.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := fh.Sync(); err != nil { // durable before it replaces the old file
+		fh.Close()
+		os.Remove(tmp)
+		return err
+	}
+	fh.Close()
 	return os.Rename(tmp, s.path(f.Meta.ID))
 }
 
@@ -137,17 +169,14 @@ func (f *sessionFile) rewind(n int) {
 			seen++
 		}
 	}
-	f.Meta.Messages = 0
-	for _, m := range f.Events {
-		switch m := m.(type) {
-		case protocol.UserMessage:
-			f.Meta.Messages++
-		case protocol.AgentMessage:
-			if strings.TrimSpace(m.Message) != "" {
-				f.Meta.Messages++
-			}
-		}
+	// Recompute the summary from what remains (title, counts, tokens).
+	events := f.Events
+	f.Events = nil
+	f.Meta.Title, f.Meta.Messages, f.Tokens = "", 0, 0
+	for _, m := range events {
+		f.record(m, f.Meta.UpdatedAt)
 	}
+	f.Meta.UpdatedAt = time.Now()
 }
 
 // replayable reports whether an event belongs in saved history. Streaming

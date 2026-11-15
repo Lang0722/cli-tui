@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"agenttui/protocol"
@@ -39,8 +40,10 @@ type Backend struct {
 	model     string
 	effort    string
 	turn      atomic.Int64
-	active    *turn        // the running turn, if any
-	cur       *sessionFile // nil until the first message of a new session
+	pending   []protocol.UserInput // input received while a turn was running
+	saveErr   bool                 // a save failure was already reported
+	active    *turn                // the running turn, if any
+	cur       *sessionFile         // nil until the first message of a new session
 
 	// Submit only enqueues; ops run in order on the mock's own goroutine so
 	// the UI never waits on disk writes, sleeps or event-channel sends.
@@ -66,12 +69,12 @@ func New(dir string) (*Backend, error) {
 		effort:    effort,
 		opWake:    make(chan struct{}, 1),
 	}
-	go b.opLoop()
 	if list, err := b.store.list(); err == nil && len(list) == 0 {
 		if err := seedDemo(&b.store, cwd); err != nil {
 			return nil, fmt.Errorf("seed demo sessions in %s: %w", dir, err)
 		}
 	}
+	go b.opLoop()
 	b.emit(b.configured(nil))
 	return b, nil
 }
@@ -83,13 +86,16 @@ func ResetDemo(dir string) error {
 	}
 	// Only remove session files: dir may be a directory the user pointed
 	// -sessions at that holds other things.
-	for _, pat := range []string{"*.json", "*.json.tmp"} {
-		matches, _ := filepath.Glob(filepath.Join(dir, pat))
-		for _, f := range matches {
-			if err := os.Remove(f); err != nil {
-				return err
-			}
+	st := &store{dir: dir}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	for _, f := range matches {
+		if !st.isSessionFile(f) {
+			continue // e.g. package.json: not ours
 		}
+		if err := os.Remove(f); err != nil {
+			return err
+		}
+		_ = os.Remove(f + ".tmp")
 	}
 	cwd, _ := os.Getwd()
 	return seedDemo(&store{dir: dir}, cwd)
@@ -97,15 +103,15 @@ func ResetDemo(dir string) error {
 
 func (b *Backend) configured(f *sessionFile) protocol.SessionConfigured {
 	b.mu.Lock()
-	model, eff := b.model, b.effort
-	b.mu.Unlock()
+	defer b.mu.Unlock()
 	sc := protocol.SessionConfigured{
-		Model: model, ReasoningEffort: eff, Cwd: b.cwd,
+		Model: b.model, ReasoningEffort: b.effort, Cwd: b.cwd,
 		Version: version, AgentName: agentName,
 	}
 	if f != nil {
 		sc.SessionID = f.Meta.ID
-		sc.InitialMessages = f.Events
+		// Copy: the session keeps growing while the UI replays this.
+		sc.InitialMessages = append(protocol.EventList(nil), f.Events...)
 		if f.Meta.Cwd != "" {
 			sc.Cwd = f.Meta.Cwd
 		}
@@ -135,8 +141,13 @@ func (b *Backend) emitIn(sess *sessionFile, m protocol.EventMsg) {
 	if replayable(m) && sess != nil {
 		b.mu.Lock()
 		sess.record(m, time.Now())
-		_ = b.store.save(sess)
+		err := b.store.save(sess)
+		report := err != nil && !b.saveErr
+		b.saveErr = b.saveErr || err != nil
 		b.mu.Unlock()
+		if report {
+			b.notice(protocol.Warning{Message: "could not save the session: " + err.Error()})
+		}
 	}
 	b.events <- protocol.Event{ID: fmt.Sprint(b.turn.Load()), Msg: m}
 }
@@ -163,6 +174,7 @@ func (b *Backend) history(sess *sessionFile) int {
 // so its TurnAborted is delivered before whatever replaces the session.
 func (b *Backend) stopTurn() {
 	b.mu.Lock()
+	b.pending = nil // queued input belongs to the conversation being left
 	t := b.active
 	if b.cancel != nil {
 		b.cancel()
@@ -209,8 +221,10 @@ func (b *Backend) handle(op protocol.Op) {
 	case protocol.UserInput:
 		b.mu.Lock()
 		if b.cancel != nil {
+			// Input during a turn (agenttui -steer): run it next, in order,
+			// so the saved conversation matches what the UI shows.
+			b.pending = append(b.pending, op)
 			b.mu.Unlock()
-			b.notice(protocol.BackgroundEvent{Message: "the mock backend cannot take input while a turn runs; queue it with tab"})
 			return
 		}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -222,7 +236,7 @@ func (b *Backend) handle(op protocol.Op) {
 		b.mu.Lock()
 		b.active = t
 		b.mu.Unlock()
-		b.emitIn(sess, protocol.UserMessage{Message: op.Text})
+		b.emitIn(sess, protocol.UserMessage{Message: op.Text, Images: op.Images})
 		t.images = op.Images
 		go t.run(op.Text)
 	case protocol.ShellCommand:
@@ -280,28 +294,89 @@ func (b *Backend) handle(op protocol.Op) {
 }
 
 // runShell executes a "!" command the user typed, like Codex' user shell
-// commands: it really runs (bash -lc in the session directory, 60 s limit)
-// and is reported with Source "user_shell".
+// commands. It runs bash -lc in the session directory in its own session
+// (no controlling terminal, so it can't steal the TUI's keyboard or draw
+// over it), streams output, and is killed with its whole process group
+// after 60 s. Events go to the session the command started in.
 func (b *Backend) runShell(command string) {
+	sess := b.session()
 	id := fmt.Sprintf("sh-%d", time.Now().UnixNano())
 	argv := []string{"bash", "-lc", command}
-	b.emit(protocol.ExecCommandBegin{CallID: id, Command: argv, Cwd: b.cwd, Source: "user_shell"})
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	b.emitIn(sess, protocol.ExecCommandBegin{CallID: id, Command: argv, Cwd: b.cwd, Source: "user_shell"})
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = b.cwd
-	out, err := cmd.CombinedOutput()
+	cmd.Stdin = nil // /dev/null: interactive prompts get EOF instead of hanging
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	out := &cappedOutput{onChunk: func(chunk string) {
+		b.notice(protocol.ExecCommandOutputDelta{CallID: id, Stream: "stdout", Chunk: chunk})
+	}}
+	cmd.Stdout, cmd.Stderr = out, out
+	cmd.WaitDelay = time.Second // don't wait on pipes held by background children
 	code := 0
+	if err := cmd.Start(); err != nil {
+		b.emitIn(sess, protocol.ExecCommandEnd{CallID: id, ExitCode: 127, AggregatedOutput: err.Error()})
+		return
+	}
+	timer := time.AfterFunc(shellTimeout, func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		out.Write([]byte(fmt.Sprintf("\n(timed out after %s)\n", shellTimeout)))
+	})
+	err := cmd.Wait()
+	timer.Stop()
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // reap leftover background children
 	if err != nil {
 		code = 1
-		if ee, ok := err.(*exec.ExitError); ok {
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() >= 0 {
 			code = ee.ExitCode()
-		} else {
-			out = append(out, []byte(err.Error())...)
 		}
 	}
-	b.emit(protocol.ExecCommandEnd{CallID: id, ExitCode: code, AggregatedOutput: string(out), DurationMs: time.Since(start).Milliseconds()})
+	b.emitIn(sess, protocol.ExecCommandEnd{CallID: id, ExitCode: code, AggregatedOutput: out.String(), DurationMs: time.Since(start).Milliseconds()})
+}
+
+const (
+	shellTimeout   = 60 * time.Second
+	maxShellOutput = 256 * 1024 // stored in the session; the rest is elided
+)
+
+// cappedOutput forwards chunks live and keeps the head and tail of the
+// output for the saved record.
+type cappedOutput struct {
+	mu      sync.Mutex
+	head    []byte
+	tail    []byte
+	dropped int
+	onChunk func(string)
+}
+
+func (c *cappedOutput) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	if room := maxShellOutput/2 - len(c.head); room > 0 {
+		n := min(room, len(p))
+		c.head = append(c.head, p[:n]...)
+		p2 := p[n:]
+		c.tail = append(c.tail, p2...)
+	} else {
+		c.tail = append(c.tail, p...)
+	}
+	if over := len(c.tail) - maxShellOutput/2; over > 0 {
+		c.dropped += over
+		c.tail = append([]byte(nil), c.tail[over:]...)
+	}
+	c.mu.Unlock()
+	if c.onChunk != nil && len(p) > 0 {
+		c.onChunk(string(p))
+	}
+	return len(p), nil
+}
+
+func (c *cappedOutput) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dropped == 0 {
+		return string(c.head) + string(c.tail)
+	}
+	return string(c.head) + fmt.Sprintf("\n… (%d bytes elided)\n", c.dropped) + string(c.tail)
 }
 
 func (b *Backend) slash(op protocol.SlashCommand) {
@@ -349,16 +424,22 @@ func (b *Backend) ask(ctx context.Context, req protocol.SelectionRequest) (proto
 	case r := <-ch:
 		return r, true
 	case <-ctx.Done():
+		b.mu.Lock()
+		delete(b.answers, req.ID)
+		b.mu.Unlock()
 		return protocol.SelectionResponse{}, false
 	}
 }
 
 // pickModel is the mock /model: a model picker then an effort picker.
 func (b *Backend) pickModel() {
+	b.mu.Lock()
+	curModel, curEffort := b.model, b.effort
+	b.mu.Unlock()
 	models := []string{"mock-model", "mock-model-fast", "mock-model-large"}
 	var items []protocol.SelectionItem
 	for _, m := range models {
-		items = append(items, protocol.SelectionItem{Name: m, Current: m == b.model,
+		items = append(items, protocol.SelectionItem{Name: m, Current: m == curModel,
 			Description: map[string]string{"mock-model": "balanced", "mock-model-fast": "quick answers", "mock-model-large": "slow and thorough"}[m]})
 	}
 	r, ok := b.ask(context.Background(), protocol.SelectionRequest{Title: "Select Model and Effort", Subtitle: "Switch the model for this and future turns", Items: items})
@@ -369,7 +450,7 @@ func (b *Backend) pickModel() {
 	efforts := []string{"low", "medium", "high"}
 	var eitems []protocol.SelectionItem
 	for _, e := range efforts {
-		eitems = append(eitems, protocol.SelectionItem{Name: e, Current: e == b.effort})
+		eitems = append(eitems, protocol.SelectionItem{Name: e, Current: e == curEffort})
 	}
 	r, ok = b.ask(context.Background(), protocol.SelectionRequest{Title: "Select Reasoning Level for " + model, Items: eitems})
 	if !ok || r.Index < 0 {
@@ -400,6 +481,9 @@ func (b *Backend) waitApproval(ctx context.Context, id string) (protocol.ReviewD
 	case d := <-ch:
 		return d, true
 	case <-ctx.Done():
+		b.mu.Lock()
+		delete(b.approvals, id)
+		b.mu.Unlock()
 		return "", false
 	}
 }
@@ -411,4 +495,17 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// startPending runs the next input that arrived during the last turn.
+func (b *Backend) startPending() {
+	b.mu.Lock()
+	if len(b.pending) == 0 || b.cancel != nil {
+		b.mu.Unlock()
+		return
+	}
+	next := b.pending[0]
+	b.pending = b.pending[1:]
+	b.mu.Unlock()
+	_ = b.Submit(context.Background(), next)
 }

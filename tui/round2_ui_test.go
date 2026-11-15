@@ -183,3 +183,42 @@ func TestR2PrinterHoldIsPerLine(t *testing.T) {
 }
 
 func pasteMsg(s string) tea.PasteMsg { return tea.PasteMsg{Content: s} }
+
+func TestR2RewindRestoresImagesAndRefusesSteer(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(protocol.Event{Msg: protocol.SessionConfigured{Model: "x"}})
+	m.sendInput(pendingInput{text: "first", images: []string{"/tmp/a.png"}})
+	m.handleEvent(protocol.Event{Msg: protocol.TaskStarted{}})
+	m.sendInput(pendingInput{text: "steer"})
+	m.handleEvent(protocol.Event{Msg: protocol.TaskComplete{}})
+	var first, steer int = -1, -1
+	for i, c := range m.committed {
+		if u, ok := c.(userCell); ok {
+			if u.text == "first" {
+				first = i
+			} else if u.text == "steer" {
+				steer = i
+			}
+		}
+	}
+	if first < 0 || steer < 0 {
+		t.Fatalf("cells not found")
+	}
+	m.rewindTo(steer)
+	q := ansiStrip(strings.Join(m.out.takeQueued(), "\n"))
+	if !strings.Contains(q, "Failed to edit the selected prompt: the selected prompt is a steer") {
+		t.Fatalf("steer not refused: %q", q)
+	}
+	if m.composer.String() != "steer" {
+		t.Fatalf("steer prompt not restored: %q", m.composer.String())
+	}
+	m.composer.Clear()
+	n := len(m.committed)
+	m.rewindTo(first)
+	if len(m.committed) >= n || m.composer.String() != "[Image #1] first" || len(m.composer.images) != 1 {
+		t.Fatalf("rewind: cells %d→%d composer %q images %v", n, len(m.committed), m.composer.String(), m.composer.images)
+	}
+	if text, imgs := m.composer.takeImages(m.composer.String()); text != "first" || len(imgs) != 1 || imgs[0] != "/tmp/a.png" {
+		t.Fatalf("resend: %q %v", text, imgs)
+	}
+}

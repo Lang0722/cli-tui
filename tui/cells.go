@@ -83,22 +83,23 @@ func tildePath(p string) string {
 
 type userCell struct {
 	text    string
-	images  int  // attached images, shown as "[Image #N]" rows above the text
-	command bool // echo of a slash command (not a user message to the backend)
+	images  []string // attached image files, shown as "[Image #N]" rows above the text
+	command bool     // echo of a slash command (not a user message to the backend)
+	steer   bool     // sent while a turn was running (can't be edited on its own)
 }
 
 func (c userCell) Lines(width int, st *Styles) []Line {
 	var out []Line
 	band := st.HistoryBg
 	out = append(out, Line{}.Fill(width, band))
-	for i := 1; i <= c.images; i++ {
+	for i := 1; i <= len(c.images); i++ {
 		out = append(out, L(P("  "), S(fmt.Sprintf("[Image #%d]", i), st.Accent)).Fill(width, band))
 	}
-	if c.images > 0 {
+	if len(c.images) > 0 {
 		out = append(out, Line{}.Fill(width, band))
 	}
 	src := strings.Split(sanitize(c.text), "\n")
-	if c.images > 0 && strings.TrimSpace(c.text) == "" {
+	if len(c.images) > 0 && strings.TrimSpace(c.text) == "" {
 		src = nil // image-only prompt: just the "[Image #N]" rows
 		out = out[:len(out)-1]
 	}

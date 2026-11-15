@@ -37,5 +37,6 @@ type SessionList struct {
 // UserMessage records a user prompt. It is only rendered inside
 // SessionConfigured.InitialMessages (live input is drawn by the UI itself).
 type UserMessage struct {
-	Message string `json:"message"`
+	Message string   `json:"message"`
+	Images  []string `json:"images,omitempty"` // attached image paths, as sent in user_input
 }

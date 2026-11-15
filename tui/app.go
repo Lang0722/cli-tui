@@ -150,7 +150,7 @@ type model struct {
 	queued       []pendingInput
 	turnHasAgent bool   // an agent message was committed this turn
 	deferred     []Cell // commits held while an answer streams
-	kittyKeys    bool // terminal reports Shift+Enter distinctly
+	kittyKeys    bool   // terminal reports Shift+Enter distinctly
 	ticking      bool
 
 	// tokens
@@ -601,7 +601,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		if m.replaying {
 			m.finalizeStream("")
 			m.flushActive(true)
-			m.commit(userCell{text: e.Message})
+			m.commit(userCell{text: e.Message, images: e.Images})
 			m.composer.addHistory(e.Message, nil)
 		}
 	case protocol.TaskStarted:
@@ -828,7 +828,7 @@ func (m *model) lastCommittedIsAgent() bool {
 func (m *model) sendUser(text string) { m.sendInput(pendingInput{text: text}) }
 
 func (m *model) sendInput(in pendingInput) {
-	m.commit(userCell{text: in.text, images: len(in.images)})
+	m.commit(userCell{text: in.text, images: in.images, steer: m.running})
 	m.submit(protocol.UserInput{Text: in.text, Images: in.images})
 }
 

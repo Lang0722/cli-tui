@@ -47,9 +47,13 @@ func TestBeStorm(t *testing.T) {
 		}
 	}()
 	ops := []func() protocol.Op{
-		func() protocol.Op { return protocol.UserInput{Text: []string{"demo", "hi", "question", "error", "table", "x"}[rand.Intn(6)]} },
+		func() protocol.Op {
+			return protocol.UserInput{Text: []string{"demo", "hi", "question", "error", "table", "x"}[rand.Intn(6)]}
+		},
 		func() protocol.Op { return protocol.Interrupt{} },
-		func() protocol.Op { return protocol.SlashCommand{Name: []string{"new", "model", "compact", "approvals"}[rand.Intn(4)]} },
+		func() protocol.Op {
+			return protocol.SlashCommand{Name: []string{"new", "model", "compact", "approvals"}[rand.Intn(4)]}
+		},
 		func() protocol.Op { return protocol.Rewind{UserMessageIndex: rand.Intn(3)} },
 		func() protocol.Op { return protocol.ResumeSession{} },
 		func() protocol.Op { return protocol.ListSessions{} },

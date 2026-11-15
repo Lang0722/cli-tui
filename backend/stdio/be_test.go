@@ -59,7 +59,9 @@ func alive(c *exec.Cmd) bool {
 	_, err := os.Stat("/proc/" + itoa(c.Process.Pid))
 	return err == nil
 }
-func itoa(n int) string { return strings.TrimSpace(strings.Repeat(" ", 0)) + func() string { return fmtInt(n) }() }
+func itoa(n int) string {
+	return strings.TrimSpace(strings.Repeat(" ", 0)) + func() string { return fmtInt(n) }()
+}
 func fmtInt(n int) string {
 	s := ""
 	for n > 0 {

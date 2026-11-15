@@ -15,7 +15,9 @@ import (
 
 var bg = context.Background()
 
-func drain(b *Backend) { collect(b, func(protocol.EventMsg) bool { return false }, 50*time.Millisecond) }
+func drain(b *Backend) {
+	collect(b, func(protocol.EventMsg) bool { return false }, 50*time.Millisecond)
+}
 
 // ResetDemo deletes every *.json in the -sessions dir, not only session files.
 func TestBeResetDemoDeletesUserJSON(t *testing.T) {

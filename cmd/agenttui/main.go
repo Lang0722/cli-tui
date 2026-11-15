@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"agenttui/backend/mock"
-	"agenttui/config"
 	"agenttui/backend/stdio"
+	"agenttui/config"
 	"agenttui/protocol"
 	"agenttui/tui"
 )

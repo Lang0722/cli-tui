@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // --- kill buffer (Ctrl+K/U/W, Alt+D, Alt+Backspace) and Ctrl+Y yank -------
@@ -18,14 +19,59 @@ func (c *composer) kill(a, b int) {
 	if a > b {
 		a, b = b, a
 	}
+	// Placeholders are atomic: widen the range to cover any it cuts into,
+	// and keep their content with the kill buffer so a yank restores them.
+	for _, r := range c.placeholderRanges() {
+		if r.start < b && r.end > a {
+			a, b = min(a, r.start), max(b, r.end)
+		}
+	}
 	if b > a {
 		c.killBuf = string(c.text[a:b])
+		c.killPHs = map[string]string{}
+		for _, r := range c.placeholderRanges() {
+			if r.start >= a && r.end <= b {
+				ph := string(c.text[r.start:r.end])
+				if v, ok := c.pastes[ph]; ok {
+					c.killPHs[ph] = v
+				} else {
+					c.killPHs[ph] = c.images[ph]
+				}
+			}
+		}
+	}
+	c.deleteAtomic(a, b)
+}
+
+// deleteRange for edits: placeholders removed entirely by it are forgotten
+// (unless the same placeholder text remains elsewhere).
+func (c *composer) deleteAtomic(a, b int) {
+	var gone []string
+	for _, r := range c.placeholderRanges() {
+		if r.start >= a && r.end <= b {
+			gone = append(gone, string(c.text[r.start:r.end]))
+		}
 	}
 	c.deleteRange(a, b)
+	if len(gone) > 0 {
+		rest := string(c.text)
+		for _, ph := range gone {
+			if !strings.Contains(rest, ph) {
+				c.forget(ph)
+			}
+		}
+	}
 }
 
 func (c *composer) yank() {
 	if c.killBuf != "" {
+		for ph, v := range c.killPHs {
+			if strings.HasPrefix(ph, "[Image #") {
+				c.images[ph] = v
+			} else {
+				c.pastes[ph] = v
+			}
+		}
 		c.insert(c.killBuf)
 	}
 }
@@ -35,23 +81,70 @@ func (c *composer) yank() {
 // placeholderAt returns the [start,end) rune range of a paste or image
 // placeholder that ends at (before=true) or starts at the cursor.
 func (c *composer) placeholderAt(before bool) (int, int, bool) {
-	text := string(c.text)
-	for _, ph := range c.placeholders() {
-		for off := 0; ; {
-			i := strings.Index(text[off:], ph)
-			if i < 0 {
-				break
-			}
-			bs := off + i
-			start := len([]rune(text[:bs]))
-			end := start + len([]rune(ph))
-			if before && end == c.cursor || !before && start == c.cursor {
-				return start, end, true
-			}
-			off = bs + len(ph)
+	for _, r := range c.placeholderRanges() {
+		if before && r.end == c.cursor || !before && r.start == c.cursor {
+			return r.start, r.end, true
 		}
 	}
 	return 0, 0, false
+}
+
+// placeholderRanges returns the rune ranges of the placeholders in the
+// text, scanning left to right (the longest placeholder wins at a position).
+func (c *composer) placeholderRanges() []row {
+	phs := c.placeholders()
+	if len(phs) == 0 {
+		return nil
+	}
+	var out []row
+	text := string(c.text)
+	runes := 0 // rune index of byte offset off
+	for off := 0; off < len(text); {
+		i := strings.IndexByte(text[off:], '[')
+		if i < 0 {
+			break
+		}
+		runes += utf8.RuneCountInString(text[off : off+i])
+		off += i
+		best := ""
+		for _, ph := range phs {
+			if len(ph) > len(best) && strings.HasPrefix(text[off:], ph) {
+				best = ph
+			}
+		}
+		if best == "" {
+			off++
+			runes++
+			continue
+		}
+		n := utf8.RuneCountInString(best)
+		out = append(out, row{runes, runes + n})
+		off += len(best)
+		runes += n
+	}
+	return out
+}
+
+// snapCursor moves a cursor that landed inside a placeholder to its end
+// (forward) or start.
+func (c *composer) snapCursor(forward bool) {
+	for _, r := range c.placeholderRanges() {
+		if r.start < c.cursor && c.cursor < r.end {
+			if forward {
+				c.cursor = r.end
+			} else {
+				c.cursor = r.start
+			}
+			return
+		}
+	}
+}
+
+// forget drops a deleted placeholder's entry so typing its text again does
+// not expand it.
+func (c *composer) forget(ph string) {
+	delete(c.pastes, ph)
+	delete(c.images, ph)
 }
 
 func (c *composer) placeholders() []string {
@@ -65,28 +158,17 @@ func (c *composer) placeholders() []string {
 	return out
 }
 
-// backspace deletes one rune, or a whole placeholder ending at the cursor.
+// backspace deletes one grapheme, or a whole placeholder ending at the
+// cursor.
 func (c *composer) backspace() {
-	if s, e, ok := c.placeholderAt(true); ok {
-		ph := string(c.text[s:e])
-		c.deleteRange(s, e)
-		delete(c.images, ph)
-		return
-	}
 	if c.cursor > 0 {
-		c.deleteRange(c.cursor-1, c.cursor)
+		c.deleteAtomic(c.prevStop(), c.cursor)
 	}
 }
 
 func (c *composer) deleteForward() {
-	if s, e, ok := c.placeholderAt(false); ok {
-		ph := string(c.text[s:e])
-		c.deleteRange(s, e)
-		delete(c.images, ph)
-		return
-	}
 	if c.cursor < len(c.text) {
-		c.deleteRange(c.cursor, c.cursor+1)
+		c.deleteAtomic(c.cursor, c.nextStop())
 	}
 }
 
@@ -162,22 +244,51 @@ var reImagePH = regexp.MustCompile(`\[Image #\d+\]`)
 // takeImages removes image placeholders from text and returns the files
 // in the order they appear.
 func (c *composer) takeImages(text string) (string, []string) {
+	return c.expand(text, false)
+}
+
+// expand removes image placeholders (with one adjacent space) and, with
+// pastes, replaces paste placeholders by their content, in one left-to-right
+// pass so pasted content is never expanded again. It returns the image
+// files in the order they appear.
+func (c *composer) expand(text string, pastes bool) (string, []string) {
+	var b strings.Builder
 	var paths []string
-	for _, ph := range reImagePH.FindAllString(text, -1) {
-		if p, ok := c.images[ph]; ok {
+	for text != "" {
+		i := strings.IndexByte(text, '[')
+		if i < 0 {
+			break
+		}
+		b.WriteString(text[:i])
+		text = text[i:]
+		best := ""
+		for _, ph := range c.placeholders() {
+			if len(ph) > len(best) && strings.HasPrefix(text, ph) {
+				if _, img := c.images[ph]; img || pastes {
+					best = ph
+				}
+			}
+		}
+		if best == "" {
+			b.WriteByte('[')
+			text = text[1:]
+			continue
+		}
+		text = text[len(best):]
+		if p, img := c.images[best]; img {
 			paths = append(paths, p)
+			if strings.HasPrefix(text, " ") {
+				text = text[1:]
+			} else if s := b.String(); strings.HasSuffix(s, " ") {
+				b.Reset()
+				b.WriteString(s[:len(s)-1])
+			}
+			continue
 		}
+		b.WriteString(c.pastes[best])
 	}
-	if len(paths) == 0 {
-		return text, nil
-	}
-	text = reImagePH.ReplaceAllStringFunc(text, func(ph string) string {
-		if _, ok := c.images[ph]; ok {
-			return ""
-		}
-		return ph
-	})
-	return strings.Join(strings.Fields(text), " "), paths
+	b.WriteString(text)
+	return b.String(), paths
 }
 
 // --- reverse history search (Ctrl+R) ---------------------------------------

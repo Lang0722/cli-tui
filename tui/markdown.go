@@ -24,7 +24,7 @@ var (
 	reOrdered  = regexp.MustCompile(`^(\s*)(\d+)[.)]\s+(.*)$`)
 	reTask     = regexp.MustCompile(`^\[([ xX])\]\s+(.*)$`)
 	reFence    = regexp.MustCompile("^ {0,3}(```+|~~~+)\\s*([\\w+#.-]*)")
-	reRule     = regexp.MustCompile(`^\s*([-*_])(\s*[-*_]){2,}\s*$`)
+	reRule     = regexp.MustCompile(`^\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$`)
 	reURL      = regexp.MustCompile(`https?://[^\s<>()\[\]]+[^\s<>()\[\].,;:!?'"]`)
 	reTableSep = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$`)
 	reQuote    = regexp.MustCompile(`^\s*((?:>\s?)+)(.*)$`)
@@ -46,6 +46,7 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 	last := ""            // kind of the previous block
 	sawBlank := false     // a blank source line since the previous block
 	var listIndents []int // source indents of the open list levels
+	listContent := -1     // source content column of the last list item
 
 	// start begins a new block of kind k, inserting the separator row.
 	start := func(k string) {
@@ -59,25 +60,45 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 		raw := lines[i]
 		trimmed := strings.TrimSpace(raw)
 
-		if m := reFence.FindStringSubmatch(raw); m != nil && !(m[1][0] == '`' && strings.Contains(raw[strings.Index(raw, m[1])+len(m[1]):], "`")) {
+		// Inside a list item a fence may be indented up to 3 columns past
+		// the item's content column (CommonMark); that indentation is
+		// stripped from the fence and its code lines.
+		extra, codeLead := 0, ""
+		if ind := len(raw) - len(strings.TrimLeft(raw, " ")); last == "list" && listContent >= 0 && ind > 3 && ind <= listContent+3 {
+			extra = min(ind, listContent)
+			codeLead = strings.Repeat(" ", 4*max(len(listIndents)-1, 0)+2)
+		}
+		unindent := func(l string) string {
+			n := 0
+			for n < extra && n < len(l) && l[n] == ' ' {
+				n++
+			}
+			return l[n:]
+		}
+		if m := reFence.FindStringSubmatch(raw[extra:]); m != nil && !(m[1][0] == '`' && strings.Contains(raw[strings.Index(raw, m[1])+len(m[1]):], "`")) {
 			// (a backtick fence's info string can't contain backticks, so
 			// "```js``` is inline code" is a paragraph, not a fence)
 			marker, lang := m[1], m[2]
 			var code []string
 			j := i + 1
 			for ; j < len(lines); j++ {
-				if c := reFence.FindStringSubmatch(lines[j]); c != nil && c[1][0] == marker[0] && len(c[1]) >= len(marker) && strings.TrimSpace(lines[j]) == c[1] {
+				lj := unindent(lines[j])
+				if c := reFence.FindStringSubmatch(lj); c != nil && c[1][0] == marker[0] && len(c[1]) >= len(marker) && strings.TrimSpace(lj) == c[1] {
 					break
 				}
-				code = append(code, lines[j])
+				code = append(code, lj)
 			}
 			start("code")
 			listIndents = listIndents[:0]
+			listContent = -1
 			if len(code) == 0 {
 				i = j
 				continue // empty (or just opened, while streaming) fence
 			}
 			for _, l := range highlightLines(strings.Join(code, "\n"), lexerFor(lang, ""), st.Code, st) {
+				if codeLead != "" {
+					l = append(L(P(codeLead)), l...)
+				}
 				out = append(out, mdLine{Line: l, Keep: true})
 			}
 			i = j // skip the closing fence (or run to the end while streaming)
@@ -139,8 +160,11 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 		}
 
 		isList := reBullet.MatchString(raw) || reOrdered.MatchString(raw)
+		if !isList && (last != "list" || sawBlank && len(raw) == len(strings.TrimLeft(raw, " "))) {
+			listContent = -1
+		}
 		switch {
-		case reRule.MatchString(raw) && !isList:
+		case reRule.MatchString(raw): // "* * *" is a rule, not a list item
 			start("rule")
 			listIndents = listIndents[:0]
 			out = append(out, mdLine{Line: L(S("———", st.Dim))})
@@ -171,6 +195,7 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 				n, _ := strconv.Atoi(m[2])
 				indentSrc, body, marker = len(expandTabs(m[1])), m[3], strconv.Itoa(n)+". "
 			}
+			listContent = len(raw) - len(body)
 			// Nesting level from the source indentation (Codex nests by 4).
 			for len(listIndents) > 0 && listIndents[len(listIndents)-1] > indentSrc {
 				listIndents = listIndents[:len(listIndents)-1]
@@ -230,7 +255,7 @@ func tableHoldback(src string, commit int) int {
 	for commit > 0 {
 		start := strings.LastIndexByte(src[:commit-1], '\n') + 1
 		line := src[start : commit-1]
-		if strings.TrimSpace(line) == "" || !strings.Contains(line, "|") {
+		if strings.TrimSpace(line) == "" || !strings.Contains(line, "|") && !reTableSep.MatchString(line) { // a delimiter row may lack pipes
 			return commit
 		}
 		commit = start
@@ -400,6 +425,15 @@ func renderRecords(rows [][]string, ncol, width int, st *Styles) []mdLine {
 	stacked := keyW+3+12 > width
 	keyW = min(keyW, max(4, width/3))
 	var out []mdLine
+	if len(rows) == 1 {
+		// header-only table: list the column names
+		for _, key := range rows[0] {
+			for _, row := range Wrap(L(S(key, st.AccentB)), width, L(P(" ")), L(P(" "))) {
+				out = append(out, mdLine{Line: row, Fixed: true})
+			}
+		}
+		return out
+	}
 	for i, r := range rows[1:] {
 		if i > 0 {
 			out = append(out, mdLine{Line: L(S(strings.Repeat("─", max(1, width)), st.Dim)), Fixed: true})
@@ -489,13 +523,19 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 			}
 			out = append(out, S(code, st.Code.Inherit(cur())))
 			i += n + end + n
+		case (c == 'h' || c == 'H') && !isWordChar(i-1) && bareURLAt(s[i:]) > 0:
+			// A bare URL is literal: no emphasis inside it (Lib/__init__.py).
+			n := bareURLAt(s[i:])
+			flush()
+			out = append(out, linkify(s[i:i+n], cur(), st)...)
+			i += n
 		case (c == '*' || c == '_') && i+1 < len(s) && s[i+1] == c:
-			if c == '_' && isWordChar(i-1) && isWordChar(i+2) {
-				buf.WriteString("__")
-				i += 2
-				continue
-			}
-			if !bold && !strings.Contains(s[i+2:], string([]byte{c, c})) {
+			// CommonMark flanking rules: "x ** 2" is not emphasis.
+			open, close := strongDelim(s, i)
+			switch {
+			case bold && close:
+			case !bold && open && strongCloser(s, i+2, c):
+			default:
 				buf.WriteString(s[i : i+2])
 				i += 2
 				continue
@@ -563,6 +603,46 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 	}
 	flush()
 	return out
+}
+
+// bareURLAt returns the length of a bare http(s) URL at the start of s.
+func bareURLAt(s string) int {
+	if len(s) < 8 || !strings.EqualFold(s[:7], "http://") && !strings.EqualFold(s[:8], "https://") {
+		return 0
+	}
+	if loc := reURL.FindStringIndex(s); loc != nil && loc[0] == 0 {
+		return loc[1]
+	}
+	return 0
+}
+
+// strongDelim reports whether the two-character delimiter run ("**" or
+// "__") at s[i:] can open and/or close emphasis under CommonMark's
+// left/right-flanking rules (ASCII punctuation only).
+func strongDelim(s string, i int) (open, close bool) {
+	ws := func(j int) bool { return j < 0 || j >= len(s) || s[j] == ' ' || s[j] == '\t' || s[j] == '\n' }
+	punct := func(j int) bool {
+		return j >= 0 && j < len(s) && s[j] < 0x80 && strings.IndexByte("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", s[j]) >= 0
+	}
+	prev, next := i-1, i+2
+	left := !ws(next) && (!punct(next) || ws(prev) || punct(prev))
+	right := !ws(prev) && (!punct(prev) || ws(next) || punct(next))
+	if s[i] == '_' {
+		return left && (!right || punct(prev)), right && (!left || punct(next))
+	}
+	return left, right
+}
+
+// strongCloser reports whether s[from:] holds a "cc" run that can close.
+func strongCloser(s string, from int, c byte) bool {
+	for j := from; j+1 < len(s); j++ {
+		if s[j] == c && s[j+1] == c {
+			if _, cl := strongDelim(s, j); cl {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasCloser reports whether s[from:] holds a closing emphasis delimiter c

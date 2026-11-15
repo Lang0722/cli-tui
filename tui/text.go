@@ -101,7 +101,7 @@ func takeWidth(s string, w int) string {
 	n := 0
 	var b strings.Builder
 	for g.Next() {
-		cw := g.Width()
+		cw := strw(g.Str()) // the same width function as Line.Width
 		if n+cw > w {
 			break
 		}
@@ -157,6 +157,14 @@ func tokenize(l Line) []token {
 // Wrap word-wraps a line to width. first is prepended to the first output
 // row and rest to every continuation row (their widths are accounted for).
 func Wrap(l Line, width int, first, rest Line) []Line {
+	// A newline in the text is a hard break (continuation rows use rest).
+	for i, sp := range l {
+		if j := strings.IndexByte(sp.Text, '\n'); j >= 0 {
+			head := append(append(Line{}, l[:i]...), Span{sp.Text[:j], sp.Style})
+			tail := append(Line{{sp.Text[j+1:], sp.Style}}, l[i+1:]...)
+			return append(Wrap(head, width, first, rest), Wrap(tail, width, rest, rest)...)
+		}
+	}
 	fw, rw := first.Width(), rest.Width()
 	if width-fw < 1 || width-rw < 1 {
 		width = max(fw, rw) + 1
@@ -175,48 +183,67 @@ func Wrap(l Line, width int, first, rest Line) []Line {
 		pendingSpace = pendingSpace[:0]
 	}
 
-	for _, tk := range tokenize(l) {
-		if tk.space {
+	// Adjacent non-space tokens from different spans form one word: a style
+	// boundary is not a break opportunity.
+	toks := tokenize(l)
+	for k := 0; k < len(toks); {
+		if toks[k].space {
 			if curw == 0 && len(out) > 0 {
+				k++
 				continue // drop leading spaces on continuation rows
 			}
-			pendingSpace = append(pendingSpace, tk)
+			pendingSpace = append(pendingSpace, toks[k])
+			k++
 			continue
 		}
+		e, tw := k, 0
+		for e < len(toks) && !toks[e].space {
+			tw += strw(toks[e].text)
+			e++
+		}
+		word := toks[k:e]
+		k = e
 		spw := 0
 		for _, s := range pendingSpace {
 			spw += strw(s.text)
 		}
-		tw := strw(tk.text)
 		if curw+spw+tw <= avail {
 			for _, s := range pendingSpace {
 				cur = append(cur, Span{s.text, s.style})
 			}
 			pendingSpace = pendingSpace[:0]
-			cur = append(cur, Span{tk.text, tk.style})
+			for _, p := range word {
+				cur = append(cur, Span{p.text, p.style})
+			}
 			curw += spw + tw
 			continue
 		}
 		if curw > 0 {
 			newRow()
 		} else {
-			// leading spaces on an otherwise empty first row (indentation)
+			// leading spaces on an otherwise empty first row (indentation),
+			// clamped so at least one cell is left for the text
 			for _, s := range pendingSpace {
-				cur = append(cur, Span{s.text, s.style})
-				curw += strw(s.text)
+				sp := takeWidth(s.text, max(0, avail-1-curw))
+				cur = append(cur, Span{sp, s.style})
+				curw += strw(sp)
 			}
 			pendingSpace = pendingSpace[:0]
 		}
-		text := tk.text
-		for strw(text) > avail-curw {
-			head, tail := splitWidth(text, avail-curw)
-			cur = append(cur, Span{head, tk.style})
-			newRow()
-			text = tail
-		}
-		if text != "" {
-			cur = append(cur, Span{text, tk.style})
-			curw += strw(text)
+		for _, p := range word {
+			text := p.text
+			for strw(text) > avail-curw {
+				head, tail := splitWidth(text, avail-curw)
+				if strw(head) <= avail-curw || curw == 0 {
+					cur = append(cur, Span{head, p.style})
+					text = tail
+				}
+				newRow()
+			}
+			if text != "" {
+				cur = append(cur, Span{text, p.style})
+				curw += strw(text)
+			}
 		}
 	}
 	out = append(out, cur)
@@ -249,7 +276,18 @@ func renderLines(lines []Line) string {
 // sanitize strips control sequences and normalizes tabs/CR from untrusted
 // text (command output, model text) so it cannot move the cursor.
 func sanitize(s string) string {
-	s = ansi.Strip(s)
+	// Raw 8-bit C1 bytes (invalid UTF-8) would start DCS/OSC strings in
+	// ansi.Strip, and an unterminated string sequence swallows everything
+	// after it, so decode them as U+FFFD and strip line by line (string
+	// sequences end at a newline).
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if strings.ContainsAny(s, "\x1b\u0090\u0098\u009b\u009d\u009e\u009f") {
+		lines := strings.Split(s, "\n")
+		for i, l := range lines {
+			lines[i] = ansi.Strip(l)
+		}
+		s = strings.Join(lines, "\n")
+	}
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, "\t", "    ")
@@ -262,6 +300,12 @@ func sanitize(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// sanitizeLine is sanitize for single-row fields (names, paths, labels):
+// newlines become spaces.
+func sanitizeLine(s string) string {
+	return strings.ReplaceAll(sanitize(s), "\n", " ")
 }
 
 // WrapChars hard-wraps at the character (keeping spaces), as Codex does for

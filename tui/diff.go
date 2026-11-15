@@ -152,10 +152,10 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 	for _, p := range paths {
 		ch := changes[p]
 		rows, a, d := fileRows(ch)
-		f := file{path: relPath(cwd, p), rows: rows, add: a, del: d, kind: ch.Kind}
+		f := file{path: sanitizeLine(relPath(cwd, p)), rows: rows, add: a, del: d, kind: ch.Kind}
 		if ch.MovePath != "" {
 			f.movedFrom = f.path
-			f.path = relPath(cwd, ch.MovePath)
+			f.path = sanitizeLine(relPath(cwd, ch.MovePath))
 		}
 		files = append(files, f)
 		tadd += a

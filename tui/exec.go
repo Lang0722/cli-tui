@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -156,7 +157,7 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 		if i == 0 {
 			f = L(S("  └ ", st.Dim))
 		}
-		out = append(out, Wrap(append(L(S(r.label, st.Accent), P(" "), P(r.body)), r.exit...), width, f, L(P("      ")))...)
+		out = append(out, Wrap(append(L(S(r.label, st.Accent), P(" "), P(sanitizeLine(r.body))), r.exit...), width, f, L(P("      ")))...)
 	}
 	return out
 }
@@ -341,11 +342,16 @@ func parseCommand(cmd []string) []protocol.ParsedCommand {
 		return ps
 	}
 	pc := protocol.ParsedCommand{Cmd: script}
+	if hasSideEffects(args) {
+		pc.Kind = protocol.CmdUnknown
+		return []protocol.ParsedCommand{pc}
+	}
 	switch args[0] {
-	case "cat", "bat", "less", "nl", "head", "tail", "sed", "awk":
+	case "cat", "bat", "less", "nl", "head", "tail", "sed":
 		ps := positional(1)
-		if args[0] == "sed" || args[0] == "awk" {
-			if len(ps) < 2 {
+		if args[0] == "sed" {
+			// Like Codex, only "sed [-n] N[,M]p file" is a read.
+			if len(ps) < 2 || !reSedPrint.MatchString(ps[0]) {
 				break
 			}
 			ps = ps[1:]
@@ -403,6 +409,42 @@ func parseCommand(cmd []string) []protocol.ParsedCommand {
 	return []protocol.ParsedCommand{pc}
 }
 
+var reSedPrint = regexp.MustCompile(`^(\d+|\$)(,(\d+|\$))?p$`)
+
+// hasSideEffects reports flags that make an otherwise read-only command
+// write files or run other programs, so it must not be summarized as an
+// exploration.
+func hasSideEffects(args []string) bool {
+	var bad []string
+	switch args[0] {
+	case "sed":
+		for _, a := range args[1:] {
+			if a == "-n" || a == "-E" || a == "-r" || a == "--quiet" || a == "--silent" || !strings.HasPrefix(a, "-") {
+				continue
+			}
+			return true // -i/--in-place (also combined, e.g. -ni) and the rest
+		}
+	case "find":
+		bad = []string{"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
+	case "fd":
+		bad = []string{"-x", "-X", "--exec", "--exec-batch"}
+	case "tree":
+		bad = []string{"-o"}
+	case "rg":
+		bad = []string{"--pre"}
+	case "git":
+		bad = []string{"-O", "--open-files-in-pager"}
+	}
+	for _, a := range args[1:] {
+		for _, b := range bad {
+			if a == b || strings.HasPrefix(a, b+"=") || len(b) == 2 && strings.HasPrefix(a, b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func containsArg(args []string, a string) bool {
 	for _, x := range args {
 		if x == a {
@@ -412,7 +454,9 @@ func containsArg(args []string, a string) bool {
 	return false
 }
 
-// shellSplit splits a simple shell string honoring single/double quotes.
+// shellSplit splits a simple shell string honoring single/double quotes and
+// backslash escapes (POSIX: inside double quotes a backslash only escapes
+// $ ` " \ and newline).
 func shellSplit(s string) []string {
 	var out []string
 	var cur strings.Builder
@@ -429,7 +473,7 @@ func shellSplit(s string) []string {
 		case inD:
 			if c == '"' {
 				inD = false
-			} else if c == '\\' && i+1 < len(s) {
+			} else if c == '\\' && i+1 < len(s) && strings.IndexByte("$`\"\\\n", s[i+1]) >= 0 {
 				i++
 				cur.WriteByte(s[i])
 			} else {
@@ -439,6 +483,10 @@ func shellSplit(s string) []string {
 			inS, has = true, true
 		case c == '"':
 			inD, has = true, true
+		case c == '\\' && i+1 < len(s):
+			i++
+			cur.WriteByte(s[i])
+			has = true
 		case c == ' ' || c == '\t':
 			if cur.Len() > 0 || has {
 				out = append(out, cur.String())

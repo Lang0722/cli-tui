@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"charm.land/lipgloss/v2"
+	"github.com/rivo/uniseg"
 )
 
 // Command describes a slash command shown in the "/" popup.
@@ -183,8 +184,8 @@ func fuzzy(s, q string) int {
 	if q == "" {
 		return 0
 	}
-	ls, lq := strings.ToLower(s), strings.ToLower(q)
-	if i := strings.Index(ls, lq); i >= 0 {
+	ls, lq := strings.ToLower(s), []rune(strings.ToLower(q))
+	if i := strings.Index(ls, string(lq)); i >= 0 {
 		score := 1000 - len(s)
 		base := strings.LastIndex(ls, "/") + 1
 		if i >= base {
@@ -196,8 +197,11 @@ func fuzzy(s, q string) int {
 		return score
 	}
 	qi, score, run := 0, 0, 0
-	for i := 0; i < len(ls) && qi < len(lq); i++ {
-		if ls[i] == lq[qi] {
+	for _, r := range ls { // runes, not bytes: no matches across characters
+		if qi >= len(lq) {
+			break
+		}
+		if r == lq[qi] {
 			qi++
 			run++
 			score += run * 2
@@ -248,7 +252,7 @@ func (p *filePopup) Lines(width int, st *Styles, loading bool) []Line {
 	start := windowStart(p.selected, len(p.matches), popupRows)
 	var out []Line
 	for i := start; i < min(len(p.matches), start+popupRows); i++ {
-		m := middleTruncate(p.matches[i], width-2)
+		m := middleTruncate(sanitizeLine(p.matches[i]), width-2)
 		var l Line
 		if i == p.selected {
 			l = append(L(S("› ", st.AccentB)), highlightMatch(m, p.query, st.AccentB, st.Accent)...)
@@ -333,7 +337,17 @@ func middleTruncate(path string, width int) string {
 	}
 	base := path[strings.LastIndex(path, "/")+1:]
 	if strw(base)+2 >= width {
-		return "…" + string([]rune(base)[max(0, len([]rune(base))-(width-1)):])
+		// keep the last width-1 cells of the name (whole graphemes)
+		var gs []string
+		for g := uniseg.NewGraphemes(base); g.Next(); {
+			gs = append(gs, g.Str())
+		}
+		i, w := len(gs), 0
+		for i > 0 && w+strw(gs[i-1]) <= width-1 {
+			i--
+			w += strw(gs[i])
+		}
+		return "…" + strings.Join(gs[i:], "")
 	}
 	keep := width - strw(base) - 2 // "…" and "/"
 	head := takeWidth(path, keep)

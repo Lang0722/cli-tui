@@ -15,7 +15,7 @@ type composer struct {
 	cursor int // index into text
 
 	history    []string
-	histPastes []map[string]string // paste placeholders per history entry
+	histPastes []map[string]string // paste and image placeholders per history entry
 	histIdx    int                 // len(history) when not browsing
 	histDraft  string
 	pastes     map[string]string
@@ -23,8 +23,9 @@ type composer struct {
 	images     map[string]string // "[Image #N]" -> file path
 	imageCount int
 	killBuf    string
-	search     *historySearch // Ctrl+R reverse-i-search, nil when off
-	shell      bool           // "!" shell-command mode
+	killPHs    map[string]string // placeholders (paste or image) inside killBuf
+	search     *historySearch    // Ctrl+R reverse-i-search, nil when off
+	shell      bool              // "!" shell-command mode
 
 	// popups
 	slash *slashPopup
@@ -39,7 +40,7 @@ func (c *composer) String() string { return string(c.text) }
 func (c *composer) Empty() bool    { return len(c.text) == 0 }
 
 func (c *composer) Set(s string) {
-	c.text = []rune(s)
+	c.text = []rune(expandTabs(s))
 	c.cursor = len(c.text)
 }
 
@@ -64,6 +65,14 @@ func (c *composer) insert(s string) {
 func (c *composer) Paste(s string) {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
+	// Tabs render as several cells (and other controls as escapes), which
+	// would break the row layout: expand tabs and drop control characters.
+	s = strings.Map(func(r rune) rune {
+		if r != '\n' && r != '\t' && (r < 0x20 || r == 0x7f || r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, expandTabs(s))
 	if n := len([]rune(s)); n > 1000 {
 		c.pasteCount++
 		ph := fmt.Sprintf("[Pasted Content %d chars]", n)
@@ -86,14 +95,16 @@ func (c *composer) Submit() string {
 
 func (c *composer) SubmitWithImages() (string, []string) {
 	raw := string(c.text)
-	expanded, images := c.takeImages(raw)
-	for ph, content := range c.pastes {
-		expanded = strings.ReplaceAll(expanded, ph, content)
-	}
+	expanded, images := c.expand(raw, true)
 	used := map[string]string{}
 	for ph, content := range c.pastes {
 		if strings.Contains(raw, ph) {
 			used[ph] = content
+		}
+	}
+	for ph, path := range c.images {
+		if strings.Contains(raw, ph) {
+			used[ph] = path
 		}
 	}
 	c.pastes = map[string]string{}
@@ -163,16 +174,69 @@ func (c *composer) moveVertical(dy, width int) bool {
 	}
 	col := 0
 	idx := r.start
-	for idx < end {
-		w := uniseg.StringWidth(string(c.text[idx]))
-		if col+w > ccol {
+	for _, g := range c.clusters(r.start, end) {
+		if col+g.w > ccol {
 			break
 		}
-		col += w
-		idx++
+		col += g.w
+		idx = g.e
 	}
 	c.cursor = idx
+	c.snapCursor(dy > 0)
 	return true
+}
+
+// cluster is one grapheme cluster: rune range [s,e) and display width.
+type cluster struct{ s, e, w int }
+
+// clusters splits text[a:b] into grapheme clusters.
+func (c *composer) clusters(a, b int) []cluster {
+	var out []cluster
+	g := uniseg.NewGraphemes(string(c.text[a:b]))
+	for i := a; g.Next(); {
+		n := len(g.Runes())
+		out = append(out, cluster{i, i + n, strw(g.Str())})
+		i += n
+	}
+	return out
+}
+
+// prevStop is the cursor position one grapheme (or placeholder) left.
+func (c *composer) prevStop() int {
+	p := max(c.cursor-1, 0)
+	ls := c.cursor
+	for ls > 0 && c.text[ls-1] != '\n' {
+		ls--
+	}
+	if ls < c.cursor {
+		cl := c.clusters(ls, c.cursor)
+		p = cl[len(cl)-1].s
+	}
+	for _, r := range c.placeholderRanges() {
+		if r.start < p && p < r.end || r.end == c.cursor {
+			return r.start
+		}
+	}
+	return p
+}
+
+// nextStop is the cursor position one grapheme (or placeholder) right.
+func (c *composer) nextStop() int {
+	p := min(c.cursor+1, len(c.text))
+	if c.cursor < len(c.text) && c.text[c.cursor] != '\n' {
+		le := c.cursor
+		for le < len(c.text) && c.text[le] != '\n' {
+			le++
+		}
+		g, _, _, _ := uniseg.FirstGraphemeClusterInString(string(c.text[c.cursor:le]), -1)
+		p = c.cursor + len([]rune(g))
+	}
+	for _, r := range c.placeholderRanges() {
+		if r.start < p && p < r.end || r.start == c.cursor {
+			return r.end
+		}
+	}
+	return p
 }
 
 // addHistory records a submitted prompt. pastes maps placeholders in text
@@ -190,7 +254,8 @@ func (c *composer) addHistory(text string, pastes map[string]string) {
 	c.histIdx = len(c.history)
 }
 
-// recall loads history entry i into the editor, restoring its pastes.
+// recall loads history entry i into the editor, restoring its pastes and
+// images.
 func (c *composer) recall(i int) {
 	c.shell = false
 	if h := c.history[i]; len(h) > 1 && h[0] == '!' && c.search == nil {
@@ -200,7 +265,11 @@ func (c *composer) recall(i int) {
 		c.Set(h)
 	}
 	for ph, content := range c.histPastes[i] {
-		c.pastes[ph] = content
+		if strings.HasPrefix(ph, "[Image #") {
+			c.images[ph] = content
+		} else {
+			c.pastes[ph] = content
+		}
 	}
 }
 
@@ -236,17 +305,15 @@ func (c *composer) HandleEditKey(k tea.KeyPressMsg, act string, width int) bool 
 	case "insert_newline":
 		c.insert("\n")
 	case "move_left":
-		if c.cursor > 0 {
-			c.cursor--
-		}
+		c.cursor = c.prevStop()
 	case "move_right":
-		if c.cursor < len(c.text) {
-			c.cursor++
-		}
+		c.cursor = c.nextStop()
 	case "move_word_left":
 		c.cursor = c.wordLeft()
+		c.snapCursor(false)
 	case "move_word_right":
 		c.cursor = c.wordRight()
+		c.snapCursor(true)
 	case "move_line_start":
 		c.cursor, _ = c.lineBounds()
 	case "move_line_end":
@@ -323,31 +390,35 @@ func (c *composer) layout(w int) (rows []row, crow, ccol int) {
 		for end < len(c.text) && c.text[end] != '\n' {
 			end++
 		}
-		// wrap [start,end)
-		s := start
+		// wrap [start,end) at grapheme boundaries
+		cl := c.clusters(start, end)
+		ci := 0
 		for {
-			col, i, lastSpace := 0, s, -1
-			for i < end {
-				cw := uniseg.StringWidth(string(c.text[i]))
-				if col+cw > w {
+			col, j, lastSpace := 0, ci, -1
+			for j < len(cl) {
+				if col+cl[j].w > w && j > ci { // always make progress
 					break
 				}
-				if c.text[i] == ' ' {
-					lastSpace = i
+				if c.text[cl[j].s] == ' ' {
+					lastSpace = j
 				}
-				col += cw
-				i++
+				col += cl[j].w
+				j++
 			}
-			if i >= end {
-				rows = append(rows, row{s, end})
+			rs := start
+			if ci < len(cl) {
+				rs = cl[ci].s
+			}
+			if j >= len(cl) {
+				rows = append(rows, row{rs, end})
 				break
 			}
-			brk := i
-			if lastSpace >= s && lastSpace+1 < i+1 && lastSpace > s {
+			brk := j
+			if lastSpace > ci {
 				brk = lastSpace + 1
 			}
-			rows = append(rows, row{s, brk})
-			s = brk
+			rows = append(rows, row{rs, cl[brk].s})
+			ci = brk
 		}
 		start = end + 1
 	}
@@ -363,7 +434,7 @@ func (c *composer) layout(w int) (rows []row, crow, ccol int) {
 		}
 	}
 	r := rows[crow]
-	ccol = uniseg.StringWidth(string(c.text[r.start:min(c.cursor, r.end)]))
+	ccol = strw(string(c.text[r.start:min(c.cursor, r.end)]))
 	return
 }
 

@@ -24,19 +24,19 @@ type headerCell struct {
 }
 
 func (c headerCell) Lines(width int, st *Styles) []Line {
-	title := L(S(">_ ", st.Dim), S(c.agent, st.Bold))
+	title := L(S(">_ ", st.Dim), S(sanitizeLine(c.agent), st.Bold))
 	if c.version != "" {
-		title = append(title, S(" (v"+c.version+")", st.Dim))
+		title = append(title, S(" (v"+sanitizeLine(c.version)+")", st.Dim))
 	}
-	model := c.model
+	model := sanitizeLine(c.model)
 	if c.effort != "" {
-		model += " " + c.effort
+		model += " " + sanitizeLine(c.effort)
 	}
 	body := []Line{
 		title,
 		{},
 		L(S("model:     ", st.Dim), P(model), S("   /model to change", st.Dim)),
-		L(S("directory: ", st.Dim), P(tildePath(c.cwd))),
+		L(S("directory: ", st.Dim), P(sanitizeLine(tildePath(c.cwd)))),
 	}
 	inner := 0
 	for _, l := range body {
@@ -241,6 +241,7 @@ func (c planCell) Lines(width int, st *Styles) []Line {
 	for _, s := range c.update.Plan {
 		var box Span
 		var body Span
+		s.Step = sanitize(s.Step)
 		switch s.Status {
 		case protocol.PlanCompleted:
 			box, body = S("✔ ", st.Green), S(s.Step, st.Dim.Strikethrough(true))
@@ -281,9 +282,9 @@ func (c *toolCell) TranscriptLines(width int, st *Styles) []Line {
 // "└" row (wrapped at width-4) and the result continues at 4 spaces.
 // Failures keep "Called" with a red bullet and "Error: …" output.
 func (c *toolCell) render(width int, st *Styles, mode outputMode) []Line {
-	name := c.begin.Tool
+	name := sanitizeLine(c.begin.Tool)
 	if c.begin.Server != "" {
-		name = c.begin.Server + "." + name
+		name = sanitizeLine(c.begin.Server) + "." + name
 	}
 	inv := L(S(name, st.Accent))
 	if a := strings.TrimSpace(c.begin.Arguments); a != "" {

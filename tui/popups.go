@@ -1,0 +1,278 @@
+package tui
+
+import (
+	"io/fs"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"charm.land/lipgloss/v2"
+)
+
+// Command describes a slash command shown in the "/" popup.
+type Command struct {
+	Name        string
+	Description string
+	// Local commands are handled by the TUI; others are forwarded to the
+	// backend as protocol.SlashCommand.
+	Local bool
+}
+
+// DefaultCommands mirrors the common Codex slash commands. Pass your own
+// list via Options.Commands to change it.
+var DefaultCommands = []Command{
+	{Name: "model", Description: "choose what model and reasoning effort to use"},
+	{Name: "approvals", Description: "choose what the agent can do without approval"},
+	{Name: "new", Description: "start a new chat during a conversation"},
+	{Name: "init", Description: "create an AGENTS.md file with instructions for the agent"},
+	{Name: "compact", Description: "summarize conversation to prevent hitting the context limit"},
+	{Name: "review", Description: "review my current changes and find issues"},
+	{Name: "diff", Description: "show git diff (including untracked files)", Local: true},
+	{Name: "mention", Description: "mention a file", Local: true},
+	{Name: "status", Description: "show current session configuration and token usage", Local: true},
+	{Name: "transcript", Description: "open the full transcript pager", Local: true},
+	{Name: "resume", Description: "resume a saved conversation", Local: true},
+	{Name: "quit", Description: "exit the app", Local: true},
+	{Name: "exit", Description: "exit the app", Local: true},
+}
+
+const popupRows = 8
+
+type slashPopup struct {
+	all      []Command
+	matches  []Command
+	selected int
+}
+
+func (p *slashPopup) filter(q string) {
+	p.matches = p.matches[:0]
+	var contains []Command
+	for _, c := range p.all {
+		switch {
+		case strings.HasPrefix(c.Name, q):
+			p.matches = append(p.matches, c)
+		case q != "" && fuzzy(c.Name, q) >= 0:
+			contains = append(contains, c)
+		}
+	}
+	p.matches = append(p.matches, contains...)
+	if p.selected >= len(p.matches) {
+		p.selected = max(0, len(p.matches)-1)
+	}
+}
+
+func (p *slashPopup) move(d int) {
+	if n := len(p.matches); n > 0 {
+		p.selected = (p.selected + d + n) % n
+	}
+}
+
+func (p *slashPopup) current() (Command, bool) {
+	if len(p.matches) == 0 {
+		return Command{}, false
+	}
+	return p.matches[p.selected], true
+}
+
+func (p *slashPopup) Lines(width int, st *Styles) []Line {
+	if len(p.matches) == 0 {
+		return []Line{L(P("  "), S("no matches", st.Dim.Italic(true)))}
+	}
+	nameW := 0
+	for _, c := range p.matches {
+		nameW = max(nameW, strw(c.Name)+1)
+	}
+	start := windowStart(p.selected, len(p.matches), popupRows)
+	var out []Line
+	for i := start; i < min(len(p.matches), start+popupRows); i++ {
+		c := p.matches[i]
+		name := "/" + c.Name + strings.Repeat(" ", nameW-strw(c.Name))
+		var l Line
+		if i == p.selected {
+			l = L(S("› ", st.AccentB), S(name, st.AccentB), P("  "), S(c.Description, st.Accent))
+		} else {
+			l = L(P("  "), S(name, st.Plain), P("  "), S(c.Description, st.Dim))
+		}
+		out = append(out, l.Truncate(width))
+	}
+	return out
+}
+
+func windowStart(sel, n, rows int) int {
+	if n <= rows {
+		return 0
+	}
+	s := sel - rows/2
+	return max(0, min(s, n-rows))
+}
+
+// ---------------------------------------------------------------------------
+
+type filePopup struct {
+	query    string
+	matches  []string
+	selected int
+	start    int // token start in composer (rune index of '@')
+	end      int
+}
+
+type fileIndex struct {
+	files []string
+	ready bool
+}
+
+// loadFileIndex lists repo files (git ls-files when possible, else a
+// bounded walk skipping VCS / dependency directories).
+func loadFileIndex(cwd string) []string {
+	if out, err := exec.Command("git", "-C", cwd, "ls-files", "-co", "--exclude-standard").Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) > 0 && lines[0] != "" {
+			return lines
+		}
+	}
+	var files []string
+	skip := map[string]bool{".git": true, "node_modules": true, "target": true, ".venv": true, "vendor": true, "dist": true, "build": true}
+	_ = filepath.WalkDir(cwd, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && skip[d.Name()] {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() {
+			if r, err := filepath.Rel(cwd, p); err == nil {
+				files = append(files, r)
+			}
+		}
+		if len(files) > 50000 {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return files
+}
+
+// fuzzy returns a score (higher is better) or -1 when q is not a
+// subsequence of s. Contiguous runs and basename hits score higher.
+func fuzzy(s, q string) int {
+	if q == "" {
+		return 0
+	}
+	ls, lq := strings.ToLower(s), strings.ToLower(q)
+	if i := strings.Index(ls, lq); i >= 0 {
+		score := 1000 - len(s)
+		base := strings.LastIndex(ls, "/") + 1
+		if i >= base {
+			score += 500
+		}
+		if i == base {
+			score += 200
+		}
+		return score
+	}
+	qi, score, run := 0, 0, 0
+	for i := 0; i < len(ls) && qi < len(lq); i++ {
+		if ls[i] == lq[qi] {
+			qi++
+			run++
+			score += run * 2
+		} else {
+			run = 0
+		}
+	}
+	if qi < len(lq) {
+		return -1
+	}
+	return score - len(s)/4
+}
+
+func (p *filePopup) filter(files []string) {
+	type scored struct {
+		s     string
+		score int
+	}
+	var res []scored
+	for _, f := range files {
+		if sc := fuzzy(f, p.query); sc >= 0 {
+			res = append(res, scored{f, sc})
+		}
+	}
+	sort.SliceStable(res, func(i, j int) bool { return res[i].score > res[j].score })
+	p.matches = p.matches[:0]
+	for i := 0; i < len(res) && i < 50; i++ {
+		p.matches = append(p.matches, res[i].s)
+	}
+	if p.selected >= len(p.matches) {
+		p.selected = 0
+	}
+}
+
+func (p *filePopup) move(d int) {
+	if n := len(p.matches); n > 0 {
+		p.selected = (p.selected + d + n) % n
+	}
+}
+
+func (p *filePopup) Lines(width int, st *Styles, loading bool) []Line {
+	if loading {
+		return []Line{L(P("  "), S("loading…", st.Dim.Italic(true)))}
+	}
+	if len(p.matches) == 0 {
+		return []Line{L(P("  "), S("no matches", st.Dim.Italic(true)))}
+	}
+	start := windowStart(p.selected, len(p.matches), popupRows)
+	var out []Line
+	for i := start; i < min(len(p.matches), start+popupRows); i++ {
+		m := p.matches[i]
+		var l Line
+		if i == p.selected {
+			l = append(L(S("› ", st.AccentB)), highlightMatch(m, p.query, st.AccentB, st.Accent)...)
+		} else {
+			l = append(L(P("  ")), highlightMatch(m, p.query, st.Bold, st.Plain)...)
+		}
+		out = append(out, l.Truncate(width))
+	}
+	return out
+}
+
+func highlightMatch(s, q string, hs, bs lipgloss.Style) Line {
+	ls, lq := strings.ToLower(s), strings.ToLower(q)
+	marks := make([]bool, len(s))
+	if i := strings.LastIndex(ls, lq); i >= 0 && lq != "" {
+		for j := i; j < i+len(lq); j++ {
+			marks[j] = true
+		}
+	} else {
+		qi := 0
+		for i := 0; i < len(ls) && qi < len(lq); i++ {
+			if ls[i] == lq[qi] {
+				marks[i] = true
+				qi++
+			}
+		}
+	}
+	var out Line
+	var cur strings.Builder
+	curMark := false
+	flush := func() {
+		if cur.Len() == 0 {
+			return
+		}
+		st := bs
+		if curMark {
+			st = hs
+		}
+		out = append(out, S(cur.String(), st))
+		cur.Reset()
+	}
+	for i := 0; i < len(s); i++ {
+		if marks[i] != curMark {
+			flush()
+			curMark = marks[i]
+		}
+		cur.WriteByte(s[i])
+	}
+	flush()
+	return out
+}

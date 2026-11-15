@@ -18,6 +18,8 @@ type Command struct {
 	// Local commands are handled by the TUI; others are forwarded to the
 	// backend as protocol.SlashCommand.
 	Local bool
+	// Alias commands (like /exit for /quit) are hidden until typed.
+	Alias bool
 }
 
 // DefaultCommands mirrors the common Codex slash commands. Pass your own
@@ -34,8 +36,12 @@ var DefaultCommands = []Command{
 	{Name: "status", Description: "show current session configuration and token usage", Local: true},
 	{Name: "transcript", Description: "open the full transcript pager", Local: true},
 	{Name: "resume", Description: "resume a saved conversation", Local: true},
+	{Name: "copy", Description: "copy the last response to the clipboard", Local: true},
+	{Name: "export", Description: "export the conversation as markdown", Local: true},
+	{Name: "clear", Description: "clear the terminal and start a new chat", Local: true},
+	{Name: "pwd", Description: "show the current working directory", Local: true},
 	{Name: "quit", Description: "exit the app", Local: true},
-	{Name: "exit", Description: "exit the app", Local: true},
+	{Name: "exit", Description: "exit the app", Local: true, Alias: true},
 }
 
 const popupRows = 8
@@ -44,12 +50,17 @@ type slashPopup struct {
 	all      []Command
 	matches  []Command
 	selected int
+	query    string
 }
 
 func (p *slashPopup) filter(q string) {
 	p.matches = p.matches[:0]
 	var contains []Command
+	p.query = q
 	for _, c := range p.all {
+		if c.Alias && q == "" {
+			continue
+		}
 		switch {
 		case strings.HasPrefix(c.Name, q):
 			p.matches = append(p.matches, c)
@@ -88,12 +99,14 @@ func (p *slashPopup) Lines(width int, st *Styles) []Line {
 	var out []Line
 	for i := start; i < min(len(p.matches), start+popupRows); i++ {
 		c := p.matches[i]
-		name := "/" + c.Name + strings.Repeat(" ", nameW-strw(c.Name))
+		pad := strings.Repeat(" ", nameW-strw(c.Name))
 		var l Line
 		if i == p.selected {
-			l = L(S("› ", st.AccentB), S(name, st.AccentB), P("  "), S(c.Description, st.Accent))
+			l = append(L(S("› ", st.AccentB), S("/", st.AccentB)), highlightMatch(c.Name, p.query, st.AccentB.Underline(true), st.AccentB)...)
+			l = append(l, P(pad+"  "), S(c.Description, st.Accent))
 		} else {
-			l = L(P("  "), S(name, st.Plain), P("  "), S(c.Description, st.Dim))
+			l = append(L(P("  "), S("/", st.Plain)), highlightMatch(c.Name, p.query, st.Bold, st.Plain)...)
+			l = append(l, P(pad+"  "), S(c.Description, st.Dim))
 		}
 		out = append(out, l.Truncate(width))
 	}
@@ -225,7 +238,7 @@ func (p *filePopup) Lines(width int, st *Styles, loading bool) []Line {
 	start := windowStart(p.selected, len(p.matches), popupRows)
 	var out []Line
 	for i := start; i < min(len(p.matches), start+popupRows); i++ {
-		m := p.matches[i]
+		m := middleTruncate(p.matches[i], width-2)
 		var l Line
 		if i == p.selected {
 			l = append(L(S("› ", st.AccentB)), highlightMatch(m, p.query, st.AccentB, st.Accent)...)
@@ -300,4 +313,19 @@ outer:
 		return i
 	}
 	return -1
+}
+
+// middleTruncate shortens a path to width cells by eliding the middle and
+// keeping the file name, like Codex' file search ("src/share…/parser.rs").
+func middleTruncate(path string, width int) string {
+	if strw(path) <= width || width < 8 {
+		return path
+	}
+	base := path[strings.LastIndex(path, "/")+1:]
+	if strw(base)+2 >= width {
+		return "…" + string([]rune(base)[max(0, len([]rune(base))-(width-1)):])
+	}
+	keep := width - strw(base) - 2 // "…" and "/"
+	head := takeWidth(path, keep)
+	return head + "…/" + base
 }

@@ -81,12 +81,22 @@ func tildePath(p string) string {
 
 // ---------------------------------------------------------------------------
 
-type userCell struct{ text string }
+type userCell struct {
+	text    string
+	images  int  // attached images, shown as "[Image #N]" rows above the text
+	command bool // echo of a slash command (not a user message to the backend)
+}
 
 func (c userCell) Lines(width int, st *Styles) []Line {
 	var out []Line
-	band := st.UserBg
+	band := st.HistoryBg
 	out = append(out, Line{}.Fill(width, band))
+	for i := 1; i <= c.images; i++ {
+		out = append(out, L(P("  "), S(fmt.Sprintf("[Image #%d]", i), st.Accent)).Fill(width, band))
+	}
+	if c.images > 0 {
+		out = append(out, Line{}.Fill(width, band))
+	}
 	src := strings.Split(sanitize(c.text), "\n")
 	for i, l := range src {
 		f := L(P("  "))
@@ -106,14 +116,18 @@ func (c userCell) Lines(width int, st *Styles) []Line {
 type agentCell struct{ md string }
 
 func (c agentCell) Lines(width int, st *Styles) []Line {
-	return wrapMarkdown(RenderMarkdown(c.md, st), width, L(S("• ", st.Plain)), L(P("  ")))
+	return wrapMarkdown(RenderMarkdown(c.md, st, width-2), width, L(S("• ", st.Plain)), L(P("  ")))
 }
 
+// reasoningCell is transcript-only in Codex: it shows in Ctrl+T, not in
+// the scrollback (unless Options.ShowReasoning).
 type reasoningCell struct{ text string }
+
+func (reasoningCell) transcriptOnly() bool { return true }
 
 func (c reasoningCell) Lines(width int, st *Styles) []Line {
 	it := st.Dim.Italic(true)
-	md := RenderMarkdown(c.text, st)
+	md := RenderMarkdown(c.text, st, width-2)
 	for i := range md {
 		for j := range md[i].Line {
 			md[i].Line[j].Style = md[i].Line[j].Style.Inherit(it)
@@ -152,12 +166,19 @@ func warningCell(st *Styles, msg string) Cell {
 	return textCell{bullet: S("⚠", st.Magenta), body: L(S(sanitize(msg), st.Plain))}
 }
 
-// separatorCell is the "─ Worked for 1m 05s ───" rule printed at turn end.
-type separatorCell struct{ elapsed time.Duration }
+// separatorCell is Codex' turn footer: "Worked for 1m 05s • 14:02" (the
+// date is added when the turn ended on another day).
+type separatorCell struct {
+	elapsed time.Duration
+	at      time.Time
+}
 
 func (c separatorCell) Lines(width int, st *Styles) []Line {
-	label := "─ Worked for " + fmtElapsed(c.elapsed) + " "
-	return []Line{L(S(label+strings.Repeat("─", max(0, width-strw(label))), st.Dim))}
+	when := c.at.Format("15:04")
+	if y, m, d := c.at.Date(); time.Now().YearDay() != c.at.YearDay() || time.Now().Year() != y {
+		when = fmt.Sprintf("%s %d at %s", m.String()[:3], d, when)
+	}
+	return []Line{L(P("  "), S("Worked for "+fmtElapsed(c.elapsed)+" • "+when, st.Dim))}
 }
 
 // blankCell inserts nothing but the cell separator (used for spacing).
@@ -220,7 +241,15 @@ type toolCell struct {
 	duration time.Duration
 }
 
-func (c *toolCell) Lines(width int, st *Styles) []Line {
+func (c *toolCell) Lines(width int, st *Styles) []Line { return c.render(width, st, 5) }
+
+func (c *toolCell) TranscriptLines(width int, st *Styles) []Line { return c.render(width, st, 0) }
+
+// render follows Codex' MCP/dynamic tool cells:
+//
+//   - Calling                 • Called server.tool(args)   • Failed server.tool(args)
+//     └ server.tool(args)       └ result                     └ error
+func (c *toolCell) render(width int, st *Styles, limit int) []Line {
 	name := c.begin.Tool
 	if c.begin.Server != "" {
 		name = c.begin.Server + "." + name
@@ -229,28 +258,35 @@ func (c *toolCell) Lines(width int, st *Styles) []Line {
 	if a := strings.TrimSpace(c.begin.Arguments); a != "" {
 		inv = append(inv, S("("+oneLine(a)+")", st.Dim))
 	}
+	if !c.done {
+		bullet := S("• ", st.Dim)
+		if blinkOff() {
+			bullet = S("◦ ", st.Dim)
+		}
+		out := []Line{append(L(bullet), st.Shimmer("Calling")...)}
+		return append(out, Wrap(inv, width, L(S("  └ ", st.Dim)), L(P("    ")))...)
+	}
 	var head Line
 	switch {
-	case !c.done:
-		head = append(st.Shimmer("Calling"), P(" "))
-		head = append(L(S("• ", st.Dim)), head...)
+	case c.isError && c.result == "interrupted":
+		head = L(S("• ", st.RedB), S("Interrupted ", st.Bold))
 	case c.isError:
-		head = L(S("• ", st.Red), S("Called ", st.Bold))
+		head = L(S("• ", st.RedB), S("Failed ", st.Bold))
 	default:
-		head = L(S("• ", st.Green), S("Called ", st.Bold))
+		head = L(S("• ", st.GreenB), S("Called ", st.Bold))
 	}
-	if c.done && c.duration > 0 {
+	if c.duration > 0 {
 		inv = append(inv, S(" · "+fmtElapsed(c.duration), st.Dim))
 	}
 	out := Wrap(append(head, inv...), width, nil, L(P("    ")))
-	if c.done {
-		res := strings.TrimRight(sanitize(c.result), "\n")
-		if res == "" {
-			res = "(no output)"
-		}
-		out = append(out, outputLines(strings.Split(res, "\n"), width, st, c.isError, 5)...)
+	res := strings.TrimRight(sanitize(c.result), "\n")
+	if c.isError && c.result == "interrupted" {
+		res = "Interrupted before this tool returned a result."
 	}
-	return out
+	if res == "" {
+		res = "(no output)"
+	}
+	return append(out, outputLines(strings.Split(res, "\n"), width, st, c.isError, limit)...)
 }
 
 func oneLine(s string) string {
@@ -261,34 +297,30 @@ func oneLine(s string) string {
 	return s
 }
 
-// outputLines renders tool/exec output under a "└" elbow, keeping the head
-// and tail when longer than limit (Codex style "… +N lines").
+// outputLines renders tool/exec output under a "└" elbow. With limit > 0
+// it keeps the first and last limit lines around Codex' ellipsis
+// "… +N lines (⌃t to view transcript)"; limit 0 shows everything.
 func outputLines(lines []string, width int, st *Styles, failed bool, limit int) []Line {
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
 	}
 	style := st.Dim
-	if failed {
-		style = st.Red.Faint(true)
-	}
 	if len(lines) == 0 {
 		return []Line{L(S("  └ ", st.Dim), S("(no output)", st.Dim))}
 	}
 	var shown []Line
-	if len(lines) > limit {
-		head := limit / 2
-		tail := limit - head
-		for _, l := range lines[:head] {
+	add := func(ls []string) {
+		for _, l := range ls {
 			shown = append(shown, L(S(l, style)))
 		}
-		shown = append(shown, L(S(fmt.Sprintf("… +%d lines", len(lines)-limit), st.Dim)))
-		for _, l := range lines[len(lines)-tail:] {
-			shown = append(shown, L(S(l, style)))
-		}
+	}
+	if limit > 0 && len(lines) > 2*limit {
+		add(lines[:limit])
+		n := len(lines) - 2*limit
+		shown = append(shown, L(S(fmt.Sprintf("… +%d %s (⌃t to view transcript)", n, pluralWord(n, "line")), st.Dim)))
+		add(lines[len(lines)-limit:])
 	} else {
-		for _, l := range lines {
-			shown = append(shown, L(S(l, style)))
-		}
+		add(lines)
 	}
 	var out []Line
 	for i, l := range shown {
@@ -296,11 +328,16 @@ func outputLines(lines []string, width int, st *Styles, failed bool, limit int) 
 		if i == 0 {
 			f = L(S("  └ ", st.Dim))
 		}
-		// Output rows are truncated rather than wrapped to keep cells compact.
-		row := append(f, l...)
-		out = append(out, row.Truncate(width))
+		out = append(out, Wrap(l, width, f, L(P("    ")))...)
 	}
 	return out
+}
+
+func pluralWord(n int, w string) string {
+	if n == 1 {
+		return w
+	}
+	return w + "s"
 }
 
 func fmtElapsed(d time.Duration) string {

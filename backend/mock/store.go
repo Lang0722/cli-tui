@@ -125,6 +125,31 @@ func (f *sessionFile) record(m protocol.EventMsg, at time.Time) {
 	f.Meta.UpdatedAt = at
 }
 
+// rewind drops user message n (0-based) and everything after it.
+func (f *sessionFile) rewind(n int) {
+	seen := 0
+	for i, m := range f.Events {
+		if _, ok := m.(protocol.UserMessage); ok {
+			if seen == n {
+				f.Events = f.Events[:i]
+				break
+			}
+			seen++
+		}
+	}
+	f.Meta.Messages = 0
+	for _, m := range f.Events {
+		switch m := m.(type) {
+		case protocol.UserMessage:
+			f.Meta.Messages++
+		case protocol.AgentMessage:
+			if strings.TrimSpace(m.Message) != "" {
+				f.Meta.Messages++
+			}
+		}
+	}
+}
+
 // replayable reports whether an event belongs in saved history. Streaming
 // deltas, approvals and turn framing are dropped; final messages and
 // completed tool activity are kept.

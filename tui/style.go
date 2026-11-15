@@ -3,6 +3,7 @@ package tui
 import (
 	"image/color"
 	"math"
+	"os"
 	"time"
 
 	"charm.land/lipgloss/v2"
@@ -29,9 +30,18 @@ type Styles struct {
 	Code    lipgloss.Style
 	Link    lipgloss.Style
 
+	// LinkLabelOnly shows markdown links as their label with an OSC 8
+	// hyperlink (VTE/gnome-terminal, kitty, iTerm2, WezTerm, ...). Off for
+	// terminals without OSC 8, which get "label (url)" like Codex does.
+	LinkLabelOnly bool
+
 	// UserBg is the band behind submitted/editable prompts. Zero when the
 	// terminal background is unknown.
 	UserBg    lipgloss.Style
+	HistoryBg lipgloss.Style // submitted prompts: lighter than the composer
+	DiffAdd   lipgloss.Style // diff row tints (truecolor + known background)
+	DiffDel   lipgloss.Style
+	diffTint  bool
 	hasBg     bool
 	bg, fg    [3]uint8
 	trueColor bool
@@ -40,22 +50,24 @@ type Styles struct {
 func newStyles() *Styles {
 	n := lipgloss.NewStyle()
 	s := &Styles{
-		Plain:   n,
-		Dim:     n.Faint(true),
-		Bold:    n.Bold(true),
-		Italic:  n.Italic(true),
-		Accent:  n.Foreground(lipgloss.Cyan),
-		AccentB: n.Foreground(lipgloss.Cyan).Bold(true),
-		Green:   n.Foreground(lipgloss.Green),
-		GreenB:  n.Foreground(lipgloss.Green).Bold(true),
-		Red:     n.Foreground(lipgloss.Red),
-		RedB:    n.Foreground(lipgloss.Red).Bold(true),
-		Magenta: n.Foreground(lipgloss.Magenta),
-		Code:    n.Foreground(lipgloss.Cyan),
-		Link:    n.Foreground(lipgloss.Cyan).Underline(true),
-		UserBg:  n,
-		fg:      [3]uint8{204, 204, 204},
-		bg:      [3]uint8{0, 0, 0},
+		Plain:         n,
+		Dim:           n.Faint(true),
+		Bold:          n.Bold(true),
+		Italic:        n.Italic(true),
+		Accent:        n.Foreground(lipgloss.Cyan),
+		AccentB:       n.Foreground(lipgloss.Cyan).Bold(true),
+		Green:         n.Foreground(lipgloss.Green),
+		GreenB:        n.Foreground(lipgloss.Green).Bold(true),
+		Red:           n.Foreground(lipgloss.Red),
+		RedB:          n.Foreground(lipgloss.Red).Bold(true),
+		Magenta:       n.Foreground(lipgloss.Magenta),
+		Code:          n.Foreground(lipgloss.Cyan),
+		Link:          n.Foreground(lipgloss.Cyan).Underline(true),
+		UserBg:        n,
+		HistoryBg:     n,
+		LinkLabelOnly: osc8Supported(),
+		fg:            [3]uint8{204, 204, 204},
+		bg:            [3]uint8{0, 0, 0},
 	}
 	return s
 }
@@ -94,7 +106,41 @@ func (s *Styles) SetBackground(c color.Color) {
 		top = [3]uint8{255, 255, 255}
 	}
 	s.UserBg = lipgloss.NewStyle().Background(toColor(blend(top, s.bg, alpha)))
+	// Submitted prompts: white 16% on dark, black 2% on light (Codex
+	// history_prompt_style).
+	hAlpha := 0.16
+	if isLight(s.bg) {
+		hAlpha = 0.02
+	}
+	s.HistoryBg = lipgloss.NewStyle().Background(toColor(blend(top, s.bg, hAlpha)))
+	s.updateDiffTint()
 }
+
+// SetTrueColor records whether the terminal renders 24-bit color.
+func (s *Styles) SetTrueColor(v bool) {
+	s.trueColor = v
+	s.updateDiffTint()
+}
+
+// updateDiffTint sets Codex' diff backgrounds: dark #212922 / #3C170F,
+// light GitHub-style pastels. Only with truecolor and a known background;
+// otherwise diffs use foreground colors alone (like Codex on ANSI-16).
+func (s *Styles) updateDiffTint() {
+	s.diffTint = s.hasBg && s.trueColor
+	if !s.diffTint {
+		return
+	}
+	add, del := [3]uint8{0x21, 0x29, 0x22}, [3]uint8{0x3c, 0x17, 0x0f}
+	if isLight(s.bg) {
+		add, del = [3]uint8{0xe6, 0xff, 0xec}, [3]uint8{0xff, 0xeb, 0xe9}
+	}
+	s.DiffAdd = lipgloss.NewStyle().Background(toColor(add))
+	s.DiffDel = lipgloss.NewStyle().Background(toColor(del))
+}
+
+// blinkOff alternates every 600 ms (Codex' running-bullet blink between
+// "•" and a dim "◦").
+func blinkOff() bool { return (time.Since(processStart)/(600*time.Millisecond))%2 == 1 }
 
 func (s *Styles) SetForeground(c color.Color) { s.fg = rgb(c) }
 
@@ -146,4 +192,13 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 func spinnerFrame() string {
 	i := int(time.Since(processStart)/(80*time.Millisecond)) % len(spinnerFrames)
 	return spinnerFrames[i]
+}
+
+// osc8Supported mirrors Codex' terminal_hyperlinks list.
+func osc8Supported() bool {
+	switch os.Getenv("TERM_PROGRAM") {
+	case "Apple_Terminal", "WarpTerminal":
+		return false
+	}
+	return os.Getenv("TERM") != "dumb"
 }

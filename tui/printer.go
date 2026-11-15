@@ -137,6 +137,13 @@ func (p *printer) quitCmd() tea.Cmd {
 	}
 }
 
+// reset drops everything queued (the transcript is about to be re-emitted).
+func (p *printer) reset() {
+	p.mu.Lock()
+	p.queue = nil
+	p.mu.Unlock()
+}
+
 // takeQueued removes and returns everything queued (for tests, which run
 // without a Bubble Tea program to print into).
 func (p *printer) takeQueued() []string {

@@ -65,13 +65,13 @@ func plain(ls []Line) []string {
 func TestStreamingStable(t *testing.T) {
 	st := newStyles()
 	src := "Intro line\n\n- item one\n- item two\n\n```go\nx := 1\n```\nDone."
-	full := plain(wrapMarkdown(RenderMarkdown(src, st), 40, L(P("• ")), L(P("  "))))
+	full := plain(wrapMarkdown(RenderMarkdown(src, st, 80), 40, L(P("• ")), L(P("  "))))
 	// Every prefix ending at a newline must render as a prefix of the full output.
 	for i := 0; i < len(src); i++ {
 		if src[i] != '\n' {
 			continue
 		}
-		part := plain(wrapMarkdown(RenderMarkdown(src[:i], st), 40, L(P("• ")), L(P("  "))))
+		part := plain(wrapMarkdown(RenderMarkdown(src[:i], st, 80), 40, L(P("• ")), L(P("  "))))
 		for j := range part {
 			if j >= len(full) || part[j] != full[j] {
 				t.Fatalf("prefix %q row %d = %q, full has %q", src[:i], j, part[j], full)
@@ -169,8 +169,8 @@ func TestParseUnifiedWrongCounts(t *testing.T) {
 func TestMarkdownReviewCases(t *testing.T) {
 	st := newStyles()
 	cases := map[string]string{
-		"check arr[0] and [docs](http://x.io)":                          "check arr[0] and docs (http://x.io)",
-		"[Go](https://en.wikipedia.org/wiki/Go_(programming_language))": "Go (https://en.wikipedia.org/wiki/Go_(programming_language))",
+		"check arr[0] and [docs](http://x.io)":                          "check arr[0] and docs",
+		"[Go](https://en.wikipedia.org/wiki/Go_(programming_language))": "Go",
 		"delete *.txt and *.go files":                                   "delete *.txt and *.go files",
 		"costs ~~5 dollars":                                             "costs ~~5 dollars",
 		"~~gone~~ here":                                                 "gone here",
@@ -180,7 +180,7 @@ func TestMarkdownReviewCases(t *testing.T) {
 			t.Errorf("%q -> %q, want %q", in, got, want)
 		}
 	}
-	md := RenderMarkdown("```js``` is inline code\nnext line", st)
+	md := RenderMarkdown("```js``` is inline code\nnext line", st, 80)
 	if len(md) != 2 || md[1].Line.Plain() != "next line" {
 		t.Errorf("inline triple backticks became a fence: %q", plainMD(md))
 	}
@@ -192,4 +192,113 @@ func plainMD(md []mdLine) []string {
 		out = append(out, l.Line.Plain())
 	}
 	return out
+}
+
+func TestMarkdownBlocks(t *testing.T) {
+	st := newStyles()
+	src := "- one\n  - nested\n- [ ] todo\n- [x] done\n1. first\n\n---\n\n> > deep"
+	got := plainMD(RenderMarkdown(src, st, 80))
+	want := []string{"• one", "    • nested", "☐ todo", "☑ done", "1. first", "", "———", "", "> > deep"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("blocks:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestMarkdownTable(t *testing.T) {
+	st := newStyles()
+	src := "| Task | Status |\n|---|---|\n| Parse | done |\n| Test | `wip` |"
+	got := plainMD(RenderMarkdown(src, st, 80))
+	want := []string{" Task    Status", "━━━━━━  ━━━━━━━", " Parse   done", "──────  ───────", " Test    wip"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("table:\n got %q\nwant %q", got, want)
+	}
+	// Too narrow for a grid: key/value records.
+	wide := "| Name | Description | Owner | Due |\n|--|--|--|--|\n| a | something long enough | me | soon |"
+	for _, l := range plainMD(RenderMarkdown(wide, st, 20)) {
+		if strw(l) > 20 {
+			t.Errorf("record row wider than 20: %q", l)
+		}
+	}
+}
+
+func TestStreamingHoldsBackTables(t *testing.T) {
+	src := "intro\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+	if got := tableHoldback(src, len(src)); got != len("intro\n") {
+		t.Errorf("holdback = %d, want %d", got, len("intro\n"))
+	}
+	if got := tableHoldback("plain\n", 6); got != 6 {
+		t.Errorf("no table: holdback = %d", got)
+	}
+}
+
+func TestCodeHighlight(t *testing.T) {
+	st := newStyles()
+	lines := highlightLines("func main() {\n\t// hi\n}", lexerFor("go", ""), st.Code, st)
+	if len(lines) != 3 || lines[0].Plain() != "func main() {" {
+		t.Fatalf("lines: %q", plain(lines))
+	}
+	if len(lines[0]) < 2 {
+		t.Errorf("expected multiple styled spans, got %d", len(lines[0]))
+	}
+}
+
+func TestNotATable(t *testing.T) {
+	got := plainMD(RenderMarkdown("a | b\n---", newStyles(), 80))
+	if len(got) != 2 || got[1] != "———" {
+		t.Errorf("pipe line + rule became a table: %q", got)
+	}
+}
+
+func TestComposerKillYankAtomic(t *testing.T) {
+	c := newComposer()
+	c.Set("hello world")
+	c.kill(c.wordLeft(), c.cursor) // ctrl+w
+	if c.String() != "hello " || c.killBuf != "world" {
+		t.Fatalf("kill: %q buf %q", c.String(), c.killBuf)
+	}
+	c.yank()
+	if c.String() != "hello world" {
+		t.Fatalf("yank: %q", c.String())
+	}
+	c.Clear()
+	c.Paste(strings.Repeat("x", 1500))
+	c.backspace()
+	if !c.Empty() {
+		t.Fatalf("placeholder not deleted as a unit: %q", c.String())
+	}
+	c.AttachImage("/tmp/a.png")
+	c.insert("look")
+	text, imgs := c.SubmitWithImages()
+	if text != "look" || len(imgs) != 1 || imgs[0] != "/tmp/a.png" {
+		t.Fatalf("images: %q %v", text, imgs)
+	}
+}
+
+func TestComposerReverseSearch(t *testing.T) {
+	c := newComposer()
+	for _, h := range []string{"fix parser", "run tests", "fix lexer"} {
+		c.addHistory(h, nil)
+	}
+	c.Set("draft")
+	c.startSearch()
+	c.search.query = "fix"
+	c.searchRefresh()
+	if c.String() != "fix lexer" {
+		t.Fatalf("first match %q", c.String())
+	}
+	c.searchStep(-1)
+	if c.String() != "fix parser" {
+		t.Fatalf("older match %q", c.String())
+	}
+	c.endSearch(false)
+	if c.String() != "draft" {
+		t.Fatalf("cancel should restore draft, got %q", c.String())
+	}
+}
+
+func TestMiddleTruncate(t *testing.T) {
+	got := middleTruncate("src/shared/components/parser_alpha.rs", 24)
+	if strw(got) > 24 || !strings.HasSuffix(got, "/parser_alpha.rs") || !strings.Contains(got, "…") {
+		t.Errorf("middleTruncate = %q", got)
+	}
 }

@@ -12,10 +12,11 @@ import (
 
 // turn is one running request, bound to the session it started in.
 type turn struct {
-	b    *Backend
-	sess *sessionFile
-	ctx  context.Context
-	done chan struct{}
+	b      *Backend
+	sess   *sessionFile
+	ctx    context.Context
+	done   chan struct{}
+	images []string
 }
 
 func (t *turn) emit(m protocol.EventMsg) { t.b.emitIn(t.sess, m) }
@@ -81,6 +82,10 @@ func (t *turn) run(text string) {
 		}
 	case containsAny(lower, "demo", "timeout", "fix", "edit", "refactor"):
 		ok = t.toolDemo(text)
+	case containsAny(lower, "markdown", "table"):
+		ok = t.markdownShowcase()
+	case containsAny(lower, "question", "ask me", "choose"):
+		ok = t.question()
 	case containsAny(lower, "help", "what can you"):
 		ok = t.help()
 	case isGreeting(lower):
@@ -122,6 +127,10 @@ func isGreeting(s string) bool {
 }
 
 const tryList = "- **chat** about anything: I answer with markdown\n" +
+	"- say **markdown** or **table**: tables, code, lists, links\n" +
+	"- say **question**: I ask you to pick an option (or type your own)\n" +
+	"- `!ls` runs a shell command (\"You ran\"); `/model` opens a picker\n" +
+	"- **Esc Esc** to rewind to an earlier prompt, **Ctrl+T** for the transcript\n" +
 	"- say **demo** (or *fix*, *edit*): explore files, propose a patch, ask to run tests\n" +
 	"- say **error** to see an error\n" +
 	"- `/resume` to switch to a saved conversation, `/new` to start over\n" +
@@ -188,6 +197,9 @@ func (t *turn) chat(text string) bool {
 	reply := fmt.Sprintf(chatReplies[int(t.b.turn.Load())%len(chatReplies)], topic)
 	if n := t.b.history(t.sess); n > 1 {
 		reply += fmt.Sprintf("\n\n_(%d earlier messages in this session.)_", n-1)
+	}
+	if len(t.images) > 0 {
+		reply += fmt.Sprintf("\n\nI received %d image(s): `%s`. (The mock can't look at them.)", len(t.images), strings.Join(t.images, "`, `"))
 	}
 	if !t.say(reply) {
 		return false
@@ -284,4 +296,48 @@ func (t *turn) toolDemo(text string) bool {
 		"```go\nctx, cancel := context.WithTimeout(ctx, s.timeout)\ndefer cancel()\n```\n\n" +
 		"Run `go test ./...` to verify. You said: _" + text + "_"
 	return t.say(final)
+}
+
+func (t *turn) markdownShowcase() bool {
+	if !t.stream("**Formatting a sample**", true) || !t.sleep(300*time.Millisecond) {
+		return false
+	}
+	md := "## Rendering sample\n\n" +
+		"| Feature | Status | Notes |\n|---|---|---|\n" +
+		"| Tables | done | column widths fit the terminal |\n" +
+		"| Code | done | highlighted by language |\n" +
+		"| Links | done | [Codex](https://github.com/openai/codex) opens on ctrl+click |\n\n" +
+		"```go\n// Package main says hello.\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\", 42)\n}\n```\n\n" +
+		"- nested lists\n    - like this one\n- [x] task lists\n- [ ] with checkboxes\n\n" +
+		"> quotes, **bold**, *italic*, ~~strikethrough~~ and `inline code`\n\n---\n\n1. ordered\n2. lists"
+	if !t.say(md) {
+		return false
+	}
+	t.addTokens(1500)
+	return true
+}
+
+func (t *turn) question() bool {
+	if !t.stream("**Clarifying the request**", true) || !t.sleep(300*time.Millisecond) {
+		return false
+	}
+	r, ok := t.b.ask(t.ctx, protocol.SelectionRequest{
+		Title:         "Which approach should I take?",
+		Subtitle:      "The mock asks a question mid-turn; the answer comes back as a selection_response.",
+		Items:         []protocol.SelectionItem{{Name: "Minimal fix", Description: "smallest change that works"}, {Name: "Refactor", Description: "clean up while fixing"}, {Name: "Explain only", Description: "no code changes"}},
+		AllowFreeform: true,
+	})
+	if !ok {
+		return false
+	}
+	var reply string
+	switch {
+	case r.Index >= 0:
+		reply = fmt.Sprintf("You picked option %d. I'd proceed with that.", r.Index+1)
+	case r.Text != "":
+		reply = "You wrote: *" + r.Text + "*. Noted."
+	default:
+		reply = "No answer, so I'll stop here."
+	}
+	return t.say(reply)
 }

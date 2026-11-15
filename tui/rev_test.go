@@ -71,7 +71,7 @@ func TestRevMarkdownStrikeUnclosed(t *testing.T) {
 
 func TestRevMarkdownFenceInline(t *testing.T) {
 	st := newStyles()
-	md := RenderMarkdown("```js``` is inline code\nnext line", st)
+	md := RenderMarkdown("```js``` is inline code\nnext line", st, 80)
 	for _, m := range md {
 		t.Logf("%q", m.Line.Plain())
 	}

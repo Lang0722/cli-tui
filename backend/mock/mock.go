@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,9 @@ type Backend struct {
 	mu        sync.Mutex
 	cancel    context.CancelFunc
 	approvals map[string]chan protocol.ReviewDecision
+	answers   map[string]chan protocol.SelectionResponse
+	model     string
+	effort    string
 	turn      atomic.Int64
 	active    *turn        // the running turn, if any
 	cur       *sessionFile // nil until the first message of a new session
@@ -57,6 +61,9 @@ func New(dir string) (*Backend, error) {
 		store:     store{dir: dir},
 		cwd:       cwd,
 		approvals: map[string]chan protocol.ReviewDecision{},
+		answers:   map[string]chan protocol.SelectionResponse{},
+		model:     modelName,
+		effort:    effort,
 		opWake:    make(chan struct{}, 1),
 	}
 	go b.opLoop()
@@ -89,8 +96,11 @@ func ResetDemo(dir string) error {
 }
 
 func (b *Backend) configured(f *sessionFile) protocol.SessionConfigured {
+	b.mu.Lock()
+	model, eff := b.model, b.effort
+	b.mu.Unlock()
 	sc := protocol.SessionConfigured{
-		Model: modelName, ReasoningEffort: effort, Cwd: b.cwd,
+		Model: model, ReasoningEffort: eff, Cwd: b.cwd,
 		Version: version, AgentName: agentName,
 	}
 	if f != nil {
@@ -213,7 +223,26 @@ func (b *Backend) handle(op protocol.Op) {
 		b.active = t
 		b.mu.Unlock()
 		b.emitIn(sess, protocol.UserMessage{Message: op.Text})
+		t.images = op.Images
 		go t.run(op.Text)
+	case protocol.ShellCommand:
+		go b.runShell(op.Command)
+	case protocol.SelectionResponse:
+		b.mu.Lock()
+		ch := b.answers[op.ID]
+		delete(b.answers, op.ID)
+		b.mu.Unlock()
+		if ch != nil {
+			ch <- op
+		}
+	case protocol.Rewind:
+		b.stopTurn()
+		b.mu.Lock()
+		if b.cur != nil {
+			b.cur.rewind(op.UserMessageIndex)
+			_ = b.store.save(b.cur)
+		}
+		b.mu.Unlock()
 	case protocol.Interrupt:
 		b.mu.Lock()
 		if b.cancel != nil {
@@ -250,6 +279,31 @@ func (b *Backend) handle(op protocol.Op) {
 	}
 }
 
+// runShell executes a "!" command the user typed, like Codex' user shell
+// commands: it really runs (bash -lc in the session directory, 60 s limit)
+// and is reported with Source "user_shell".
+func (b *Backend) runShell(command string) {
+	id := fmt.Sprintf("sh-%d", time.Now().UnixNano())
+	argv := []string{"bash", "-lc", command}
+	b.emit(protocol.ExecCommandBegin{CallID: id, Command: argv, Cwd: b.cwd, Source: "user_shell"})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = b.cwd
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		code = 1
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		} else {
+			out = append(out, []byte(err.Error())...)
+		}
+	}
+	b.emit(protocol.ExecCommandEnd{CallID: id, ExitCode: code, AggregatedOutput: string(out), DurationMs: time.Since(start).Milliseconds()})
+}
+
 func (b *Backend) slash(op protocol.SlashCommand) {
 	switch op.Name {
 	case "new":
@@ -262,10 +316,69 @@ func (b *Backend) slash(op protocol.SlashCommand) {
 		b.emit(protocol.BackgroundEvent{Message: "Compacted conversation history"})
 		b.emit(protocol.TokenCount{TotalTokens: 4000, ContextWindow: contextWindow})
 	case "model":
-		b.notice(protocol.BackgroundEvent{Message: modelName + " (" + effort + ") is the only model the mock backend has"})
+		go b.pickModel()
+	case "approvals":
+		go func() {
+			r, ok := b.ask(context.Background(), protocol.SelectionRequest{
+				Title: "Select Approval Mode", Subtitle: "The mock backend always asks; this only demonstrates the picker.",
+				Items: []protocol.SelectionItem{
+					{Name: "Read Only", Description: "ask before every command and edit"},
+					{Name: "Auto", Description: "run safe commands, ask for edits", Current: true},
+					{Name: "Full Access", Description: "never ask"},
+				}})
+			if ok && r.Index >= 0 {
+				b.notice(protocol.BackgroundEvent{Message: "Approval mode set (mock): nothing changes"})
+			}
+		}()
 	default:
 		b.notice(protocol.Warning{Message: "/" + op.Name + " is not implemented by the mock backend"})
 	}
+}
+
+// ask sends a SelectionRequest and waits for the answer.
+func (b *Backend) ask(ctx context.Context, req protocol.SelectionRequest) (protocol.SelectionResponse, bool) {
+	if req.ID == "" {
+		req.ID = fmt.Sprintf("q-%d", time.Now().UnixNano())
+	}
+	ch := make(chan protocol.SelectionResponse, 1)
+	b.mu.Lock()
+	b.answers[req.ID] = ch
+	b.mu.Unlock()
+	b.notice(req)
+	select {
+	case r := <-ch:
+		return r, true
+	case <-ctx.Done():
+		return protocol.SelectionResponse{}, false
+	}
+}
+
+// pickModel is the mock /model: a model picker then an effort picker.
+func (b *Backend) pickModel() {
+	models := []string{"mock-model", "mock-model-fast", "mock-model-large"}
+	var items []protocol.SelectionItem
+	for _, m := range models {
+		items = append(items, protocol.SelectionItem{Name: m, Current: m == b.model,
+			Description: map[string]string{"mock-model": "balanced", "mock-model-fast": "quick answers", "mock-model-large": "slow and thorough"}[m]})
+	}
+	r, ok := b.ask(context.Background(), protocol.SelectionRequest{Title: "Select Model and Effort", Subtitle: "Switch the model for this and future turns", Items: items})
+	if !ok || r.Index < 0 {
+		return
+	}
+	model := models[r.Index]
+	efforts := []string{"low", "medium", "high"}
+	var eitems []protocol.SelectionItem
+	for _, e := range efforts {
+		eitems = append(eitems, protocol.SelectionItem{Name: e, Current: e == b.effort})
+	}
+	r, ok = b.ask(context.Background(), protocol.SelectionRequest{Title: "Select Reasoning Level for " + model, Items: eitems})
+	if !ok || r.Index < 0 {
+		return
+	}
+	b.mu.Lock()
+	b.model, b.effort = model, efforts[r.Index]
+	b.mu.Unlock()
+	b.notice(protocol.BackgroundEvent{Message: "Model changed to " + model + " " + efforts[r.Index]})
 }
 
 func (b *Backend) answer(id string, d protocol.ReviewDecision) {

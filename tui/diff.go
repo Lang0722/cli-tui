@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"charm.land/lipgloss/v2"
 	"fmt"
+	"github.com/alecthomas/chroma/v2"
 	"regexp"
 	"sort"
 	"strconv"
@@ -201,6 +203,7 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 			out = append(out, append(L(S("  └ ", st.Dim)), fileLabel(f)...))
 			indent = "    "
 		}
+		lexer := lexerFor("", f.path)
 		for ri, r := range f.rows {
 			if maxRows > 0 && budget <= 0 {
 				remaining := len(f.rows) - ri
@@ -216,22 +219,48 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 				continue
 			}
 			num := fmt.Sprintf("%*d ", numW, r.num)
-			var sign Span
-			var body Span
-			switch r.kind {
-			case '+':
-				sign, body = S("+", st.Green), S(r.text, st.Green)
-			case '-':
-				sign, body = S("-", st.Red), S(r.text, st.Red)
-			default:
-				sign, body = P(" "), S(r.text, st.Plain)
-			}
-			first := L(P(indent), S(num, st.Dim), sign)
-			rest := L(P(indent + strings.Repeat(" ", numW+2)))
-			out = append(out, Wrap(L(body), width, first, rest)...)
+			_, _, rows := diffLine(r, num, indent, numW, lexer, width, st)
+			out = append(out, rows...)
 		}
 	}
 	return out
+}
+
+// diffLine renders one diff row. With a known background and truecolor,
+// rows get Codex' add/delete tints and syntax highlighting by file type;
+// otherwise the text is green/red like Codex on 16-color terminals.
+func diffLine(r diffRow, num, indent string, numW int, lexer chroma.Lexer, width int, st *Styles) (Line, Line, []Line) {
+	var sign Span
+	var body Line
+	var tint lipgloss.Style
+	tinted := st.diffTint && r.kind != ' '
+	switch r.kind {
+	case '+':
+		sign, tint = S("+", st.Green), st.DiffAdd
+	case '-':
+		sign, tint = S("-", st.Red), st.DiffDel
+	default:
+		sign = P(" ")
+	}
+	switch {
+	case st.diffTint:
+		body = highlightLines(r.text, lexer, st.Plain, st)[0]
+	case r.kind == '+':
+		body = L(S(r.text, st.Green))
+	case r.kind == '-':
+		body = L(S(r.text, st.Red))
+	default:
+		body = L(S(r.text, st.Plain))
+	}
+	first := L(P(indent), S(num, st.Dim), sign)
+	rest := L(P(indent + strings.Repeat(" ", numW+2)))
+	rows := Wrap(body, width, first, rest)
+	if tinted {
+		for i := range rows {
+			rows[i] = rows[i].Fill(width, tint)
+		}
+	}
+	return first, rest, rows
 }
 
 type patchCell struct {
@@ -242,17 +271,17 @@ type patchCell struct {
 }
 
 func (c patchCell) Lines(width int, st *Styles) []Line {
-	bullet := S("•", st.Plain)
-	if c.failed {
-		bullet = S("•", st.Red)
+	return renderPatch(c.changes, c.cwd, "Edited", width, st, 0, S("•", st.Plain))
+}
+
+// patchFailedCell is Codex' "✘ Failed to apply patch" record.
+type patchFailedCell struct{ stderr string }
+
+func (c patchFailedCell) Lines(width int, st *Styles) []Line {
+	msg := strings.TrimSpace(sanitize(c.stderr))
+	if msg == "" {
+		msg = "(error details unavailable)"
 	}
-	out := renderPatch(c.changes, c.cwd, "Edited", width, st, 0, bullet)
-	if c.failed {
-		msg := strings.TrimSpace(c.stderr)
-		if msg == "" {
-			msg = "patch failed"
-		}
-		out = append(out, outputLines(strings.Split(sanitize(msg), "\n"), width, st, true, 5)...)
-	}
-	return out
+	out := []Line{L(S("✘ ", st.RedB), S("Failed to apply patch", st.Red))}
+	return append(out, outputLines(strings.Split(msg, "\n"), width, st, true, toolCallMaxLines)...)
 }

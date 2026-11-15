@@ -1,26 +1,32 @@
 # agenttui
 
-A Go rewrite of the **Codex CLI TUI design** (`codex-rs/tui`), built with
-Bubble Tea v2 and tuned for **gnome-terminal (VTE)**. It contains no agent
-logic: it drives *your* agent loop through a small event protocol.
+A Go terminal UI for agent loops. It re-implements the **design and
+interaction model of the Codex CLI TUI** (`codex-rs/tui`) with Bubble Tea v2.
+It is tuned for **gnome-terminal (VTE)** and drives *your* agent loop through
+a small event protocol.
+
+**Scope, honestly:** Codex's TUI is about 335k lines of Rust. This is about
+9k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
+streaming, composer, approvals, pickers, transcript pager, resume and
+backtrack. Much of the rest of Codex depends on Codex's own services (login,
+model catalog, MCP setup, plugins, voice, cloud tasks, the agents dashboard),
+and that part is out of scope. The [parity table](#parity-with-codex) at the
+end lists each area.
 
 ```
 ╭─────────────────────────────────────────────────╮
 │ >_ Agent (v0.1.0)                               │
 │                                                 │
 │ model:     mock-model medium   /model to change │
-│ directory: ~/agenttui                           │
+│ directory: ~/cli-tui                            │
 ╰─────────────────────────────────────────────────╯
 
 › please add a timeout
 
-• I'll start by exploring the project structure.
-
 • Explored
   └ List ls -la
-    Read go.mod
+    Read go.mod, server.go
     Search TODO in internal
-    Read server.go
 
 • Edited internal/server.go (+3 -2)
     40      ctx := r.Context()
@@ -31,7 +37,10 @@ logic: it drives *your* agent loop through a small event protocol.
   └ ok      example/internal    0.412s
 
 • Planning the fix (14s • esc to interrupt)
-  ↳ queued follow-up
+
+• Queued follow-up inputs
+  ↳ also update the docs
+    ⇧← edit last queued message
 
 › Ask Agent to do anything
   ? for shortcuts                                    89% context left
@@ -47,31 +56,23 @@ go build -o agenttui ./cmd/agenttui
 ./agenttui resume
 ```
 
-That opens the session picker with four saved demo conversations (a
-debugging session with edits and a failing test, a pure Q&A chat, an
-interrupted feature, and a short one-off). Type to search, ↑/↓ to choose,
-Enter to resume: the conversation is replayed into the scrollback and you can
-keep chatting in it. Esc starts a new session instead.
+This opens the picker with four saved demo conversations; Enter resumes one
+and you keep chatting. The built-in mock agent reacts to keywords:
 
-In any session, the mock agent reacts to what you type:
+| type | what you get |
+|---|---|
+| anything | a markdown chat answer |
+| `demo` / `fix` / `edit` | a full coding turn: exploration, plan, patch approval, command approval, tool call, summary |
+| `markdown` / `table` | tables, highlighted code, nested and task lists, quotes, links |
+| `question` | a mid-turn question picker (choose, or type your own answer) |
+| `error` | an error event |
+| `!ls -la` | a real shell command you run ("You ran") |
+| `/model`, `/approvals` | backend-driven pickers |
 
-- anything else: a chat answer in markdown
-- `hello` / `help`: what to try
-- a message containing `demo`, `fix` or `edit`: a full coding turn
-  (exploration, plan, patch approval, command approval, tool call, summary)
-- `error`: an error event
-- `/resume` switches conversations, `/new` starts a fresh one, `/status`,
-  `/diff`, `/transcript` (or Ctrl+T)
-
-Everything you type is saved, so after quitting (Ctrl+C twice) you can come
-back to it:
-
-```bash
-./agenttui resume -last
-```
-
-Sessions live in `~/.local/share/agenttui/mock-sessions` (change it with
-`-sessions DIR`). `./agenttui -reset-demo` restores the original demo history.
+Then try Ctrl+T (transcript), Esc Esc (rewind to an earlier prompt), Ctrl+R
+(history search), `/export`, and quitting followed by `./agenttui resume -last`.
+Sessions live in `~/.local/share/agenttui/mock-sessions`. Use `-sessions DIR`
+to change that, and `-reset-demo` to restore the demo history.
 
 ## Run
 
@@ -79,152 +80,183 @@ Sessions live in `~/.local/share/agenttui/mock-sessions` (change it with
 ./agenttui                                        # new session, mock backend
 ./agenttui resume [-last | -id ID]                # resume a saved session
 ./agenttui -- python3 examples/echo_agent.py      # your agent loop as a subprocess
-./agenttui resume -- python3 my_agent.py          # ...with resume, if it supports it
 ```
 
-Other flags: `-show-reasoning`, `-steer`, `-notify=false`, `-log FILE` (where the
-backend's stderr goes).
+Other flags:
+- `-show-reasoning`: also print reasoning into the scrollback (otherwise it appears in Ctrl+T only, as in Codex).
+- `-steer`: Enter sends input immediately while a turn runs (otherwise it is queued).
+- `-notify=false`
+- `-no-reflow`
+- `-log FILE`: backend stderr.
 
-Requires Go 1.26+ (the Bubble Tea v2 dependency tree needs it; `GOTOOLCHAIN=auto` fetches it).
+Go 1.26+ is required. Dependencies are vendored, so builds work offline.
 
 ## Plugging in your agent loop
 
-There are two ways to connect your backend.
+There are two ways to connect it.
 
-**In-process (Go):** implement `protocol.Backend`:
+**In-process (Go):** implement `protocol.Backend`.
+- `Submit` must not block for a whole turn.
+- `Events` is the event stream; close it when the backend exits.
 
 ```go
 type Backend interface {
-    Submit(ctx context.Context, op protocol.Op) error // must not block for a whole turn
-    Events() <-chan protocol.Event                    // close it to signal shutdown
+    Submit(ctx context.Context, op protocol.Op) error
+    Events() <-chan protocol.Event
 }
-
 tui.Run(ctx, tui.Options{Backend: myLoop})
 ```
 
-**Subprocess (any language):** one JSON object per line, as in `protocol/wire.go`:
+**Subprocess (any language):** exchange one JSON object per line.
+- Ops go to the agent's stdin, events come back on its stdout.
+- `examples/echo_agent.py` is a complete reference of about 100 lines.
+- `backend/mock` shows realistic event ordering, session storage, rewind and pickers.
 
 ```
-stdin  ← {"type":"user_input","text":"fix the tests"}
+stdin  ← {"type":"user_input","text":"fix the tests","images":["/tmp/a.png"]}
 stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 ```
 
-`examples/echo_agent.py` is a complete ~100-line reference with streaming,
-command approval and interrupts. `backend/mock` shows the full event ordering
-for a realistic turn, plus session storage and resume.
-
-### Resume
-
-Your backend owns the history; the UI never writes it. To support resume,
-answer `list_sessions` with `session_list`, and `resume_session` with a
-`session_configured` whose `initial_messages` holds the past events in order.
-Use the same event types as live turns: `user_message`, `agent_message`,
-`exec_command_begin`/`end`, `patch_apply_begin`, `plan_update`,
-`tool_call_begin`/`end`, `token_count`, `error`, `turn_aborted`, ….
-Replay skips approval requests and turn timers, and fills ↑ history with the
-past prompts. Backends that ignore these ops still work: after 4 s the UI says
-so and starts a new session. `backend/mock/store.go` shows one way to record
-sessions: keep final messages and finished tool events, drop deltas.
-
 ### Ops (UI → backend)
 
-| op | when |
+| op | sent when |
 |---|---|
-| `user_input{text}` | Enter (or a queued message after the turn ends) |
-| `interrupt` | Esc / Ctrl+C while running → reply with `turn_aborted` |
-| `exec_approval{call_id,decision}` / `patch_approval{…}` | answer to an approval modal; decision ∈ `approved`, `approved_for_session`, `denied`, `abort` |
-| `slash_command{name,args}` | non-local slash commands (`/new`, `/model`, `/compact`, `/init`, …) |
-| `list_sessions` | `agenttui resume` or `/resume` → reply with `session_list` |
-| `resume_session{id}` | a session was picked (`id` empty = most recent) → reply with `session_configured` carrying `initial_messages` |
+| `user_input{text,images?}` | Enter, or a queued message when the turn ends. Images come from Ctrl+V / Alt+V or a pasted image path. |
+| `interrupt` | Esc or Ctrl+C while running; reply with `turn_aborted` |
+| `exec_approval` / `patch_approval{call_id,decision}` | answers an approval. `decision` is one of `approved`, `approved_for_session`, `denied`, `abort`. |
+| `shell_command{command}` | `!cmd` shell mode; run it and report it with `exec_command_*` and `source:"user_shell"` |
+| `selection_response{id,index,text?}` | answers a `selection_request`; `index` -1 means cancelled or answered with `text` |
+| `rewind{user_message_index}` | Esc Esc then Enter: drop that user message (0-based) and everything after it |
+| `slash_command{name,args}` | backend slash commands (`/new`, `/model`, `/compact`, `/init`, `/review`, …) |
+| `list_sessions` / `resume_session{id}` | resume picker / chosen session (an empty id means the most recent) |
 | `shutdown` | UI exit |
 
 ### Events (backend → UI)
 
-Every event is optional. A turn should be framed by `task_started` …
-`task_complete` (or `turn_aborted`).
+Every event is optional. A turn is framed by `task_started` … `task_complete`
+(or `turn_aborted`).
 
 | event | renders as |
 |---|---|
-| `session_configured` | header box (model, cwd, `agent_name` replaces "Agent"); with `initial_messages` the saved conversation is replayed under it |
-| `session_list{sessions:[{id,title,cwd,updated_at,messages}]}` | the resume picker |
-| `user_message{message}` | a past prompt; only rendered inside `initial_messages` |
-| `agent_message_delta` / `agent_message` | `• …` markdown, streamed line by line into scrollback |
-| `agent_reasoning_delta` | its latest `**bold title**` becomes the shimmering status header |
-| `exec_command_begin/output_delta/end` | `• Running` → `• Ran cmd` + `└ output` (head/tail, `… +N lines`); read/ls/rg/grep/cat/sed runs merge into `• Explored`. Send `parsed_cmd` to classify commands yourself, otherwise a built-in parser does it |
-| `exec_approval_request` / `apply_patch_approval_request` | numbered modal (y / p·a / esc), diff preview for patches |
-| `patch_apply_begin/end` | `• Edited path (+a -d)` with a line-numbered diff |
-| `tool_call_begin/end` | `• Calling server.tool(args)` → `• Called …` |
+| `session_configured` | the header box. With `initial_messages` the saved conversation is replayed; set `resumed:true` when answering a resume. |
+| `agent_message_delta` / `agent_message` | `• …` markdown streamed into scrollback line by line. Tables are held back until complete; dropped deltas are repaired from the final message. |
+| `agent_reasoning_delta` / `agent_reasoning` | the latest `**title**` becomes the status header; the text goes to the Ctrl+T transcript |
+| `exec_command_begin` / `output_delta` / `end` | `• Running` → `• Ran cmd`, with the first and last 5 output lines around `… +N lines (⌃t to view transcript)`. Reads, lists and searches merge into `• Explored`, with `(exit N)` on failures. |
+| `exec_approval_request` / `apply_patch_approval_request` | numbered approval modal; Ctrl+A shows the full command or diff |
+| `patch_apply_begin` / `end` | `• Edited path (+a -d)` with a line-numbered, tinted, syntax-highlighted diff; `✘ Failed to apply patch` on failure |
+| `tool_call_begin` / `end` | `• Calling` / `• Called server.tool(args)` / `• Failed` |
 | `plan_update` | `• Updated Plan · 1/3 complete` checklist |
-| `token_count` | `N% context left` in the footer |
-| `error` / `warning` / `background_event` | `■` red / `⚠` / dim `•` lines |
-| `stream_error` | transient detail under the status line |
-
-## How it maps to Codex
-
-| Codex (`codex-rs/tui/src`) | here |
-|---|---|
-| `insert_history.rs` (inline viewport, history in native scrollback) | `tui/app.go` printer goroutine + `tea.Println`, no alt-screen |
-| `history_cell/`, `exec_cell/` | `tui/cells.go`, `tui/exec.go` |
-| `diff_render.rs` | `tui/diff.go` |
-| `markdown_render.rs`, `markdown_stream.rs` | `tui/markdown.go` (forward-only, so lines can be committed as they complete) |
-| `bottom_pane/chat_composer.rs`, `textarea.rs` | `tui/composer.go` |
-| `command_popup.rs`, `file_search_popup.rs` | `tui/popups.go` |
-| `approval_overlay.rs` | `tui/approval.go` |
-| `status_indicator_widget.rs`, `shimmer.rs` | `statusLines` in `app.go`, `Shimmer` in `style.go` |
-| `footer.rs` | `footerLine` / `shortcutLines` in `app.go` |
-| `pager_overlay.rs` (Ctrl+T transcript) | `tui/pager.go` |
-| `styles.md` palette | `tui/style.go` (ANSI cyan/green/red/magenta + dim/bold only) |
+| `selection_request{id,title,items,allow_freeform}` | a picker in place of the composer (digits, j/k, search when there are more than 9 items) |
+| `session_list` | the resume picker |
+| `token_count` | `N% context left` (or `NK used`) |
+| `error` / `warning` / `background_event` | `■` red, `⚠`, dim `•` |
+| `stream_error` | a transient detail line under the status row |
 
 ## Keys
 
 | key | action |
 |---|---|
-| Enter | send (while running: queue; with `-steer`: send now) |
-| Ctrl+J / Alt+Enter | newline (Shift+Enter too, if the terminal reports it) |
+| Enter | send (queues while running, or sends now with `-steer`) |
 | Tab | queue a message while running; complete in popups |
-| `/` · `@` | command popup · fuzzy file search (git ls-files) |
-| Esc | interrupt · close popup · Esc Esc edits the previous message |
+| Ctrl+J / Alt+Enter / Shift+Enter* | newline |
+| `/` · `@` · `!` | command popup · fuzzy file search · shell mode |
+| Esc | interrupt; close a popup. With an empty composer, Esc Esc opens backtrack: ←/→ pick a prompt, Enter rewinds. |
 | Ctrl+C | clear input → interrupt → press twice to quit |
-| ↑/↓ | history at the edges of the composer |
-| Ctrl+G | edit the prompt in `$VISUAL`/`$EDITOR` |
-| Ctrl+T | full transcript pager (re-wrapped to the current width) |
-| `/resume` | session picker (type to search, Enter resume, Esc cancel) |
+| ↑/↓, Ctrl+R / Ctrl+S | history; reverse-i-search |
+| Ctrl+W, Alt+Backspace, Ctrl+Backspace, Ctrl+U/K, Alt+D, Ctrl+Y | word and line kills, then yank |
+| Ctrl+V / Alt+V | paste a clipboard image (needs `wl-paste` or `xclip`) |
+| Ctrl+G | edit the prompt in `$VISUAL` / `$EDITOR` |
+| Shift+← / Alt+↑ | pop the last queued message back for editing |
+| Ctrl+T | transcript pager: `/` find, `n`/`N`, pgup/pgdn, home/end, q |
+| Ctrl+O · Ctrl+L · Ctrl+Z | copy last response · clear the screen · suspend |
 | `?` | shortcut overlay (empty composer) |
-| Ctrl+W, Alt+Backspace, Ctrl+Backspace | delete word; Ctrl+U/K kill to line start/end; Ctrl+A/E, Alt+B/F |
+
+\* Shift+Enter works only if the terminal reports it (kitty keyboard protocol);
+the overlay shows ⇧enter or ⌃j accordingly.
+
+Local slash commands: `/status`, `/diff` (opens a pager), `/transcript`,
+`/resume`, `/copy`, `/export [file]`, `/clear`, `/pwd`, `/mention`, `/quit`.
+All other commands are forwarded to the backend.
 
 ## gnome-terminal notes
 
-- **Inline, not fullscreen.** The transcript lives in VTE's real scrollback,
-  so the scrollbar, mouse wheel, Ctrl+Shift+F search and text selection all
-  work. Mouse reporting is never turned on.
-- **Shift+Enter.** VTE without the kitty keyboard protocol sends the same
-  byte for Enter and Shift+Enter, so the footer advertises Ctrl+J. Alt+Enter
-  also works.
-- **Ctrl+Backspace** arrives as `^H` in VTE and deletes a word.
-- **Colors.** Text uses only the 16 ANSI colors, so your gnome-terminal
-  palette (Tango, Solarized, …) applies. The prompt band and the shimmer are
-  RGB blends of the real background, which is read through OSC 11 (VTE answers
-  it). Light and dark profiles both work.
-- **Links** in agent markdown are OSC 8 hyperlinks (Ctrl+click opens them).
-- **Notifications.** When the window is unfocused (focus reporting), the end
-  of a turn or an approval request rings the bell and sends OSC 777
-  `notify`. Fedora and Ubuntu builds of gnome-terminal show that as a desktop
-  notification.
-- **Window title** shows a spinner while a turn runs.
-- **Inside tmux**, `scroll-on-clear` can copy redrawn frames into the
-  scrollback when the UI starts at the very top of a cleared screen. The UI
-  avoids this by starting one line down.
-- **Resizing.** Scrollback is pre-wrapped, as in Codex, so VTE's rewrap can
-  leave odd breaks after you shrink the window. Ctrl+T re-renders everything at
-  the new width.
+- **Inline, not fullscreen.** The transcript is the terminal's real
+  scrollback: scrollbar, wheel, Ctrl+Shift+F and selection all work. Mouse
+  reporting is never enabled.
+- **Resize reflow** (as in Codex): after a width change the screen and the
+  scrollback are cleared, and the transcript is re-emitted at the new width.
+  This also clears shell output from before the session started; use
+  `-no-reflow` to keep it.
+- **Colors.** Text uses the 16 ANSI colors, so your profile's palette applies.
+  The prompt bands, the shimmer and the diff tints are blended from the real
+  background, read via OSC 11.
+- **Links** are OSC 8 hyperlinks showing only their label (Ctrl+click opens
+  them).
+- **Clipboard.** VTE ignores OSC 52, so `/copy` and Ctrl+O use `wl-copy`,
+  `xclip` or `xsel`.
+- **Notifications.** When the window is unfocused, a finished turn or an
+  approval or question rings the bell and sends OSC 777 (desktop notifications
+  in Fedora and Ubuntu builds). The window title shows a spinner while
+  working, and a blinking `[ ! ] Action Required` while input is needed.
+
+## Parity with Codex
+
+This was checked against an inventory of the Codex TUI source and its render
+snapshots.
+
+**Implemented**
+- **Transcript cells:** user, agent, reasoning, exec ("Ran", "You ran",
+  "Explored"), patch, plan, tool calls, approval records, errors and warnings,
+  session header, turn separator.
+- **Streaming:** newline-gated commits, a live tail, table holdback, and repair
+  of dropped deltas.
+- **Composer:**
+  - Emacs-style editing keys, kill and yank, history, reverse-i-search.
+  - Large pastes collapse into placeholders that delete as a unit; image
+    attachments.
+  - External editor, `!` shell mode, queued messages with their preview.
+  - Footer modes and the `?` overlay.
+- **Popups and modals:**
+  - Slash and `@` popups.
+  - Approval modal with its variants' options and "view all".
+  - Generic pickers and questions, resume picker.
+- **Transcript and history:** Ctrl+T transcript with find; Esc Esc
+  backtrack and rewind; resize reflow.
+- **Rendering:**
+  - Markdown with tables (falling back to records when narrow), task lists,
+    nested lists, quotes, rules and highlighted code.
+  - Diffs with tints and highlighting.
+- **Terminal and session:** title, notifications, resume, `/copy`,
+  `/export`, `/clear`.
+
+**Not ported**
+
+- **Codex-specific:** login and onboarding, model catalog and rate-limit
+  cards, MCP inventory and elicitation forms, plugins, apps and skills, voice
+  and realtime, agents command center and side conversations, worktrees,
+  goals, pets, hooks, Daybreak, update prompts. Generic equivalents are the
+  backend-driven `selection_request` and slash-command forwarding.
+- **Secondary, not done yet:**
+  - The fullscreen "owned transcript" mode, with mouse selection and semantic
+    copy.
+  - Vim mode and the remappable keymap (`/keymap`, leader chords).
+  - Mermaid and TeX-math rendering.
+  - Smooth line-by-line commit animation. Lines appear as soon as they
+    complete, which is equivalent to Codex's catch-up mode.
+  - Configurable status line and title items (`/statusline`, `/title`);
+    raw mode (`/raw`); the warnings view (F2).
+  - Inline image previews (Kitty/Sixel; VTE has no Kitty graphics).
+  - Paste-burst detection for terminals without bracketed paste. VTE has
+    bracketed paste.
 
 ## Layout
 
 ```
-protocol/        backend contract + JSONL codec
-backend/mock     scripted demo agent with saved sessions + seeded demo history
+protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, wire.go)
+backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, real "!" commands
 backend/stdio    subprocess adapter (any language)
-tui/             the UI
+tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
+                 approval, interaction, pager, printer, resume)
 cmd/agenttui     entry point
 examples/        echo_agent.py reference backend
 ```

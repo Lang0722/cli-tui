@@ -20,6 +20,11 @@ type composer struct {
 	histDraft  string
 	pastes     map[string]string
 	pasteCount int
+	images     map[string]string // "[Image #N]" -> file path
+	imageCount int
+	killBuf    string
+	search     *historySearch // Ctrl+R reverse-i-search, nil when off
+	shell      bool           // "!" shell-command mode
 
 	// popups
 	slash *slashPopup
@@ -27,7 +32,7 @@ type composer struct {
 }
 
 func newComposer() *composer {
-	return &composer{pastes: map[string]string{}}
+	return &composer{pastes: map[string]string{}, images: map[string]string{}}
 }
 
 func (c *composer) String() string { return string(c.text) }
@@ -72,10 +77,16 @@ func (c *composer) Paste(s string) {
 	c.insert(s)
 }
 
-// Submit returns the expanded text and records it in history.
+// Submit returns the expanded text plus attached image paths, and records
+// the prompt in history.
 func (c *composer) Submit() string {
+	text, _ := c.SubmitWithImages()
+	return text
+}
+
+func (c *composer) SubmitWithImages() (string, []string) {
 	raw := string(c.text)
-	expanded := raw
+	expanded, images := c.takeImages(raw)
 	for ph, content := range c.pastes {
 		expanded = strings.ReplaceAll(expanded, ph, content)
 	}
@@ -86,9 +97,10 @@ func (c *composer) Submit() string {
 		}
 	}
 	c.pastes = map[string]string{}
+	c.images = map[string]string{}
 	c.addHistory(raw, used)
 	c.Clear()
-	return expanded
+	return expanded, images
 }
 
 func (c *composer) lineBounds() (start, end int) {
@@ -180,7 +192,13 @@ func (c *composer) addHistory(text string, pastes map[string]string) {
 
 // recall loads history entry i into the editor, restoring its pastes.
 func (c *composer) recall(i int) {
-	c.Set(c.history[i])
+	c.shell = false
+	if h := c.history[i]; len(h) > 1 && h[0] == '!' && c.search == nil {
+		c.shell = true // a recalled "!cmd" re-enters shell mode
+		c.Set(h[1:])
+	} else {
+		c.Set(h)
+	}
 	for ph, content := range c.histPastes[i] {
 		c.pastes[ph] = content
 	}
@@ -247,30 +265,28 @@ func (c *composer) HandleEditKey(k tea.KeyPressMsg, width int) bool {
 		if !c.moveVertical(1, width) {
 			c.cursor = len(c.text)
 		}
-	case "backspace":
-		if c.cursor > 0 {
-			c.deleteRange(c.cursor-1, c.cursor)
-		}
-	case "delete", "ctrl+d":
-		if c.cursor < len(c.text) {
-			c.deleteRange(c.cursor, c.cursor+1)
-		}
-	case "ctrl+w", "alt+backspace", "ctrl+h", "ctrl+backspace":
-		c.deleteRange(c.wordLeft(), c.cursor)
+	case "backspace", "shift+backspace":
+		c.backspace()
+	case "delete", "ctrl+d", "shift+delete":
+		c.deleteForward()
+	case "ctrl+w", "alt+backspace", "ctrl+h", "ctrl+backspace", "ctrl+alt+h":
+		c.kill(c.wordLeft(), c.cursor)
 	case "alt+d", "alt+delete", "ctrl+delete":
-		c.deleteRange(c.cursor, c.wordRight())
+		c.kill(c.cursor, c.wordRight())
 	case "ctrl+u":
 		s, _ := c.lineBounds()
 		if s == c.cursor && s > 0 {
 			s--
 		}
-		c.deleteRange(s, c.cursor)
+		c.kill(s, c.cursor)
 	case "ctrl+k":
 		_, e := c.lineBounds()
 		if e == c.cursor && e < len(c.text) {
 			e++
 		}
-		c.deleteRange(c.cursor, e)
+		c.kill(c.cursor, e)
+	case "ctrl+y":
+		c.yank()
 	case "tab":
 		c.insert("    ")
 	default:
@@ -349,6 +365,10 @@ func (c *composer) Render(width int, st *Styles, placeholder string, focused boo
 	if !focused {
 		prompt = S("›", st.Dim)
 	}
+	if c.shell {
+		prompt = S("!", st.AccentB)
+		placeholder = "Run a shell command"
+	}
 	if c.Empty() {
 		l := L(prompt, P(" "), S(placeholder, st.Dim)).Truncate(width)
 		return []Line{l.Fill(width, band)}, 0, 2
@@ -371,7 +391,7 @@ func (c *composer) styled(text string, st *Styles) Line {
 	var out Line
 	for text != "" {
 		best, bestLen := -1, 0
-		for ph := range c.pastes {
+		for _, ph := range c.placeholders() {
 			if i := strings.Index(text, ph); i >= 0 && (best < 0 || i < best) {
 				best, bestLen = i, len(ph)
 			}

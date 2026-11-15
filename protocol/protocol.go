@@ -29,6 +29,16 @@ type Op interface{ opType() string }
 // into the running one).
 type UserInput struct {
 	Text string `json:"text"`
+	// Images are local file paths attached with Ctrl+V / Alt+V (clipboard
+	// image saved as PNG) or by pasting/dragging an image file path.
+	Images []string `json:"images,omitempty"`
+}
+
+// ShellCommand is a command the user typed in "!" shell mode. The backend
+// runs it and reports it with ExecCommandBegin/End carrying
+// Source: "user_shell" (rendered as "You ran").
+type ShellCommand struct {
+	Command string `json:"command"`
 }
 
 // Interrupt asks the backend to abort the running turn. The backend should
@@ -59,6 +69,7 @@ type Shutdown struct{}
 
 func (UserInput) opType() string     { return "user_input" }
 func (Interrupt) opType() string     { return "interrupt" }
+func (ShellCommand) opType() string  { return "shell_command" }
 func (ExecApproval) opType() string  { return "exec_approval" }
 func (PatchApproval) opType() string { return "patch_approval" }
 func (SlashCommand) opType() string  { return "slash_command" }
@@ -183,6 +194,9 @@ type ExecCommandBegin struct {
 	Command []string        `json:"command"`
 	Cwd     string          `json:"cwd,omitempty"`
 	Parsed  []ParsedCommand `json:"parsed_cmd,omitempty"`
+	// Source is "user_shell" for ShellCommand executions (rendered "You
+	// ran" with a 50-line output preview); empty for the agent's commands.
+	Source string `json:"source,omitempty"`
 }
 
 // ExecCommandOutputDelta streams command output.

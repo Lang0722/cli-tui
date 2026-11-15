@@ -25,11 +25,11 @@ func init() {
 		ExecCommandEnd{}, ExecApprovalRequest{}, ApplyPatchApprovalRequest{},
 		PatchApplyBegin{}, PatchApplyEnd{}, ToolCallBegin{}, ToolCallEnd{},
 		PlanUpdate{}, TokenCount{}, BackgroundEvent{}, Warning{}, Error{},
-		StreamError{}, ShutdownComplete{}, SessionList{}, UserMessage{},
+		StreamError{}, ShutdownComplete{}, SessionList{}, UserMessage{}, SelectionRequest{},
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}
-	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}} {
+	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}} {
 		opTypes[o.opType()] = reflect.TypeOf(o)
 	}
 }

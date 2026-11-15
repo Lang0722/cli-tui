@@ -43,6 +43,7 @@ func main() {
 	logPath := fs.String("log", "", "file for backend stderr (default: discard)")
 	sessionsDir := fs.String("sessions", mock.DefaultDir(), "mock backend: directory with saved sessions")
 	resetDemo := fs.Bool("reset-demo", false, "mock backend: delete saved sessions and restore the demo history")
+	noReflow := fs.Bool("no-reflow", false, "don't clear and re-emit the transcript when the terminal width changes")
 	last := fs.Bool("last", false, "with resume: resume the most recent session without the picker")
 	id := fs.String("id", "", "with resume: resume this session id")
 	_ = fs.Parse(args)
@@ -93,6 +94,7 @@ func main() {
 		ShowReasoning:     *showReasoning,
 		SteerWhileRunning: *steer,
 		Notify:            *notify,
+		NoReflow:          *noReflow,
 		ResumePicker:      resume && !*last && *id == "",
 		ResumeLast:        resume && *last,
 		ResumeID:          *id,

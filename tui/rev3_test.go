@@ -26,8 +26,14 @@ func TestRevSlashWhileRunningLosesText(t *testing.T) {
 	}
 	m.Update(key("esc")) // close popup
 	m.Update(key("enter"))
-	if m.composer.String() != "/compact" || len(m.queued) != 0 || !strings.Contains(m.hint, "disabled") {
-		t.Errorf("composer=%q hint=%q queued=%v", m.composer.String(), m.hint, m.queued)
+	last := ""
+	if n := len(m.committed); n > 0 {
+		for _, l := range m.committed[n-1].Lines(80, m.st) {
+			last += l.Plain()
+		}
+	}
+	if m.composer.String() != "/compact" || len(m.queued) != 0 || !strings.Contains(last, "disabled while a task is in progress") {
+		t.Errorf("composer=%q last=%q queued=%v", m.composer.String(), last, m.queued)
 	}
 }
 

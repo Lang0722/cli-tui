@@ -73,7 +73,7 @@ func (a *approval) byKey(k string) (approvalOption, bool) {
 			return o, true
 		}
 	}
-	if k == "n" { // undocumented: plain deny, keep the turn going
+	if k == "n" || k == "d" { // Codex: d deny (continue without it)
 		return approvalOption{"No", "n", protocol.DecisionDenied}, true
 	}
 	return approvalOption{}, false
@@ -95,27 +95,11 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 	optRows := len(a.options) + 3
 	bodyBudget := max(3, maxHeight-len(out)-optRows)
 
-	var body []Line
-	if a.kind == approveExec {
-		for i, l := range strings.Split(displayCommand(a.command), "\n") {
-			pre := L(P("    "))
-			if i == 0 {
-				pre = L(P("  "), S("$ ", st.Dim))
-			}
-			body = append(body, Wrap(highlightShell(l, st), width, pre, L(P("    ")))...)
-		}
-		if a.cwd != "" && a.cwd != cwd {
-			body = append(body, L(P("  "), S("in "+tildePath(a.cwd), st.Dim)))
-		}
-	} else {
-		body = renderPatch(a.changes, cwd, "Proposed", width-2, st, bodyBudget-1, S("•", st.Plain))
-		for i := range body {
-			body[i] = append(L(P("  ")), body[i]...)
-		}
-	}
+	body := a.body(width, cwd, st)
 	if len(body) > bodyBudget {
+		// Codex: "[… N lines] ⌃a view all" opens the full request in a pager.
 		extra := len(body) - bodyBudget + 1
-		body = append(body[:bodyBudget-1], L(P("    "), S("… +"+itoa(extra)+" lines", st.Dim)))
+		body = append(body[:bodyBudget-1], L(P("    "), S("[… "+itoa(extra)+" lines] ", st.Dim), S("⌃a", st.Bold), S(" view all", st.Dim)))
 	}
 	out = append(out, body...)
 	out = append(out, Line{})
@@ -133,6 +117,36 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 	}
 	out = append(out, Line{}, L(P("  "), S("Press ", st.Dim), S("enter", st.Bold), S(" to confirm or ", st.Dim), S("esc", st.Bold), S(" to cancel", st.Dim)))
 	return out
+}
+
+// body is the command or proposed diff shown in the modal (unclipped).
+func (a *approval) body(width int, cwd string, st *Styles) []Line {
+	var body []Line
+	if a.kind == approveExec {
+		for i, l := range strings.Split(displayCommand(a.command), "\n") {
+			pre := L(P("    "))
+			if i == 0 {
+				pre = L(P("  "), S("$ ", st.Dim))
+			}
+			body = append(body, Wrap(highlightShell(l, st), width, pre, L(P("    ")))...)
+		}
+		if a.cwd != "" && a.cwd != cwd {
+			body = append(body, L(P("  "), S("in "+tildePath(a.cwd), st.Dim)))
+		}
+		return body
+	}
+	body = renderPatch(a.changes, cwd, "Proposed Change", width-2, st, 0, S("•", st.Plain))
+	for i := range body {
+		body[i] = append(L(P("  ")), body[i]...)
+	}
+	return body
+}
+
+func (a *approval) pagerTitle() string {
+	if a.kind == approveExec {
+		return "exec"
+	}
+	return "patch"
 }
 
 // decisionCell is the one-line history record of an approval decision.

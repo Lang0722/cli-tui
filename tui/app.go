@@ -47,6 +47,10 @@ type Options struct {
 	// turn finishes or needs approval while the window is unfocused.
 	Notify bool
 
+	// NoReflow disables re-emitting the transcript when the terminal width
+	// changes (Codex does it; it clears the terminal's scrollback).
+	NoReflow bool
+
 	// Startup resume behavior (Codex `codex resume`): ResumePicker opens the
 	// session picker, ResumeLast resumes the most recent session, and
 	// ResumeID resumes a specific one. The backend must handle
@@ -90,6 +94,17 @@ type (
 	}
 )
 
+// pendingInput is a queued follow-up (sent when the turn ends).
+type pendingInput struct {
+	text   string
+	images []string
+}
+
+type imageMsg struct {
+	path string
+	err  error
+}
+
 type streamState struct {
 	src        strings.Builder
 	emitted    int // wrapped rows already printed to scrollback
@@ -132,7 +147,8 @@ type model struct {
 	execByID     map[string]*execCall
 	toolByID     map[string]*toolCell
 	hadTools     bool
-	queued       []string
+	queued       []pendingInput
+	kittyKeys    bool // terminal reports Shift+Enter distinctly
 	ticking      bool
 
 	// tokens
@@ -154,14 +170,51 @@ type model struct {
 	closed   bool
 	quitting bool
 	userQuit bool
+
+	selections    []*selectionView
+	freeformID    string // answering a selection with typed text
+	freeformTitle string
+	sessionStart  int // index in committed of the current session's header
+	lastHeader    *headerCell
+	pendingReflow bool
+	reflowGen     int
 }
 
 // openPager shows the Ctrl+T transcript on the alternate screen. Scrollback
 // output is held meanwhile (it would land in the alt buffer and be lost)
 // and released when the pager closes.
 func (m *model) openPager() {
-	m.pager = newPager(m.committed, m.width, m.st)
+	m.pager = newTranscriptPager(func() []Cell { return m.committed }, m.liveTranscript, m.st)
 	m.out.hold(true)
+}
+
+func (m *model) openStaticPager(title string, lines []Line) {
+	m.pager = newStaticPager(title, lines, m.st)
+	m.out.hold(true)
+}
+
+// liveTranscript is the in-progress part of the turn in transcript form.
+func (m *model) liveTranscript(width int) []Line {
+	var out []Line
+	for _, c := range m.active {
+		if len(out) > 0 {
+			out = append(out, Line{})
+		}
+		out = append(out, detailLines(c, width, m.st)...)
+	}
+	if m.reasoning.Len() > 0 {
+		if len(out) > 0 {
+			out = append(out, Line{})
+		}
+		out = append(out, reasoningCell{m.reasoning.String()}.Lines(width, m.st)...)
+	}
+	if tail := m.streamRows(m.stream.src.String()); m.stream.active && len(tail) > 0 {
+		if len(out) > 0 {
+			out = append(out, Line{})
+		}
+		out = append(out, tail...)
+	}
+	return out
 }
 
 func (m *model) closePager() {
@@ -250,7 +303,13 @@ func (m *model) printLines(lines []Line, separate bool) {
 
 func (m *model) commit(cells ...Cell) {
 	for _, c := range cells {
+		if h, ok := c.(headerCell); ok {
+			m.lastHeader, m.sessionStart = &h, len(m.committed)
+		}
 		m.committed = append(m.committed, c)
+		if t, ok := c.(interface{ transcriptOnly() bool }); ok && t.transcriptOnly() && !m.opts.ShowReasoning {
+			continue // visible in the Ctrl+T transcript only
+		}
 		m.printLines(c.Lines(m.width, m.st), true)
 	}
 }
@@ -281,7 +340,7 @@ func (m *model) flushActive(force bool) {
 // --- streaming agent text ------------------------------------------------
 
 func (m *model) streamRows(src string) []Line {
-	return wrapMarkdown(RenderMarkdown(src, m.st), m.width, L(S("• ", m.st.Plain)), L(P("  ")))
+	return wrapMarkdown(RenderMarkdown(src, m.st, m.width-2), m.width, L(S("• ", m.st.Plain)), L(P("  ")))
 }
 
 func (m *model) streamDelta(d string) {
@@ -293,6 +352,11 @@ func (m *model) streamDelta(d string) {
 	src := m.stream.src.String()
 	i := strings.LastIndexByte(src, '\n')
 	if i < 0 {
+		return
+	}
+	// Hold back a trailing table (its column widths aren't final yet).
+	i = tableHoldback(src, i+1) - 1
+	if i <= m.stream.emittedSrc {
 		return
 	}
 	rows := m.streamRows(src[:i])
@@ -323,6 +387,11 @@ func (m *model) finalizeStream(final string) {
 		return
 	}
 	src := m.stream.src.String()
+	// Repair dropped deltas: if the final message extends what streamed,
+	// render the final text (Codex repairs on completion too).
+	if final != "" && final != src && strings.HasPrefix(final, src[:m.stream.emittedSrc]) {
+		src = final
+	}
 	rows := m.streamRows(src)
 	if len(rows) > m.stream.emitted {
 		m.printLines(rows[m.stream.emitted:], m.stream.emitted == 0)
@@ -346,8 +415,11 @@ func (m *model) finalizeReasoning(full string) {
 	if text == "" {
 		text = m.reasoning.String()
 	}
-	if m.opts.ShowReasoning && strings.TrimSpace(text) != "" {
-		m.flushActive(true)
+	if strings.TrimSpace(text) != "" {
+		// Reasoning is transcript-only (Ctrl+T) unless ShowReasoning.
+		if m.opts.ShowReasoning {
+			m.flushActive(true)
+		}
 		m.commit(reasoningCell{text})
 	}
 	m.reasoning.Reset()
@@ -358,13 +430,23 @@ func (m *model) finalizeReasoning(full string) {
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case reflowMsg:
+		if msg.gen == m.reflowGen {
+			return m, m.reflow(false)
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
+		widthChanged := max(msg.Width, 20) != m.width
 		m.width, m.height = max(msg.Width, 20), max(msg.Height, 8)
+
 		if m.stream.active && m.stream.emitted > 0 {
 			// Rows already in scrollback were wrapped at the old width;
 			// re-count them at the new width so streaming resumes exactly
 			// after the printed source instead of skipping or repeating.
 			m.stream.emitted = len(m.streamRows(m.stream.src.String()[:m.stream.emittedSrc]))
+		}
+		if widthChanged && m.printedAny && !m.opts.NoReflow {
+			return m, m.scheduleReflow()
 		}
 		return m, nil
 	case tea.BackgroundColorMsg:
@@ -374,7 +456,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.st.SetForeground(msg.Color)
 		return m, nil
 	case tea.ColorProfileMsg:
-		m.st.trueColor = msg.Profile == colorprofile.TrueColor
+		m.st.SetTrueColor(msg.Profile == colorprofile.TrueColor)
+		return m, nil
+	case tea.KeyboardEnhancementsMsg:
+		m.kittyKeys = msg.SupportsKeyDisambiguation()
+		return m, nil
+	case imageMsg:
+		if msg.err != nil {
+			m.flash(msg.err.Error())
+		} else {
+			m.composer.AttachImage(msg.path)
+		}
 		return m, nil
 	case tea.FocusMsg:
 		m.focused = true
@@ -384,7 +476,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case backendMsg:
 		cmd := m.handleEvent(msg.ev)
-		return m, tea.Batch(cmd, m.waitEvent(), m.ensureTick())
+		var reflow tea.Cmd
+		if m.pendingReflow && !m.stream.active {
+			m.pendingReflow = false
+			reflow = m.reflow(false)
+		}
+		return m, tea.Batch(cmd, reflow, m.waitEvent(), m.ensureTick())
 	case backendDone:
 		m.closed = true
 		m.finalizeStream("")
@@ -411,15 +508,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case diffMsg:
-		if msg.err != nil {
-			m.commit(errorCell(m.st, "git diff: "+msg.err.Error()))
-		} else {
-			m.commit(gitDiffCell(msg.out, m.st))
+		switch {
+		case msg.err != nil:
+			m.commit(errorCell(m.st, msg.err.Error()))
+		case strings.TrimSpace(msg.out) == "":
+			m.commit(infoCell(m.st, "No changes detected."))
+		default:
+			m.openStaticPager("diff", gitDiffCell(msg.out, m.st).Lines(m.width, m.st))
 		}
 		return m, nil
 	case tea.PasteMsg:
 		if m.pager == nil && len(m.approvals) == 0 && m.picker == nil && !m.awaitingList && !m.awaitingResume {
-			m.composer.Paste(msg.Content)
+			if p, ok := pastedImagePath(msg.Content); ok {
+				m.composer.AttachImage(p)
+			} else {
+				m.composer.Paste(msg.Content)
+			}
 			m.refreshPopups()
 		}
 		return m, nil
@@ -430,7 +534,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) needsTick() bool {
-	if m.running || m.awaitingList || m.awaitingResume || time.Now().Before(m.hintUntil) {
+	if m.running || m.awaitingList || m.awaitingResume || m.needsAction() || time.Now().Before(m.hintUntil) {
 		return true
 	}
 	for _, c := range m.active {
@@ -468,12 +572,20 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.onSessionConfigured(e)
 	case protocol.SessionList:
 		m.onSessionList(e.Sessions)
+	case protocol.SelectionRequest:
+		if m.replaying {
+			break
+		}
+		m.finalizeStream("")
+		m.flushActive(true)
+		m.selections = append(m.selections, &selectionView{req: e})
+		return m.notify(m.agent, e.Title)
 	case protocol.UserMessage:
 		// Live input is drawn when submitted; only history is rendered here.
 		if m.replaying {
 			m.finalizeStream("")
 			m.flushActive(true)
-			m.commit(userCell{e.Message})
+			m.commit(userCell{text: e.Message})
 			m.composer.addHistory(e.Message, nil)
 		}
 	case protocol.TaskStarted:
@@ -506,7 +618,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		if len(parsed) == 0 {
 			parsed = parseCommand(e.Command)
 		}
-		call := &execCall{id: e.CallID, command: e.Command, parsed: parsed, started: time.Now()}
+		call := &execCall{id: e.CallID, command: e.Command, parsed: parsed, started: time.Now(), user: e.Source == "user_shell"}
 		m.execByID[e.CallID] = call
 		if n := len(m.active); n > 0 && call.isExploring() {
 			if x, ok := m.active[n-1].(*execCell); ok && x.exploring() {
@@ -581,11 +693,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.commit(patchCell{changes: e.Changes, cwd: m.cwd})
 	case protocol.PatchApplyEnd:
 		if !e.Success {
-			msg := strings.TrimSpace(e.Stderr)
-			if msg == "" {
-				msg = "unknown error"
-			}
-			m.commit(errorCell(m.st, "Failed to apply patch: "+msg))
+			m.commit(patchFailedCell{e.Stderr})
 		}
 	case protocol.PlanUpdate:
 		m.finalizeStream("")
@@ -645,14 +753,18 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 			return nil
 		}
 		if el := time.Since(m.turnStart); m.hadTools && el >= time.Second {
-			m.commit(separatorCell{el})
+			m.commit(separatorCell{el, time.Now()})
 		}
 	}
 	m.running = false
 	m.statusDetail = ""
 	if aborted && len(m.queued) > 0 {
 		// Restore queued input into the composer for editing.
-		restored := strings.Join(m.queued, "\n")
+		var texts []string
+		for _, q := range m.queued {
+			texts = append(texts, q.text)
+		}
+		restored := strings.Join(texts, "\n")
 		if !m.composer.Empty() {
 			restored += "\n" + m.composer.String()
 		}
@@ -661,12 +773,16 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 	} else if len(m.queued) > 0 {
 		next := m.queued[0]
 		m.queued = m.queued[1:]
-		m.sendUser(next)
+		m.sendInput(next)
 	}
 	if aborted {
 		return nil
 	}
-	return m.notify(m.agent, "Turn complete")
+	body := notificationPreview(m.lastAgentMessage())
+	if body == "" {
+		body = "Turn complete"
+	}
+	return m.notify(m.agent, body)
 }
 
 func (m *model) lastCommittedIsAgent() bool {
@@ -677,9 +793,11 @@ func (m *model) lastCommittedIsAgent() bool {
 	return false
 }
 
-func (m *model) sendUser(text string) {
-	m.commit(userCell{text})
-	m.submit(protocol.UserInput{Text: text})
+func (m *model) sendUser(text string) { m.sendInput(pendingInput{text: text}) }
+
+func (m *model) sendInput(in pendingInput) {
+	m.commit(userCell{text: in.text, images: len(in.images)})
+	m.submit(protocol.UserInput{Text: in.text, Images: in.images})
 }
 
 func (m *model) flash(s string) {
@@ -692,13 +810,20 @@ func (m *model) flash(s string) {
 func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 	key := k.String()
 	if m.pager != nil {
-		if m.pager.handleKey(key, m.height) {
+		if m.pager.handleKey(key, k.Text, m.height) {
+			bt := m.pager.backtrack
 			m.closePager()
+			if bt != nil && bt.chosen >= 0 {
+				return m.rewindTo(bt.chosen)
+			}
 		}
 		return nil
 	}
 	if len(m.approvals) > 0 {
 		return m.handleApprovalKey(key)
+	}
+	if len(m.selections) > 0 {
+		return m.handleSelectionKey(k)
 	}
 	if m.picker != nil {
 		return m.handlePickerKey(k)
@@ -723,9 +848,55 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 	}
 
+	if c := m.composer; c.search != nil {
+		switch key {
+		case "esc", "ctrl+c":
+			c.endSearch(false)
+		case "enter":
+			c.endSearch(true)
+		case "ctrl+r":
+			c.searchStep(-1)
+		case "ctrl+s":
+			c.searchStep(1)
+		case "backspace":
+			if r := []rune(c.search.query); len(r) > 0 {
+				c.search.query = string(r[:len(r)-1])
+				c.searchRefresh()
+			}
+		default:
+			if k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
+				c.search.query += k.Text
+				c.searchRefresh()
+			}
+		}
+		return nil
+	}
+	switch key {
+	case "ctrl+r":
+		m.closePopups()
+		m.composer.startSearch()
+		return nil
+	case "ctrl+v", "alt+v":
+		return func() tea.Msg {
+			p, err := clipboardImage()
+			return imageMsg{p, err}
+		}
+	case "!":
+		if m.composer.Empty() && !m.composer.shell {
+			m.composer.shell = true // the "!" is absorbed, as in Codex
+			return nil
+		}
+	case "backspace", "esc":
+		if m.composer.shell && m.composer.Empty() {
+			m.composer.shell = false
+			return nil
+		}
+	}
 	switch key {
 	case "ctrl+c":
 		switch {
+		case m.composer.shell && m.composer.Empty():
+			m.composer.shell = false
 		case !m.composer.Empty():
 			m.composer.Submit() // stash into history, then clear
 			m.closePopups()
@@ -756,13 +927,15 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			m.closePopups()
 		case m.running:
 			m.submit(protocol.Interrupt{})
+		case m.freeformID != "" && m.composer.Empty():
+			m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1})
+			m.freeformID = ""
 		case m.composer.Empty() && time.Now().Before(m.escArmed):
-			if n := len(m.composer.history); n > 0 {
-				m.composer.recall(n - 1)
-			}
+			// Codex backtrack: browse earlier prompts, Enter rewinds.
 			m.escArmed = time.Time{}
 			m.hintUntil = time.Time{}
-		case m.composer.Empty() && len(m.composer.history) > 0:
+			m.startBacktrack()
+		case m.composer.Empty():
 			m.escArmed = time.Now().Add(2 * time.Second)
 			m.hint, m.hintUntil = "esc again to edit previous message", m.escArmed
 		}
@@ -770,6 +943,12 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 	case "ctrl+t":
 		m.openPager()
 		return nil
+	case "ctrl+o":
+		return m.copyLastResponse()
+	case "ctrl+l":
+		return m.reflow(true)
+	case "ctrl+z":
+		return tea.Suspend
 	case "ctrl+g":
 		return m.openEditor()
 	case "?":
@@ -848,19 +1027,44 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 				return m.runCommand(name, args)
 			}
 		}
-		full := strings.TrimSpace(m.composer.Submit())
+		if m.freeformID != "" {
+			answer := strings.TrimSpace(m.composer.Submit())
+			m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1, Text: answer})
+			m.commit(textCell{bullet: S("•", m.st.Dim), body: L(S(m.freeformTitle+": ", m.st.Dim), S(answer, m.st.Plain))})
+			m.freeformID = ""
+			return nil
+		}
+		if m.composer.shell {
+			cmd := strings.TrimSpace(m.composer.Submit())
+			m.composer.shell = false
+			m.composer.history[len(m.composer.history)-1] = "!" + cmd
+			m.submit(protocol.ShellCommand{Command: cmd})
+			return nil
+		}
+		full, images := m.composer.SubmitWithImages()
+		in := pendingInput{strings.TrimSpace(full), images}
 		switch {
-		case !m.running:
-			m.sendUser(full)
-		case m.opts.SteerWhileRunning:
-			m.sendUser(full)
+		case !m.running, m.opts.SteerWhileRunning:
+			m.sendInput(in)
 		default:
-			m.queued = append(m.queued, full)
+			m.queued = append(m.queued, in)
 		}
 		return nil
 	case "tab":
-		if m.running && !m.composer.Empty() {
-			m.queued = append(m.queued, strings.TrimSpace(m.composer.Submit()))
+		if m.running && !m.composer.Empty() && !m.composer.shell {
+			full, images := m.composer.SubmitWithImages()
+			m.queued = append(m.queued, pendingInput{strings.TrimSpace(full), images})
+			return nil
+		}
+	case "shift+left", "alt+up":
+		// Codex: pop the last queued message back into the composer.
+		if n := len(m.queued); n > 0 && m.composer.Empty() {
+			last := m.queued[n-1]
+			m.queued = m.queued[:n-1]
+			m.composer.Set(last.text)
+			for _, p := range last.images {
+				m.composer.AttachImage(p)
+			}
 			return nil
 		}
 	}
@@ -888,6 +1092,10 @@ func (m *model) handleApprovalKey(key string) tea.Cmd {
 		decide(a.options[a.selected])
 	case "ctrl+c":
 		decide(approvalOption{decision: protocol.DecisionAbort})
+	case "ctrl+a":
+		m.openStaticPager(a.pagerTitle(), a.body(m.width, m.cwd, m.st))
+	case "ctrl+t":
+		m.openPager()
 	case "1", "2", "3", "4":
 		i := int(key[0] - '1')
 		if i < len(a.options) {
@@ -924,7 +1132,7 @@ func (m *model) commandBlocked(name string) bool {
 	}
 	for _, c := range m.opts.Commands {
 		if c.Name == name && (!c.Local || name == "resume") {
-			m.flash("'/" + name + "' is disabled while a task is in progress")
+			m.commit(errorCell(m.st, "'/"+name+"' is disabled while a task is in progress."))
 			return true
 		}
 	}
@@ -942,7 +1150,7 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return nil
 	}
 	if !cmd.Local {
-		m.commit(userCell{"/" + strings.TrimSpace(name+" "+args)})
+		m.commit(userCell{text: "/" + strings.TrimSpace(name+" "+args), command: true})
 		m.submit(protocol.SlashCommand{Name: name, Args: args})
 		return nil
 	}
@@ -962,6 +1170,19 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return m.refreshPopups()
 	case "transcript":
 		m.openPager()
+	case "copy":
+		return m.copyLastResponse()
+	case "export":
+		m.export(args)
+	case "clear":
+		// Clear the terminal and start a new chat; the backend's new
+		// session header is printed afresh.
+		m.out.reset()
+		m.printedAny, m.lastHeader = false, nil
+		m.submit(protocol.SlashCommand{Name: "new"})
+		return clearTerminal()
+	case "pwd":
+		m.commit(infoCell(m.st, "Current working directory: "+tildePath(m.cwd)))
 	case "resume":
 		if args != "" {
 			return m.requestResume(args)
@@ -1072,7 +1293,7 @@ func (m *model) View() tea.View {
 		return tea.NewView("")
 	}
 	if m.pager != nil {
-		v := tea.NewView(m.pager.render(m.width, m.height, m.st))
+		v := tea.NewView(m.pager.render(m.width, m.height))
 		v.AltScreen = true
 		v.WindowTitle = m.title()
 		return v
@@ -1082,24 +1303,34 @@ func (m *model) View() tea.View {
 	var bottom []Line
 	cursorRow, cursorCol := -1, 0
 
-	if m.running {
+	// Codex hides the status row while the answer streams into the
+	// transcript (a one-line partial answer keeps "Working").
+	if m.running && !(m.stream.active && m.stream.emitted > 0) {
 		bottom = append(bottom, m.statusLines(w)...)
 	}
+	bottom = append(bottom, m.queuedLines(w)...)
 	if len(m.approvals) > 0 {
 		maxH := max(8, m.height-len(bottom)-2)
 		bottom = append(bottom, m.approvals[0].Lines(w, maxH, m.cwd, st)...)
+	} else if len(m.selections) > 0 {
+		bottom = append(bottom, m.selections[0].Lines(w, m.height-len(bottom)-2, st)...)
 	} else if m.picker != nil {
 		bottom = append(bottom, m.picker.Lines(w, m.height-2, m.cwd, st)...)
 	} else if m.awaitingList || m.awaitingResume {
 		bottom = append(bottom, Line{}, L(S("• ", st.Dim)).Append(st.Shimmer("Loading saved sessions")...))
 	} else {
 		if m.shortcuts {
-			bottom = append(bottom, shortcutLines(w, st)...)
+			bottom = append(bottom, m.shortcutLines(w)...)
 		}
 		bottom = append(bottom, Line{})
 		band := st.UserBg
 		bottom = append(bottom, Line{}.Fill(w, band))
-		rows, crow, ccol := m.composer.Render(w, st, "Ask "+m.agent+" to do anything", true)
+		placeholder := "Ask " + m.agent + " to do anything"
+		if m.freeformID != "" {
+			placeholder = "Type your answer (esc to skip)"
+			bottom = append(bottom[:len(bottom)-1], L(P("  "), S(m.freeformTitle, st.Bold)), Line{}.Fill(w, band))
+		}
+		rows, crow, ccol := m.composer.Render(w, st, placeholder, true)
 		cursorRow, cursorCol = len(bottom)+crow, ccol
 		bottom = append(bottom, rows...)
 		bottom = append(bottom, Line{}.Fill(w, band))
@@ -1153,6 +1384,9 @@ func (m *model) View() tea.View {
 
 func (m *model) title() string {
 	dir := filepath.Base(m.cwd)
+	if m.needsAction() {
+		return actionTitle() + " — " + m.agent
+	}
 	if m.running {
 		return spinnerFrame() + " " + m.agent + " — " + dir
 	}
@@ -1172,29 +1406,54 @@ func (m *model) statusLines(w int) []Line {
 	if m.statusDetail != "" {
 		out = append(out, L(S("  └ ", st.Dim), S(m.statusDetail, st.Dim)).Truncate(w))
 	}
+	return out
+}
+
+// queuedLines is Codex' pending-input preview.
+func (m *model) queuedLines(w int) []Line {
+	if len(m.queued) == 0 {
+		return nil
+	}
+	st := m.st
+	out := []Line{{}, L(S("• ", st.Dim), S("Queued follow-up inputs", st.Plain))}
 	for _, q := range m.queued {
-		first := strings.SplitN(q, "\n", 2)[0]
+		first := strings.SplitN(q.text, "\n", 2)[0]
+		if len(q.images) > 0 {
+			first = fmt.Sprintf("[%d image(s)] %s", len(q.images), first)
+		}
 		out = append(out, L(S("  ↳ ", st.Dim), S(first, st.Dim.Italic(true))).Truncate(w))
 	}
+	out = append(out, L(P("    "), S("⇧←", st.Bold), S(" edit last queued message", st.Dim)))
 	return out
 }
 
 func (m *model) footerLine(w int) Line {
 	st := m.st
+	k := func(s string) Span { return S(s, st.Bold) }
+	d := func(s string) Span { return S(s, st.Dim) }
 	var left Line
 	switch {
+	case m.composer.search != nil:
+		q := m.composer.search.query
+		left = L(P("  "), d("reverse-i-search: "), S(q, st.Accent), P("  "), k("enter"), d(" accept · "), k("esc"), d(" cancel"))
+		if q != "" && m.composer.search.idx < 0 {
+			left = append(left, d(" · no match"))
+		}
 	case time.Now().Before(m.hintUntil):
-		left = L(P("  "), S(m.hint, st.Dim))
+		left = L(P("  "), d(m.hint))
+	case m.composer.shell:
+		left = L(P("  "), S("Shell mode", st.Accent), d(" · "), k("esc"), d(" to exit"))
 	case m.running && !m.composer.Empty():
-		left = L(P("  "), S("tab", st.Bold), S(" to queue message", st.Dim))
-	case m.running:
-		left = L(P("  "), S("esc", st.Bold), S(" to interrupt", st.Dim))
+		left = L(P("  "), k("tab"), d(" to queue message"))
 	case m.composer.Empty():
-		left = L(P("  "), S("?", st.Bold), S(" for shortcuts", st.Dim))
+		left = L(P("  "), k("?"), d(" for shortcuts"))
 	default:
-		left = L(P("  "), S("⏎", st.Bold), S(" send   ", st.Dim), S("⌃J", st.Bold), S(" newline", st.Dim))
+		left = nil // Codex hides hints while you type; context stays
 	}
-	right := L(S(fmt.Sprintf("%d%% context left", m.contextLeft()), st.Dim), P("  "))
+	right := L(d(fmt.Sprintf("%d%% context left", m.contextLeft())), P("  "))
+	if m.contextWindow <= 0 && m.tokensUsed > 0 {
+		right = L(d(fmt.Sprintf("%s used", compactCount(m.tokensUsed))), P("  "))
+	}
 	gap := w - left.Width() - right.Width()
 	if gap < 1 {
 		return left.Truncate(w)
@@ -1202,28 +1461,92 @@ func (m *model) footerLine(w int) Line {
 	return append(append(left, P(strings.Repeat(" ", gap))), right...)
 }
 
-func shortcutLines(w int, st *Styles) []Line {
-	items := [][2]string{
-		{"/", "for commands"}, {"@", "for file paths"},
-		{"⌃J / ⌥⏎", "for newline"}, {"⌃G", "edit in $EDITOR"},
-		{"esc", "to interrupt"}, {"esc esc", "to edit previous message"},
-		{"tab", "to queue message"}, {"⌃T", "to view transcript"},
-		{"⌃C", "to clear / quit"}, {"↑ / ↓", "browse history"},
+func compactCount(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	case n >= 1000:
+		return fmt.Sprintf("%dK", n/1000)
 	}
-	var out []Line
-	out = append(out, Line{})
-	colW := 40
-	for i := 0; i < len(items); i += 2 {
-		l := L(P("  "), S(items[i][0], st.Bold), P(" "), S(items[i][1], st.Dim))
-		if i+1 < len(items) && w >= colW*2 {
-			l = append(l, P(strings.Repeat(" ", max(1, colW-l.Width()))))
-			l = append(l, S(items[i+1][0], st.Bold), P(" "), S(items[i+1][1], st.Dim))
-			out = append(out, l)
-		} else {
-			out = append(out, l)
-			if i+1 < len(items) {
-				out = append(out, L(P("  "), S(items[i+1][0], st.Bold), P(" "), S(items[i+1][1], st.Dim)))
+	return fmt.Sprint(n)
+}
+
+// shortcutLines is Codex' "?" overlay: grouped columns that flow into 3, 2
+// or 1 columns by width.
+func (m *model) shortcutLines(w int) []Line {
+	st := m.st
+	newline := "⌃j"
+	if m.kittyKeys {
+		newline = "⇧enter"
+	}
+	tab, ctrlc := "Queue message", "Quit"
+	if m.running {
+		ctrlc = "Interrupt"
+	} else {
+		tab = "Send message"
+	}
+	groups := []struct {
+		title string
+		items [][2]string
+	}{
+		{"Compose", [][2]string{{"/", "Commands"}, {"@", "Mention files"}, {"!", "Shell command"}, {newline, "New line"},
+			{"⌃v", "Paste image"}, {"⌃g", "External editor"}, {"⌃r", "Search history"}, {"esc esc", "Edit previous message"}}},
+		{"Session", [][2]string{{"tab", tab}, {"⇧←", "Edit queued message"}, {"esc", "Interrupt"}, {"⌃c", ctrlc}, {"⌃o", "Copy last response"}, {"⌃l", "Clear screen"}, {"⌃z", "Suspend"}}},
+		{"Transcript", [][2]string{{"⌃t", "Open transcript"}, {"/", "Find (in transcript)"}, {"pgup / pgdn", "Scroll"}, {"home / end", "Top / latest"}}},
+	}
+	render := func(g int) []Line {
+		kw := 0
+		for _, it := range groups[g].items {
+			kw = max(kw, strw(it[0]))
+		}
+		out := []Line{L(S(groups[g].title, st.Bold))}
+		for _, it := range groups[g].items {
+			out = append(out, L(S(it[0], st.Accent), P(strings.Repeat(" ", kw-strw(it[0])+2)), S(it[1], st.Dim)))
+		}
+		return out
+	}
+	cols := make([][]Line, len(groups))
+	colW := make([]int, len(groups))
+	for g := range groups {
+		cols[g] = render(g)
+		for _, l := range cols[g] {
+			colW[g] = max(colW[g], l.Width())
+		}
+	}
+	out := []Line{{}, L(P("  "), S("Keyboard shortcuts", st.Bold)), {}}
+	perRow := len(groups)
+	for perRow > 1 {
+		t := 2
+		for g := 0; g < perRow; g++ {
+			t += colW[g] + 4
+		}
+		if t <= w {
+			break
+		}
+		perRow--
+	}
+	for start := 0; start < len(groups); start += perRow {
+		end := min(len(groups), start+perRow)
+		h := 0
+		for g := start; g < end; g++ {
+			h = max(h, len(cols[g]))
+		}
+		for r := 0; r < h; r++ {
+			l := L(P("  "))
+			for g := start; g < end; g++ {
+				var part Line
+				if r < len(cols[g]) {
+					part = cols[g][r]
+				}
+				l = append(l, part...)
+				if g < end-1 {
+					l = append(l, P(strings.Repeat(" ", colW[g]-part.Width()+4)))
+				}
 			}
+			out = append(out, l.Truncate(w))
+		}
+		if end < len(groups) {
+			out = append(out, Line{})
 		}
 	}
 	return out

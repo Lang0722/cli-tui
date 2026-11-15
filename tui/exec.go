@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,10 +18,11 @@ type execCall struct {
 	exit    int
 	started time.Time
 	dur     time.Duration
+	user    bool // started by the user ("!cmd"): rendered as "You ran"
 }
 
 func (c *execCall) isExploring() bool {
-	if len(c.parsed) == 0 {
+	if len(c.parsed) == 0 || c.user {
 		return false
 	}
 	for _, p := range c.parsed {
@@ -64,13 +66,18 @@ func (c *execCell) find(id string) *execCall {
 	return nil
 }
 
-func (c *execCell) Lines(width int, st *Styles) []Line {
-	if c.exploring() {
+func (c *execCell) Lines(width int, st *Styles) []Line { return c.render(width, st, false) }
+
+// TranscriptLines is the Ctrl+T form: every command with its full output.
+func (c *execCell) TranscriptLines(width int, st *Styles) []Line { return c.render(width, st, true) }
+
+func (c *execCell) render(width int, st *Styles, detail bool) []Line {
+	if c.exploring() && !detail {
 		return c.exploringLines(width, st)
 	}
 	var out []Line
 	for _, x := range c.calls {
-		out = append(out, commandLines(x, width, st)...)
+		out = append(out, commandLines(x, width, st, detail)...)
 	}
 	return out
 }
@@ -87,6 +94,7 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 	type row struct {
 		label string
 		body  string
+		exit  Line
 	}
 	var rows []row
 	for _, x := range c.calls {
@@ -104,13 +112,13 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 					}
 					continue
 				}
-				rows = append(rows, row{"Read", name})
+				rows = append(rows, row{"Read", name, nil})
 			case protocol.CmdListFiles:
 				body := p.Path
 				if body == "" {
 					body = p.Cmd
 				}
-				rows = append(rows, row{"List", body})
+				rows = append(rows, row{"List", body, nil})
 			case protocol.CmdSearch:
 				body := p.Cmd
 				if p.Query != "" {
@@ -119,8 +127,17 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 						body += " in " + p.Path
 					}
 				}
-				rows = append(rows, row{"Search", body})
+				rows = append(rows, row{"Search", body, nil})
 			}
+		}
+		// Codex: " (exit N)" in red; exit 1 from a search just means "no
+		// matches" and is dim.
+		if x.done && x.exit != 0 && len(rows) > 0 {
+			style := st.Red
+			if len(x.parsed) == 1 && x.parsed[0].Kind == protocol.CmdSearch && x.exit == 1 {
+				style = st.Dim
+			}
+			rows[len(rows)-1].exit = L(S(fmt.Sprintf(" (exit %d)", x.exit), style))
 		}
 	}
 	for i, r := range rows {
@@ -128,25 +145,39 @@ func (c *execCell) exploringLines(width int, st *Styles) []Line {
 		if i == 0 {
 			f = L(S("  └ ", st.Dim))
 		}
-		out = append(out, Wrap(L(S(r.label, st.Accent), P(" "), P(r.body)), width, f, L(P("      ")))...)
+		out = append(out, Wrap(append(L(S(r.label, st.Accent), P(" "), P(r.body)), r.exit...), width, f, L(P("      ")))...)
 	}
 	return out
 }
 
-func commandLines(x *execCall, width int, st *Styles) []Line {
+// commandLines renders one command like Codex' exec cell:
+//
+//   - Ran cmd --flag            (green bold bullet; red on failure)
+//     │ continuation (≤ 2 rows, then "… +N lines")
+//     └ output (first 5 / … +N lines (⌃t to view transcript) / last 5)
+//
+// While running the bullet blinks and the title is "Running". detail shows
+// the whole command and output (transcript).
+func commandLines(x *execCall, width int, st *Styles, detail bool) []Line {
+	verb := "Ran"
+	if x.user {
+		verb = "You ran"
+	}
 	var head Line
 	switch {
 	case !x.done:
-		head = append(L(S("• ", st.Dim)), st.Shimmer("Running")...)
+		bullet := S("• ", st.Dim)
+		if blinkOff() {
+			bullet = S("◦ ", st.Dim)
+		}
+		head = append(L(bullet), st.Shimmer("Running")...)
 	case x.exit == 0:
-		head = L(S("• ", st.Green), S("Ran", st.Bold))
+		head = L(S("• ", st.GreenB), S(verb, st.Bold))
 	default:
-		head = L(S("• ", st.Red), S("Ran", st.Bold))
+		head = L(S("• ", st.RedB), S(verb, st.Bold))
 	}
-	cmdText := displayCommand(x.command)
-	cmdRows := strings.Split(cmdText, "\n")
-	var out []Line
-	const maxCmdRows = 3
+	cmdRows := strings.Split(displayCommand(x.command), "\n")
+	const maxContinuation = 2
 	var cmdLines []Line
 	for i, r := range cmdRows {
 		f := L(S("  │ ", st.Dim))
@@ -155,37 +186,33 @@ func commandLines(x *execCall, width int, st *Styles) []Line {
 		}
 		cmdLines = append(cmdLines, Wrap(highlightShell(r, st), width, f, L(S("  │ ", st.Dim)))...)
 	}
-	if len(cmdLines) > maxCmdRows+1 {
-		extra := len(cmdLines) - maxCmdRows
-		cmdLines = append(cmdLines[:maxCmdRows], L(S("  │ ", st.Dim), S("… +"+itoa(extra)+" lines", st.Dim)))
+	if !detail && len(cmdLines) > 1+maxContinuation {
+		extra := len(cmdLines) - 1 - maxContinuation
+		cmdLines = append(cmdLines[:1+maxContinuation], L(S("  │ ", st.Dim), S(fmt.Sprintf("… +%d %s", extra, pluralWord(extra, "line")), st.Dim)))
 	}
-	out = append(out, cmdLines...)
+	out := cmdLines
 
+	lines := strings.Split(sanitize(x.output.String()), "\n")
 	if !x.done {
-		// Live tail of output while running.
-		lines := strings.Split(strings.TrimRight(sanitize(x.output.String()), "\n"), "\n")
+		lines = strings.Split(strings.TrimRight(sanitize(x.output.String()), "\n"), "\n")
 		if len(lines) == 1 && lines[0] == "" {
 			return out
 		}
-		if len(lines) > 3 {
-			lines = lines[len(lines)-3:]
-		}
-		for i, l := range lines {
-			f := L(P("    "))
-			if i == 0 {
-				f = L(S("  └ ", st.Dim))
-			}
-			out = append(out, append(f, S(l, st.Dim)).Truncate(width))
-		}
-		return out
 	}
-	lines := strings.Split(sanitize(x.output.String()), "\n")
-	out = append(out, outputLines(lines, width, st, x.exit != 0, 5)...)
-	if x.exit != 0 {
-		out = append(out, L(P("    "), S("exit code "+itoa(x.exit), st.Red.Faint(true))))
+	limit := toolCallMaxLines
+	if x.user {
+		limit = userShellMaxLines
 	}
-	return out
+	if detail {
+		limit = 0
+	}
+	return append(out, outputLines(lines, width, st, x.exit != 0, limit)...)
 }
+
+const (
+	toolCallMaxLines  = 5  // Codex TOOL_CALL_MAX_LINES
+	userShellMaxLines = 50 // Codex USER_SHELL_TOOL_CALL_MAX_LINES
+)
 
 func itoa(n int) string {
 	neg := n < 0

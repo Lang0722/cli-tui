@@ -20,7 +20,14 @@ type Backend struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	events chan protocol.Event
+	stderr io.Writer
+
+	// Submit only enqueues; a writer goroutine feeds the child's stdin, so
+	// a child that stops reading can't freeze the UI.
 	mu     sync.Mutex
+	queue  [][]byte
+	closed bool
+	wake   chan struct{}
 }
 
 // Start launches name with args. stderr receives the child's stderr and
@@ -39,7 +46,8 @@ func Start(ctx context.Context, stderr io.Writer, name string, args ...string) (
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	b := &Backend{cmd: cmd, stdin: stdin, events: make(chan protocol.Event, 256)}
+	b := &Backend{cmd: cmd, stdin: stdin, events: make(chan protocol.Event, 256), stderr: stderr, wake: make(chan struct{}, 1)}
+	go b.writeLoop()
 	go func() {
 		defer close(b.events)
 		sc := bufio.NewScanner(stdout)
@@ -61,7 +69,7 @@ func Start(ctx context.Context, stderr io.Writer, name string, args ...string) (
 	return b, nil
 }
 
-// Submit implements protocol.Backend.
+// Submit implements protocol.Backend. It never blocks.
 func (b *Backend) Submit(_ context.Context, op protocol.Op) error {
 	data, err := protocol.MarshalOp(op)
 	if err != nil {
@@ -69,13 +77,45 @@ func (b *Backend) Submit(_ context.Context, op protocol.Op) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, err := b.stdin.Write(append(data, '\n')); err != nil {
-		return err
+	if b.closed {
+		return io.ErrClosedPipe
 	}
+	b.queue = append(b.queue, append(data, '\n'))
 	if _, ok := op.(protocol.Shutdown); ok {
-		_ = b.stdin.Close()
+		b.closed = true // close stdin after this line is written
+	}
+	select {
+	case b.wake <- struct{}{}:
+	default:
 	}
 	return nil
+}
+
+func (b *Backend) writeLoop() {
+	for range b.wake {
+		for {
+			b.mu.Lock()
+			if len(b.queue) == 0 {
+				closing := b.closed
+				b.mu.Unlock()
+				if closing {
+					_ = b.stdin.Close()
+					return
+				}
+				break
+			}
+			line := b.queue[0]
+			b.queue = b.queue[1:]
+			b.mu.Unlock()
+			if _, err := b.stdin.Write(line); err != nil {
+				fmt.Fprintf(b.stderr, "agenttui: write to backend: %v\n", err)
+				b.mu.Lock()
+				b.queue, b.closed = nil, true
+				b.mu.Unlock()
+				return
+			}
+		}
+	}
 }
 
 // Events implements protocol.Backend.

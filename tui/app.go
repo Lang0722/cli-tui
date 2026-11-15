@@ -15,6 +15,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -62,54 +63,17 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	m := newModel(ctx, opts)
 	p := tea.NewProgram(m, tea.WithContext(ctx))
-	// Printer goroutine: keeps scrollback inserts strictly ordered.
-	//
-	// Two Bubble Tea v2 inline-renderer details shape it:
-	//  1. insertAbove scrolls the screen by the inserted height, so a
-	//     multi-line insert taller than the free rows above a big live frame
-	//     pushes frame rows into scrollback. Printing one line per insert is
-	//     always safe while the frame is shorter than the terminal (View
-	//     clamps it).
-	//  2. The frame buffer is updated on every Update but only flushed to the
-	//     terminal on the next frame tick; an insert in between is positioned
-	//     with the new frame height over the old frame and leaves part of the
-	//     old frame behind. Waiting a couple of frames before inserting lets
-	//     the flush happen first (and batches streaming output).
-	done := make(chan struct{})
-	go func() {
-		for {
-			var batch []string
-			select {
-			case s := <-m.printQ:
-				batch = append(batch, s)
-			case <-done:
-				return
-			}
-			time.Sleep(35 * time.Millisecond)
-		drain:
-			for {
-				select {
-				case s := <-m.printQ:
-					batch = append(batch, s)
-				default:
-					break drain
-				}
-			}
-			for _, s := range batch {
-				for _, line := range strings.Split(s, "\n") {
-					if line == "" {
-						line = " " // empty prints are dropped by Bubble Tea
-					}
-					p.Println(line)
-				}
-			}
-		}
-	}()
+	go m.out.run(p.Println)
 	_, err := p.Run()
-	close(done)
+	m.out.stop()
 	_ = opts.Backend.Submit(context.Background(), protocol.Shutdown{})
+	if err == nil && m.closed && !m.userQuit {
+		err = errBackendClosed
+	}
 	return err
 }
+
+var errBackendClosed = errors.New("the backend exited (its event stream closed)")
 
 type (
 	backendMsg  struct{ ev protocol.Event }
@@ -127,9 +91,10 @@ type (
 )
 
 type streamState struct {
-	src     strings.Builder
-	emitted int // wrapped rows already printed to scrollback
-	active  bool
+	src        strings.Builder
+	emitted    int // wrapped rows already printed to scrollback
+	emittedSrc int // source bytes those rows were rendered from
+	active     bool
 }
 
 type model struct {
@@ -138,7 +103,7 @@ type model struct {
 	st   *Styles
 
 	width, height int
-	printQ        chan string
+	out           *printer
 	printedAny    bool
 	committed     []Cell
 
@@ -188,12 +153,30 @@ type model struct {
 	pager    *pager
 	closed   bool
 	quitting bool
+	userQuit bool
 }
 
-// quit clears the live area so only the transcript remains in scrollback.
+// openPager shows the Ctrl+T transcript on the alternate screen. Scrollback
+// output is held meanwhile (it would land in the alt buffer and be lost)
+// and released when the pager closes.
+func (m *model) openPager() {
+	m.pager = newPager(m.committed, m.width, m.st)
+	m.out.hold(true)
+}
+
+func (m *model) closePager() {
+	m.pager = nil
+	m.out.hold(false)
+}
+
+// quit clears the live area, lets pending scrollback output reach the
+// terminal, then exits.
 func (m *model) quit() tea.Cmd {
 	m.quitting = true
-	return tea.Quit
+	m.userQuit = !m.closed
+	m.pager = nil
+	m.out.hold(false)
+	return m.out.quitCmd()
 }
 
 func newModel(ctx context.Context, opts Options) *model {
@@ -201,7 +184,7 @@ func newModel(ctx context.Context, opts Options) *model {
 	return &model{
 		ctx: ctx, opts: opts, st: newStyles(),
 		width: 80, height: 24,
-		printQ:   make(chan string, 1024),
+		out:      newPrinter(),
 		agent:    "Agent",
 		cwd:      cwd,
 		execByID: map[string]*execCall{},
@@ -262,7 +245,7 @@ func (m *model) printLines(lines []Line, separate bool) {
 		s = "\n" + s
 	}
 	m.printedAny = true
-	m.printQ <- s
+	m.out.push(s)
 }
 
 func (m *model) commit(cells ...Cell) {
@@ -317,6 +300,7 @@ func (m *model) streamDelta(d string) {
 		m.printLines(rows[m.stream.emitted:], m.stream.emitted == 0)
 		m.stream.emitted = len(rows)
 	}
+	m.stream.emittedSrc = i
 }
 
 func (m *model) streamTail() []Line {
@@ -376,6 +360,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(msg.Width, 20), max(msg.Height, 8)
+		if m.stream.active && m.stream.emitted > 0 {
+			// Rows already in scrollback were wrapped at the old width;
+			// re-count them at the new width so streaming resumes exactly
+			// after the printed source instead of skipping or repeating.
+			m.stream.emitted = len(m.streamRows(m.stream.src.String()[:m.stream.emittedSrc]))
+		}
 		return m, nil
 	case tea.BackgroundColorMsg:
 		m.st.SetBackground(msg.Color)
@@ -400,7 +390,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.finalizeStream("")
 		m.flushActive(true)
 		m.commit(errorCell(m.st, "backend closed the event stream"))
-		return m, tea.Quit
+		return m, m.quit()
 	case resumeTimeoutMsg:
 		m.onResumeTimeout(msg)
 		return m, nil
@@ -408,9 +398,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ticking = false
 		return m, m.ensureTick()
 	case filesMsg:
-		m.files, m.filesBusy = msg, false
-		m.refreshPopups()
-		return m, nil
+		m.files, m.filesBusy = []string(msg), false
+		if m.files == nil {
+			m.files = []string{} // loaded, just empty
+		}
+		return m, m.refreshPopups()
 	case editorMsg:
 		if msg.err != nil {
 			m.flash("editor failed: " + msg.err.Error())
@@ -426,7 +418,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.PasteMsg:
-		if m.pager == nil && len(m.approvals) == 0 {
+		if m.pager == nil && len(m.approvals) == 0 && m.picker == nil && !m.awaitingList && !m.awaitingResume {
 			m.composer.Paste(msg.Content)
 			m.refreshPopups()
 		}
@@ -482,10 +474,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 			m.finalizeStream("")
 			m.flushActive(true)
 			m.commit(userCell{e.Message})
-			if n := len(m.composer.history); n == 0 || m.composer.history[n-1] != e.Message {
-				m.composer.history = append(m.composer.history, e.Message)
-			}
-			m.composer.histIdx = len(m.composer.history)
+			m.composer.addHistory(e.Message, nil)
 		}
 	case protocol.TaskStarted:
 		if m.replaying {
@@ -704,7 +693,7 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 	key := k.String()
 	if m.pager != nil {
 		if m.pager.handleKey(key, m.height) {
-			m.pager = nil
+			m.closePager()
 		}
 		return nil
 	}
@@ -713,6 +702,19 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 	}
 	if m.picker != nil {
 		return m.handlePickerKey(k)
+	}
+	if m.awaitingList || m.awaitingResume {
+		// The composer is hidden while sessions load; don't let keys
+		// reach it (they would be sent to the backend unseen).
+		switch key {
+		case "ctrl+c", "ctrl+d":
+			return m.quit()
+		case "esc":
+			m.awaitingList, m.awaitingResume = false, false
+			m.resumeGen++ // invalidate the pending timeout
+			m.showPendingHeader()
+		}
+		return nil
 	}
 	if m.shortcuts {
 		m.shortcuts = false
@@ -727,10 +729,13 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		case !m.composer.Empty():
 			m.composer.Submit() // stash into history, then clear
 			m.closePopups()
-		case m.running:
-			m.submit(protocol.Interrupt{})
 		case time.Now().Before(m.ctrlCArmed):
 			return m.quit()
+		case m.running:
+			// Interrupt, and arm quit in case the backend never answers.
+			m.submit(protocol.Interrupt{})
+			m.ctrlCArmed = time.Now().Add(2 * time.Second)
+			m.hint, m.hintUntil = "ctrl + c again to quit", m.ctrlCArmed
 		default:
 			m.ctrlCArmed = time.Now().Add(2 * time.Second)
 			m.hint, m.hintUntil = "ctrl + c again to quit", m.ctrlCArmed
@@ -753,7 +758,7 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			m.submit(protocol.Interrupt{})
 		case m.composer.Empty() && time.Now().Before(m.escArmed):
 			if n := len(m.composer.history); n > 0 {
-				m.composer.Set(m.composer.history[n-1])
+				m.composer.recall(n - 1)
 			}
 			m.escArmed = time.Time{}
 			m.hintUntil = time.Time{}
@@ -763,7 +768,7 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	case "ctrl+t":
-		m.pager = newPager(m.committed, m.width, m.st)
+		m.openPager()
 		return nil
 	case "ctrl+g":
 		return m.openEditor()
@@ -791,6 +796,9 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			return nil
 		case "enter":
 			if c, ok := p.current(); ok {
+				if m.commandBlocked(c.Name) {
+					return nil
+				}
 				_, args := splitCommand(m.composer.String())
 				m.composer.Clear()
 				m.closePopups()
@@ -813,9 +821,14 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 					path = `"` + path + `"`
 				}
 				m.composer.replaceRange(p.start, p.end, path+" ")
+				m.closePopups()
+				return nil
 			}
 			m.closePopups()
-			return nil
+			if key == "tab" {
+				return nil
+			}
+			// enter with nothing to complete: fall through and submit
 		}
 	}
 
@@ -828,6 +841,9 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		if strings.HasPrefix(text, "/") && !strings.ContainsAny(strings.SplitN(text, " ", 2)[0], "\n") {
 			name, args := splitCommand(text)
 			if m.lookupCommand(name) {
+				if m.commandBlocked(name) {
+					return nil // keep the text so it can be sent later
+				}
 				m.composer.Submit()
 				return m.runCommand(name, args)
 			}
@@ -900,6 +916,21 @@ func (m *model) lookupCommand(name string) bool {
 	return false
 }
 
+// commandBlocked reports (and flashes) commands that cannot run now:
+// backend commands and /resume are refused while a turn is running.
+func (m *model) commandBlocked(name string) bool {
+	if !m.running {
+		return false
+	}
+	for _, c := range m.opts.Commands {
+		if c.Name == name && (!c.Local || name == "resume") {
+			m.flash("'/" + name + "' is disabled while a task is in progress")
+			return true
+		}
+	}
+	return false
+}
+
 func (m *model) runCommand(name, args string) tea.Cmd {
 	var cmd *Command
 	for i := range m.opts.Commands {
@@ -911,10 +942,6 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return nil
 	}
 	if !cmd.Local {
-		if m.running && name != "status" {
-			m.flash("'/" + name + "' is disabled while a task is in progress")
-			return nil
-		}
 		m.commit(userCell{"/" + strings.TrimSpace(name+" "+args)})
 		m.submit(protocol.SlashCommand{Name: name, Args: args})
 		return nil
@@ -934,12 +961,8 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		m.composer.Set("@")
 		return m.refreshPopups()
 	case "transcript":
-		m.pager = newPager(m.committed, m.width, m.st)
+		m.openPager()
 	case "resume":
-		if m.running {
-			m.flash("'/resume' is disabled while a task is in progress")
-			return nil
-		}
 		if args != "" {
 			return m.requestResume(args)
 		}
@@ -993,16 +1016,18 @@ func (m *model) refreshPopups() tea.Cmd {
 	c.slash = nil
 	tok, s, e := c.currentToken()
 	if strings.HasPrefix(tok, "@") {
-		if c.files == nil {
+		opening := c.files == nil
+		if opening {
 			c.files = &filePopup{}
 		}
 		c.files.query, c.files.start, c.files.end = tok[1:], s, e
-		if m.files == nil && !m.filesBusy {
+		c.files.filter(m.files) // previous index while a fresh one loads
+		if opening && !m.filesBusy {
+			// Re-index on every new "@" so files created since show up.
 			m.filesBusy = true
 			cwd := m.cwd
 			return func() tea.Msg { return filesMsg(loadFileIndex(cwd)) }
 		}
-		c.files.filter(m.files)
 		return nil
 	}
 	c.files = nil
@@ -1025,6 +1050,9 @@ func (m *model) openEditor() tea.Cmd {
 	_, _ = f.WriteString(m.composer.String())
 	_ = f.Close()
 	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		parts = []string{"vi"}
+	}
 	cmd := exec.Command(parts[0], append(parts[1:], f.Name())...)
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		defer os.Remove(f.Name())

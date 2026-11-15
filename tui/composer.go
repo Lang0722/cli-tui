@@ -15,7 +15,8 @@ type composer struct {
 	cursor int // index into text
 
 	history    []string
-	histIdx    int // len(history) when not browsing
+	histPastes []map[string]string // paste placeholders per history entry
+	histIdx    int                 // len(history) when not browsing
 	histDraft  string
 	pastes     map[string]string
 	pasteCount int
@@ -78,10 +79,14 @@ func (c *composer) Submit() string {
 	for ph, content := range c.pastes {
 		expanded = strings.ReplaceAll(expanded, ph, content)
 	}
-	c.pastes = map[string]string{}
-	if strings.TrimSpace(raw) != "" && (len(c.history) == 0 || c.history[len(c.history)-1] != raw) {
-		c.history = append(c.history, raw)
+	used := map[string]string{}
+	for ph, content := range c.pastes {
+		if strings.Contains(raw, ph) {
+			used[ph] = content
+		}
 	}
+	c.pastes = map[string]string{}
+	c.addHistory(raw, used)
 	c.Clear()
 	return expanded
 }
@@ -138,9 +143,15 @@ func (c *composer) moveVertical(dy, width int) bool {
 		return false
 	}
 	r := rows[target]
+	end := r.end
+	if target+1 < len(rows) && rows[target+1].start == r.end && end > r.start {
+		// Soft-wrapped row: its end index belongs to the next row, so the
+		// last reachable position on this row is one before it.
+		end--
+	}
 	col := 0
 	idx := r.start
-	for idx < r.end {
+	for idx < end {
 		w := uniseg.StringWidth(string(c.text[idx]))
 		if col+w > ccol {
 			break
@@ -152,6 +163,29 @@ func (c *composer) moveVertical(dy, width int) bool {
 	return true
 }
 
+// addHistory records a submitted prompt. pastes maps placeholders in text
+// to their content so a recalled entry expands the same way when resent.
+func (c *composer) addHistory(text string, pastes map[string]string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	if n := len(c.history); n > 0 && c.history[n-1] == text {
+		c.histIdx = len(c.history)
+		return
+	}
+	c.history = append(c.history, text)
+	c.histPastes = append(c.histPastes, pastes)
+	c.histIdx = len(c.history)
+}
+
+// recall loads history entry i into the editor, restoring its pastes.
+func (c *composer) recall(i int) {
+	c.Set(c.history[i])
+	for ph, content := range c.histPastes[i] {
+		c.pastes[ph] = content
+	}
+}
+
 func (c *composer) historyPrev() bool {
 	if len(c.history) == 0 || c.histIdx == 0 {
 		return false
@@ -160,7 +194,7 @@ func (c *composer) historyPrev() bool {
 		c.histDraft = string(c.text)
 	}
 	c.histIdx--
-	c.Set(c.history[c.histIdx])
+	c.recall(c.histIdx)
 	return true
 }
 
@@ -172,7 +206,7 @@ func (c *composer) historyNext() bool {
 	if c.histIdx == len(c.history) {
 		c.Set(c.histDraft)
 	} else {
-		c.Set(c.history[c.histIdx])
+		c.recall(c.histIdx)
 	}
 	return true
 }

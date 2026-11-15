@@ -15,6 +15,7 @@ type turn struct {
 	b    *Backend
 	sess *sessionFile
 	ctx  context.Context
+	done chan struct{}
 }
 
 func (t *turn) emit(m protocol.EventMsg) { t.b.emitIn(t.sess, m) }
@@ -69,19 +70,15 @@ func (t *turn) addTokens(n int64) {
 }
 
 func (t *turn) run(text string) {
-	defer func() {
-		t.b.mu.Lock()
-		t.b.cancel = nil
-		t.b.mu.Unlock()
-	}()
+	defer close(t.done)
 	t.emit(protocol.TaskStarted{ContextWindow: contextWindow})
 	lower := strings.ToLower(text)
 	var ok bool
 	switch {
 	case strings.Contains(lower, "error"):
-		t.sleep(400 * time.Millisecond)
-		t.emit(protocol.Error{Message: "stream disconnected before completion: mock error requested"})
-		ok = true
+		if ok = t.sleep(400 * time.Millisecond); ok {
+			t.emit(protocol.Error{Message: "stream disconnected before completion: mock error requested"})
+		}
 	case containsAny(lower, "demo", "timeout", "fix", "edit", "refactor"):
 		ok = t.toolDemo(text)
 	case containsAny(lower, "help", "what can you"):
@@ -91,6 +88,13 @@ func (t *turn) run(text string) {
 	default:
 		ok = t.chat(text)
 	}
+	// Mark the backend idle *before* the final event, so input the UI sends
+	// in response to it (e.g. a queued message) is accepted.
+	t.b.mu.Lock()
+	if t.b.active == t {
+		t.b.active, t.b.cancel = nil, nil
+	}
+	t.b.mu.Unlock()
 	if !ok {
 		t.emit(protocol.TurnAborted{Reason: "interrupted"})
 		return
@@ -181,7 +185,7 @@ func (t *turn) chat(text string) bool {
 	if len([]rune(topic)) > 60 {
 		topic = string([]rune(topic)[:59]) + "…"
 	}
-	reply := fmt.Sprintf(chatReplies[t.b.turn%len(chatReplies)], topic)
+	reply := fmt.Sprintf(chatReplies[int(t.b.turn.Load())%len(chatReplies)], topic)
 	if n := t.b.history(t.sess); n > 1 {
 		reply += fmt.Sprintf("\n\n_(%d earlier messages in this session.)_", n-1)
 	}
@@ -199,7 +203,9 @@ func (t *turn) toolDemo(text string) bool {
 	if !t.stream("**Inspecting the repository**\n\nI should look at the layout first. ", true) {
 		return false
 	}
-	t.sleep(500 * time.Millisecond)
+	if !t.sleep(500 * time.Millisecond) {
+		return false
+	}
 	if !t.say("I'll start by exploring the project structure.") {
 		return false
 	}
@@ -217,7 +223,9 @@ func (t *turn) toolDemo(text string) bool {
 		}
 	}
 
-	t.stream("**Planning the fix**\n\n", true)
+	if !t.stream("**Planning the fix**\n\n", true) {
+		return false
+	}
 	t.emit(protocol.PlanUpdate{
 		Explanation: "Add a request timeout to the server and cover it with a test.",
 		Plan: []protocol.PlanStep{
@@ -226,10 +234,12 @@ func (t *turn) toolDemo(text string) bool {
 			{Step: "Write a regression test", Status: protocol.PlanPending},
 		},
 	})
-	t.sleep(300 * time.Millisecond)
+	if !t.sleep(300 * time.Millisecond) {
+		return false
+	}
 
 	changes := map[string]protocol.FileChange{
-		"internal/server.go":      {Kind: protocol.ChangeUpdate, UnifiedDiff: "@@ -40,5 +40,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {\n \tctx := r.Context()\n-\t// TODO: handle timeouts\n-\tresp, err := s.backend.Do(ctx, r)\n+\tctx, cancel := context.WithTimeout(ctx, s.timeout)\n+\tdefer cancel()\n+\tresp, err := s.backend.Do(ctx, r)\n \tif err != nil {\n \t\treturn\n"},
+		"internal/server.go":      {Kind: protocol.ChangeUpdate, UnifiedDiff: "@@ -40,5 +40,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {\n \tctx := r.Context()\n-\t// TODO: handle timeouts\n-\tresp, err := s.backend.Do(ctx, r)\n+\tctx, cancel := context.WithTimeout(ctx, s.timeout)\n+\tdefer cancel()\n+\tresp, err := s.backend.Do(ctx, r)\n \tif err != nil {\n \t\treturn\n"},
 		"internal/server_test.go": {Kind: protocol.ChangeAdd, Content: "package internal\n\nimport \"testing\"\n\nfunc TestTimeout(t *testing.T) {\n\tt.Parallel()\n}\n"},
 	}
 	t.emit(protocol.ApplyPatchApprovalRequest{CallID: "p1", Changes: changes, Reason: "Add request timeout and a regression test"})
@@ -241,7 +251,10 @@ func (t *turn) toolDemo(text string) bool {
 		return t.say("Understood, I won't edit the files.")
 	}
 	t.emit(protocol.PatchApplyBegin{CallID: "p1", AutoApproved: false, Changes: changes})
-	t.sleep(200 * time.Millisecond)
+	if !t.sleep(200 * time.Millisecond) {
+		t.emit(protocol.PatchApplyEnd{CallID: "p1", Success: false, Stderr: "interrupted"})
+		return false
+	}
 	t.emit(protocol.PatchApplyEnd{CallID: "p1", Success: true})
 
 	testCmd := []string{"bash", "-lc", "go test ./..."}
@@ -258,7 +271,9 @@ func (t *turn) toolDemo(text string) bool {
 	}
 
 	t.emit(protocol.ToolCallBegin{CallID: "t1", Server: "docs", Tool: "search", Arguments: `{"query":"context.WithTimeout"}`})
-	t.sleep(600 * time.Millisecond)
+	if !t.sleep(600 * time.Millisecond) {
+		return false
+	}
 	t.emit(protocol.ToolCallEnd{CallID: "t1", Result: "Found 3 results in pkg.go.dev/context", DurationMs: 600})
 	t.addTokens(23000)
 

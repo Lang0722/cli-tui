@@ -65,8 +65,16 @@ func (c headerCell) Lines(width int, st *Styles) []Line {
 }
 
 func tildePath(p string) string {
-	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(p, home) {
-		return "~" + strings.TrimPrefix(p, home)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || home == "/" {
+		return p
+	}
+	home = strings.TrimSuffix(home, "/")
+	if p == home {
+		return "~"
+	}
+	if strings.HasPrefix(p, home+"/") {
+		return "~" + p[len(home):]
 	}
 	return p
 }

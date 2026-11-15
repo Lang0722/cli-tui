@@ -20,7 +20,7 @@ var (
 	reBullet  = regexp.MustCompile(`^(\s*)([-*+])\s+(.*)$`)
 	reOrdered = regexp.MustCompile(`^(\s*)(\d+)[.)]\s+(.*)$`)
 	reTask    = regexp.MustCompile(`^\[([ xX])\]\s+(.*)$`)
-	reFence   = regexp.MustCompile("^\\s*(```+|~~~+)\\s*([\\w+-]*)")
+	reFence   = regexp.MustCompile("^ {0,3}(```+|~~~+)\\s*([\\w+-]*)")
 	reRule    = regexp.MustCompile(`^\s*([-*_])(\s*[-*_]){2,}\s*$`)
 	reURL     = regexp.MustCompile(`https?://[^\s<>()\[\]]+[^\s<>()\[\].,;:!?'"]`)
 )
@@ -44,7 +44,9 @@ func RenderMarkdown(src string, st *Styles) []mdLine {
 			out = append(out, mdLine{Line: L(S(raw, st.Code)), Hang: nil})
 			continue
 		}
-		if m := reFence.FindStringSubmatch(raw); m != nil {
+		if m := reFence.FindStringSubmatch(raw); m != nil && !(m[1][0] == '`' && strings.Contains(raw[strings.Index(raw, m[1])+len(m[1]):], "`")) {
+			// (a backtick fence's info string can't contain backticks, so
+			// "```js``` is inline code" is a paragraph, not a fence)
 			inFence = true
 			fenceMarker = m[1]
 			prevBlank = false
@@ -191,7 +193,7 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 			// non-space, a closer preceded by non-space; "_" additionally
 			// may not touch a word character on its outer side (snake_case).
 			isSpace := func(j int) bool { return j < 0 || j >= len(s) || s[j] == ' ' || s[j] == '\t' }
-			canOpen := !isSpace(i+1) && (c == '*' || !isWordChar(i-1)) && strings.IndexByte(s[i+1:], c) >= 0
+			canOpen := !italic && !isSpace(i+1) && (c == '*' || !isWordChar(i-1)) && hasCloser(s, i+1, c)
 			canClose := italic && !isSpace(i-1) && (c == '*' || !isWordChar(i+1))
 			if !canOpen && !canClose {
 				buf.WriteByte(c)
@@ -201,26 +203,20 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 			flush()
 			italic = !italic
 			i++
-		case c == '~' && i+1 < len(s) && s[i+1] == '~':
+		case c == '~' && i+1 < len(s) && s[i+1] == '~' && (strike || strings.Contains(s[i+2:], "~~")):
 			flush()
 			strike = !strike
 			i += 2
 		case c == '[':
-			close := strings.Index(s[i:], "](")
-			if close > 0 {
-				rp := strings.IndexByte(s[i+close+2:], ')')
-				if rp >= 0 {
-					flush()
-					label := s[i+1 : i+close]
-					url := s[i+close+2 : i+close+2+rp]
-					ls := st.Link.Inherit(cur()).Hyperlink(url)
-					out = append(out, inline(label, ls, st)...)
-					if label != url && !strings.HasPrefix(url, "#") {
-						out = append(out, S(" ("+url+")", st.Dim.Hyperlink(url)))
-					}
-					i += close + 2 + rp + 1
-					continue
+			if label, url, n, ok := parseLink(s[i:]); ok {
+				flush()
+				ls := st.Link.Inherit(cur()).Hyperlink(url)
+				out = append(out, inline(label, ls, st)...)
+				if label != url && !strings.HasPrefix(url, "#") {
+					out = append(out, S(" ("+url+")", st.Dim.Hyperlink(url)))
 				}
+				i += n
+				continue
 			}
 			buf.WriteByte(c)
 			i++
@@ -231,6 +227,67 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 	}
 	flush()
 	return out
+}
+
+// hasCloser reports whether s[from:] holds a closing emphasis delimiter c
+// (preceded by non-space; for "_", not followed by a word character).
+func hasCloser(s string, from int, c byte) bool {
+	for j := from + 1; j < len(s); j++ {
+		if s[j] != c || s[j-1] == ' ' || s[j-1] == '\t' {
+			continue
+		}
+		if c == '_' && j+1 < len(s) && isWordByte(s[j+1]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
+// parseLink parses "[label](url)" at the start of s. The label may contain
+// balanced brackets; the URL may contain balanced parentheses, as in
+// https://en.wikipedia.org/wiki/Go_(programming_language).
+func parseLink(s string) (label, url string, n int, ok bool) {
+	depth := 0
+	end := -1
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 || end+1 >= len(s) || s[end+1] != '(' {
+		return "", "", 0, false
+	}
+	depth = 0
+	for j := end + 1; j < len(s); j++ {
+		switch s[j] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				url = strings.TrimSpace(s[end+2 : j])
+				if url == "" || strings.ContainsAny(url, " \t") {
+					return "", "", 0, false
+				}
+				return s[1:end], url, j + 1, true
+			}
+		}
+	}
+	return "", "", 0, false
 }
 
 // linkify styles bare URLs as OSC 8 hyperlinks (gnome-terminal/VTE supports

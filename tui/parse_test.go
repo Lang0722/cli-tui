@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"agenttui/protocol"
@@ -126,4 +127,69 @@ func TestInlineEmphasis(t *testing.T) {
 			t.Errorf("%q -> %q, want %q", in, got, want)
 		}
 	}
+}
+
+func TestParseUnifiedEdgeCases(t *testing.T) {
+	_, add, del := parseUnified("@@ -1,2 +1,2 @@\n--- old comment\n+-- new comment\n keep\n")
+	if add != 1 || del != 1 {
+		t.Errorf("sql comment lines: add=%d del=%d", add, del)
+	}
+	_, add, _ = parseUnified("@@ -1,1 +1,2 @@\n x\n+++i;\n")
+	if add != 1 {
+		t.Errorf("++i line: add=%d", add)
+	}
+	rows, _, _ := parseUnified("@@ -10,4 +10,4 @@\n a\n\n b\n-c\n+C\n")
+	if last := rows[len(rows)-1]; last.kind != '+' || last.num != 13 {
+		t.Errorf("blank context line: last row %+v", last)
+	}
+	// Two hunks plus git headers.
+	rows, add, del = parseUnified("diff --git a/x b/x\nindex 1..2\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n@@ -9,2 +9,2 @@\n k\n-y\n+z\n")
+	if add != 2 || del != 2 || rows[2].kind != 0 {
+		t.Errorf("multi hunk: add=%d del=%d rows=%+v", add, del, rows)
+	}
+	if r, a, _ := fileRows(protocol.FileChange{Kind: protocol.ChangeAdd, Content: ""}); len(r) != 0 || a != 0 {
+		t.Errorf("empty add: %d rows, +%d", len(r), a)
+	}
+}
+
+func TestParseUnifiedWrongCounts(t *testing.T) {
+	// Header claims 6 old lines but the hunk has 2: the next @@ must still
+	// start a new hunk rather than be shown as a context line.
+	rows, add, del := parseUnified("@@ -8,6 +8,9 @@\n+a\n os\n@@ -23,3 +26,7 @@\n-x\n+y\n")
+	for _, r := range rows {
+		if strings.HasPrefix(r.text, "@@") {
+			t.Fatalf("hunk header rendered as content: %+v", rows)
+		}
+	}
+	if add != 2 || del != 1 {
+		t.Errorf("add=%d del=%d", add, del)
+	}
+}
+
+func TestMarkdownReviewCases(t *testing.T) {
+	st := newStyles()
+	cases := map[string]string{
+		"check arr[0] and [docs](http://x.io)":                          "check arr[0] and docs (http://x.io)",
+		"[Go](https://en.wikipedia.org/wiki/Go_(programming_language))": "Go (https://en.wikipedia.org/wiki/Go_(programming_language))",
+		"delete *.txt and *.go files":                                   "delete *.txt and *.go files",
+		"costs ~~5 dollars":                                             "costs ~~5 dollars",
+		"~~gone~~ here":                                                 "gone here",
+	}
+	for in, want := range cases {
+		if got := inline(in, st.Plain, st).Plain(); got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+	md := RenderMarkdown("```js``` is inline code\nnext line", st)
+	if len(md) != 2 || md[1].Line.Plain() != "next line" {
+		t.Errorf("inline triple backticks became a fence: %q", plainMD(md))
+	}
+}
+
+func plainMD(md []mdLine) []string {
+	var out []string
+	for _, l := range md {
+		out = append(out, l.Line.Plain())
+	}
+	return out
 }

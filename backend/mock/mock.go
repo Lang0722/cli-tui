@@ -11,7 +11,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agenttui/protocol"
@@ -32,8 +34,15 @@ type Backend struct {
 	mu        sync.Mutex
 	cancel    context.CancelFunc
 	approvals map[string]chan protocol.ReviewDecision
-	turn      int
+	turn      atomic.Int64
+	active    *turn        // the running turn, if any
 	cur       *sessionFile // nil until the first message of a new session
+
+	// Submit only enqueues; ops run in order on the mock's own goroutine so
+	// the UI never waits on disk writes, sleeps or event-channel sends.
+	opMu   sync.Mutex
+	ops    []protocol.Op
+	opWake chan struct{}
 }
 
 // New creates a mock backend that keeps sessions in dir (DefaultDir() if
@@ -48,7 +57,9 @@ func New(dir string) (*Backend, error) {
 		store:     store{dir: dir},
 		cwd:       cwd,
 		approvals: map[string]chan protocol.ReviewDecision{},
+		opWake:    make(chan struct{}, 1),
 	}
+	go b.opLoop()
 	if list, err := b.store.list(); err == nil && len(list) == 0 {
 		if err := seedDemo(&b.store, cwd); err != nil {
 			return nil, fmt.Errorf("seed demo sessions in %s: %w", dir, err)
@@ -63,8 +74,15 @@ func ResetDemo(dir string) error {
 	if dir == "" {
 		dir = DefaultDir()
 	}
-	if err := os.RemoveAll(dir); err != nil {
-		return err
+	// Only remove session files: dir may be a directory the user pointed
+	// -sessions at that holds other things.
+	for _, pat := range []string{"*.json", "*.json.tmp"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pat))
+		for _, f := range matches {
+			if err := os.Remove(f); err != nil {
+				return err
+			}
+		}
 	}
 	cwd, _ := os.Getwd()
 	return seedDemo(&store{dir: dir}, cwd)
@@ -110,7 +128,13 @@ func (b *Backend) emitIn(sess *sessionFile, m protocol.EventMsg) {
 		_ = b.store.save(sess)
 		b.mu.Unlock()
 	}
-	b.events <- protocol.Event{ID: fmt.Sprint(b.turn), Msg: m}
+	b.events <- protocol.Event{ID: fmt.Sprint(b.turn.Load()), Msg: m}
+}
+
+// notice sends an event without saving it in the conversation (status
+// messages about the backend itself, not part of the chat).
+func (b *Backend) notice(m protocol.EventMsg) {
+	b.events <- protocol.Event{ID: fmt.Sprint(b.turn.Load()), Msg: m}
 }
 
 func (b *Backend) tokens(sess *sessionFile) int64 {
@@ -125,32 +149,70 @@ func (b *Backend) history(sess *sessionFile) int {
 	return sess.Meta.Messages
 }
 
+// stopTurn cancels the running turn and waits (bounded) for it to finish,
+// so its TurnAborted is delivered before whatever replaces the session.
 func (b *Backend) stopTurn() {
 	b.mu.Lock()
+	t := b.active
 	if b.cancel != nil {
 		b.cancel()
 	}
 	b.mu.Unlock()
-	// Give the turn goroutine a moment to emit TurnAborted.
-	time.Sleep(50 * time.Millisecond)
+	if t != nil {
+		select {
+		case <-t.done:
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
+// Submit implements protocol.Backend. It never blocks.
 func (b *Backend) Submit(_ context.Context, op protocol.Op) error {
+	b.opMu.Lock()
+	b.ops = append(b.ops, op)
+	b.opMu.Unlock()
+	select {
+	case b.opWake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (b *Backend) opLoop() {
+	for range b.opWake {
+		for {
+			b.opMu.Lock()
+			if len(b.ops) == 0 {
+				b.opMu.Unlock()
+				break
+			}
+			op := b.ops[0]
+			b.ops = b.ops[1:]
+			b.opMu.Unlock()
+			b.handle(op)
+		}
+	}
+}
+
+func (b *Backend) handle(op protocol.Op) {
 	switch op := op.(type) {
 	case protocol.UserInput:
 		b.mu.Lock()
 		if b.cancel != nil {
 			b.mu.Unlock()
-			b.emit(protocol.BackgroundEvent{Message: "the mock backend cannot take input while a turn runs; queue it with tab"})
-			return nil
+			b.notice(protocol.BackgroundEvent{Message: "the mock backend cannot take input while a turn runs; queue it with tab"})
+			return
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		b.cancel = cancel
-		b.turn++
+		b.turn.Add(1)
 		b.mu.Unlock()
 		sess := b.session()
+		t := &turn{b: b, sess: sess, ctx: ctx, done: make(chan struct{})}
+		b.mu.Lock()
+		b.active = t
+		b.mu.Unlock()
 		b.emitIn(sess, protocol.UserMessage{Message: op.Text})
-		t := &turn{b: b, sess: sess, ctx: ctx}
 		go t.run(op.Text)
 	case protocol.Interrupt:
 		b.mu.Lock()
@@ -165,28 +227,27 @@ func (b *Backend) Submit(_ context.Context, op protocol.Op) error {
 	case protocol.ListSessions:
 		list, err := b.store.list()
 		if err != nil {
-			b.emit(protocol.Error{Message: "list sessions: " + err.Error()})
+			b.notice(protocol.Error{Message: "list sessions: " + err.Error()})
 		}
-		go func() { b.events <- protocol.Event{Msg: protocol.SessionList{Sessions: list}} }()
+		b.notice(protocol.SessionList{Sessions: list})
 	case protocol.ResumeSession:
 		b.stopTurn()
 		f, err := b.store.load(op.ID)
 		if err != nil {
-			go b.emit(protocol.Error{Message: "resume: no saved session " + op.ID + ": " + err.Error()})
-			return nil
+			b.notice(protocol.Error{Message: "resume: no saved session " + op.ID + ": " + err.Error()})
+			return
 		}
 		b.mu.Lock()
 		b.cur = f
 		b.mu.Unlock()
-		go func() {
-			b.events <- protocol.Event{Msg: b.configured(f)}
-		}()
+		sc := b.configured(f)
+		sc.Resumed = true
+		b.notice(sc)
 	case protocol.SlashCommand:
-		go b.slash(op)
+		b.slash(op)
 	case protocol.Shutdown:
-		go func() { b.events <- protocol.Event{Msg: protocol.ShutdownComplete{}} }()
+		b.notice(protocol.ShutdownComplete{})
 	}
-	return nil
 }
 
 func (b *Backend) slash(op protocol.SlashCommand) {
@@ -196,14 +257,14 @@ func (b *Backend) slash(op protocol.SlashCommand) {
 		b.mu.Lock()
 		b.cur = nil
 		b.mu.Unlock()
-		b.events <- protocol.Event{Msg: b.configured(nil)}
+		b.notice(b.configured(nil))
 	case "compact":
 		b.emit(protocol.BackgroundEvent{Message: "Compacted conversation history"})
 		b.emit(protocol.TokenCount{TotalTokens: 4000, ContextWindow: contextWindow})
 	case "model":
-		b.emit(protocol.BackgroundEvent{Message: modelName + " (" + effort + ") is the only model the mock backend has"})
+		b.notice(protocol.BackgroundEvent{Message: modelName + " (" + effort + ") is the only model the mock backend has"})
 	default:
-		b.emit(protocol.Warning{Message: "/" + op.Name + " is not implemented by the mock backend"})
+		b.notice(protocol.Warning{Message: "/" + op.Name + " is not implemented by the mock backend"})
 	}
 }
 

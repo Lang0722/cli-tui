@@ -111,6 +111,9 @@ type SessionConfigured struct {
 	// PlanUpdate, ToolCall*, TokenCount, Error, ...) into the transcript
 	// without prompting for approvals or starting a turn.
 	InitialMessages EventList `json:"initial_messages,omitempty"`
+	// Resumed must be true when this answers a ResumeSession, even if the
+	// session has no messages yet; it ends the UI's "loading" state.
+	Resumed bool `json:"resumed,omitempty"`
 }
 
 // TaskStarted marks the beginning of a turn.

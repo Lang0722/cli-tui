@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 // Wire format (one JSON object per line):
@@ -80,17 +81,20 @@ func MarshalEvent(e Event) ([]byte, error) {
 // UnmarshalEvent decodes a JSON line into an Event.
 func UnmarshalEvent(data []byte) (Event, error) {
 	var env struct {
-		ID  string          `json:"id"`
+		ID  json.RawMessage `json:"id"`
 		Msg json.RawMessage `json:"msg"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil {
 		return Event{}, err
 	}
+	if len(env.Msg) == 0 {
+		return Event{}, fmt.Errorf("event has no \"msg\"")
+	}
 	v, err := decodeTagged(env.Msg, eventTypes)
 	if err != nil {
 		return Event{}, err
 	}
-	return Event{ID: env.ID, Msg: v.(EventMsg)}, nil
+	return Event{ID: rawID(env.ID), Msg: v.(EventMsg)}, nil
 }
 
 // MarshalOp encodes an Op as a single JSON line (without newline).
@@ -135,4 +139,13 @@ func (l *EventList) UnmarshalJSON(data []byte) error {
 		*l = append(*l, v.(EventMsg))
 	}
 	return nil
+}
+
+// rawID accepts a string or numeric "id" (many backends use counters).
+func rawID(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return strings.TrimSpace(string(raw))
 }

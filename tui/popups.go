@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"charm.land/lipgloss/v2"
 )
@@ -215,7 +216,7 @@ func (p *filePopup) move(d int) {
 }
 
 func (p *filePopup) Lines(width int, st *Styles, loading bool) []Line {
-	if loading {
+	if loading && len(p.matches) == 0 {
 		return []Line{L(P("  "), S("loading…", st.Dim.Italic(true)))}
 	}
 	if len(p.matches) == 0 {
@@ -237,16 +238,24 @@ func (p *filePopup) Lines(width int, st *Styles, loading bool) []Line {
 }
 
 func highlightMatch(s, q string, hs, bs lipgloss.Style) Line {
-	ls, lq := strings.ToLower(s), strings.ToLower(q)
-	marks := make([]bool, len(s))
-	if i := strings.LastIndex(ls, lq); i >= 0 && lq != "" {
+	// Work on runes: lower-casing can change a string's byte length
+	// ("Ⱥ" is 2 bytes, "ⱥ" is 3), so byte offsets from a lowered copy
+	// must never index the original.
+	rs := []rune(s)
+	lower := make([]rune, len(rs))
+	for i, r := range rs {
+		lower[i] = unicode.ToLower(r)
+	}
+	lq := []rune(strings.ToLower(q))
+	marks := make([]bool, len(rs))
+	if i := lastIndexRunes(lower, lq); i >= 0 && len(lq) > 0 {
 		for j := i; j < i+len(lq); j++ {
 			marks[j] = true
 		}
 	} else {
 		qi := 0
-		for i := 0; i < len(ls) && qi < len(lq); i++ {
-			if ls[i] == lq[qi] {
+		for i := 0; i < len(lower) && qi < len(lq); i++ {
+			if lower[i] == lq[qi] {
 				marks[i] = true
 				qi++
 			}
@@ -266,13 +275,29 @@ func highlightMatch(s, q string, hs, bs lipgloss.Style) Line {
 		out = append(out, S(cur.String(), st))
 		cur.Reset()
 	}
-	for i := 0; i < len(s); i++ {
+	for i, r := range rs {
 		if marks[i] != curMark {
 			flush()
 			curMark = marks[i]
 		}
-		cur.WriteByte(s[i])
+		cur.WriteRune(r)
 	}
 	flush()
 	return out
+}
+
+func lastIndexRunes(s, sub []rune) int {
+	if len(sub) == 0 || len(sub) > len(s) {
+		return -1
+	}
+outer:
+	for i := len(s) - len(sub); i >= 0; i-- {
+		for j := range sub {
+			if s[i+j] != sub[j] {
+				continue outer
+			}
+		}
+		return i
+	}
+	return -1
 }

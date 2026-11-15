@@ -255,7 +255,9 @@ func sanitize(s string) string {
 	s = strings.ReplaceAll(s, "\t", "    ")
 	var b strings.Builder
 	for _, r := range s {
-		if r == '\n' || r >= 0x20 && r != 0x7f {
+		// Drop C0 controls, DEL and C1 controls (U+0080–U+009F: e.g. U+009B
+		// is CSI on terminals that honor 8-bit controls).
+		if r == '\n' || r >= 0x20 && r != 0x7f && !(r >= 0x80 && r <= 0x9f) {
 			b.WriteRune(r)
 		}
 	}

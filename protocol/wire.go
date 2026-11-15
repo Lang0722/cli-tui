@@ -29,7 +29,7 @@ func init() {
 		ExecCommandEnd{}, ExecApprovalRequest{}, ApplyPatchApprovalRequest{},
 		PatchApplyBegin{}, PatchApplyEnd{}, ToolCallBegin{}, ToolCallEnd{},
 		PlanUpdate{}, TokenCount{}, BackgroundEvent{}, Warning{}, Error{},
-		StreamError{}, ShutdownComplete{}, SessionList{}, UserMessage{}, SelectionRequest{},
+		StreamError{}, ShutdownComplete{}, SessionList{}, SessionTitle{}, UserMessage{}, SelectionRequest{},
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}

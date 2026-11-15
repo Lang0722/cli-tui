@@ -117,6 +117,9 @@ type SessionConfigured struct {
 	Version         string `json:"version,omitempty"`
 	// AgentName replaces "Codex" in the header, placeholder and approvals.
 	AgentName string `json:"agent_name,omitempty"`
+	// Title names the conversation (status line / window title items
+	// "thread-name"); update it later with SessionTitle.
+	Title string `json:"title,omitempty"`
 	// InitialMessages is set when a saved session is resumed: the UI replays
 	// these events (UserMessage, AgentMessage, ExecCommand*, PatchApplyBegin,
 	// PlanUpdate, ToolCall*, TokenCount, Error, ...) into the transcript
@@ -312,6 +315,13 @@ type TokenCount struct {
 	ContextWindow int64 `json:"context_window,omitempty"`
 }
 
+// SessionTitle renames the current conversation (e.g. once the first
+// prompt gives it a title). It is shown by the "thread-name" and
+// "thread-title" status line and window title items.
+type SessionTitle struct {
+	Title string `json:"title"`
+}
+
 // BackgroundEvent is an informational line ("• message", dim).
 type BackgroundEvent struct {
 	Message string `json:"message"`
@@ -362,4 +372,5 @@ func (Error) eventType() string                      { return "error" }
 func (StreamError) eventType() string                { return "stream_error" }
 func (ShutdownComplete) eventType() string           { return "shutdown_complete" }
 func (SessionList) eventType() string                { return "session_list" }
+func (SessionTitle) eventType() string               { return "session_title" }
 func (UserMessage) eventType() string                { return "user_message" }

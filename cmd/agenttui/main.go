@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"agenttui/backend/mock"
+	"agenttui/config"
 	"agenttui/backend/stdio"
 	"agenttui/protocol"
 	"agenttui/tui"
@@ -51,6 +52,7 @@ func main() {
 	noReflow := fs.Bool("no-reflow", false, "don't clear and re-emit the transcript when the terminal width changes")
 	last := fs.Bool("last", false, "with resume: resume the most recent session without the picker")
 	id := fs.String("id", "", "with resume: resume this session id")
+	configPath := fs.String("config", config.Path(), "settings file (status line, title, keymap)")
 	// "resume" may come before or after the flags: agenttui -sessions X resume
 	for {
 		_ = fs.Parse(args)
@@ -73,6 +75,12 @@ func main() {
 		usageErr(fs, "-reset-demo and -sessions apply to the built-in mock backend, not to a -- backend")
 	case len(backendArgv) == 0 && *logPath != "":
 		usageErr(fs, "-log captures a -- backend's stderr; the mock backend has none")
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agenttui: %v\nFix the config and retry.\n", err)
+		os.Exit(1)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM)
@@ -112,7 +120,7 @@ func main() {
 		be = b
 	}
 
-	err := tui.Run(ctx, tui.Options{
+	err = tui.Run(ctx, tui.Options{
 		Backend:           be,
 		ShowReasoning:     *showReasoning,
 		SteerWhileRunning: *steer,
@@ -121,6 +129,8 @@ func main() {
 		ResumePicker:      resume && !*last && *id == "",
 		ResumeLast:        resume && *last,
 		ResumeID:          *id,
+		Config:            cfg,
+		ConfigPath:        *configPath,
 	})
 	if child != nil {
 		// Deliver shutdown and give the agent time to exit cleanly before

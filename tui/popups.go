@@ -40,6 +40,8 @@ var DefaultCommands = []Command{
 	{Name: "export", Description: "export the conversation as markdown", Local: true},
 	{Name: "clear", Description: "clear the terminal and start a new chat", Local: true},
 	{Name: "pwd", Description: "show the current working directory", Local: true},
+	{Name: "statusline", Description: "configure which items appear in the status line", Local: true},
+	{Name: "title", Description: "configure which items appear in the terminal title", Local: true},
 	{Name: "quit", Description: "exit the app", Local: true},
 	{Name: "exit", Description: "exit the app", Local: true, Alias: true},
 }

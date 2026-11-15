@@ -22,6 +22,8 @@ type TUI struct {
 	// StatusLine lists the footer status-line items in order. nil means the
 	// default; an empty list hides the status line.
 	StatusLine *[]string `toml:"status_line,omitempty"`
+	// StatusLineUseColors colors each status-line item by kind (default on).
+	StatusLineUseColors *bool `toml:"status_line_use_colors,omitempty"`
 	// TerminalTitle lists the window-title items in order (nil: default).
 	TerminalTitle *[]string `toml:"terminal_title,omitempty"`
 	// Keymap maps context → action → key bindings (see tui/keymap.go).

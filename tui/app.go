@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -27,6 +26,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
 
+	"agenttui/config"
 	"agenttui/protocol"
 )
 
@@ -58,6 +58,12 @@ type Options struct {
 	ResumePicker bool
 	ResumeLast   bool
 	ResumeID     string
+
+	// Config holds the user settings (status line, window title, keymap);
+	// ConfigPath is where /statusline, /title and /keymap save them (empty:
+	// changes last for the session only).
+	Config     config.Config
+	ConfigPath string
 }
 
 // Run starts the TUI and blocks until the user quits.
@@ -155,6 +161,18 @@ type model struct {
 
 	// tokens
 	tokensUsed, contextWindow int64
+	inputTokens, outputTokens int64
+
+	// status line and window title (/statusline, /title)
+	statusItems    []string
+	statusColors   bool
+	titleItems     []string
+	surface        *surfacePicker
+	sessionTitle   string
+	planDone       int
+	planTotal      int
+	git            gitInfo
+	configWarnings []string // shown once the first session is configured
 
 	composer  *composer
 	approvals []*approval
@@ -236,7 +254,7 @@ func (m *model) quit() tea.Cmd {
 
 func newModel(ctx context.Context, opts Options) *model {
 	cwd, _ := os.Getwd()
-	return &model{
+	m := &model{
 		ctx: ctx, opts: opts, st: newStyles(),
 		width: 80, height: 24,
 		out:      newPrinter(),
@@ -247,6 +265,8 @@ func newModel(ctx context.Context, opts Options) *model {
 		composer: newComposer(),
 		focused:  true,
 	}
+	m.applySurfaceConfig(opts.Config.TUI)
+	return m
 }
 
 func (m *model) Init() tea.Cmd {
@@ -510,6 +530,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.ticking = false
 		return m, m.ensureTick()
+	case gitInfoMsg:
+		if msg.cwd == m.cwd {
+			m.git = gitInfo(msg)
+		}
+		return m, nil
 	case filesMsg:
 		m.files, m.filesBusy = []string(msg), false
 		if m.files == nil {
@@ -534,7 +559,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.PasteMsg:
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && !m.awaitingList && !m.awaitingResume {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && !m.awaitingList && !m.awaitingResume {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -586,6 +611,16 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 			break
 		}
 		m.onSessionConfigured(e)
+		m.sessionTitle = e.Title
+		m.planDone, m.planTotal = 0, 0
+		m.inputTokens, m.outputTokens = 0, 0
+		for _, w := range m.configWarnings {
+			m.commit(warningCell(m.st, w))
+		}
+		m.configWarnings = nil
+		return fetchGitInfo(m.cwd)
+	case protocol.SessionTitle:
+		m.sessionTitle = e.Title
 	case protocol.SessionList:
 		m.onSessionList(e.Sessions)
 	case protocol.SelectionRequest:
@@ -721,8 +756,15 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.finalizeStream("")
 		m.flushActive(true)
 		m.commit(planCell{e})
+		m.planDone, m.planTotal = 0, len(e.Plan)
+		for _, st := range e.Plan {
+			if st.Status == protocol.PlanCompleted {
+				m.planDone++
+			}
+		}
 	case protocol.TokenCount:
 		m.tokensUsed = e.TotalTokens
+		m.inputTokens, m.outputTokens = e.InputTokens, e.OutputTokens
 		if e.ContextWindow > 0 {
 			m.contextWindow = e.ContextWindow
 		}
@@ -741,9 +783,9 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 	case protocol.StreamError:
 		m.statusDetail = e.Message
 	case protocol.TaskComplete:
-		return m.endTurn(false, e.LastAgentMessage)
+		return tea.Batch(m.endTurn(false, e.LastAgentMessage), m.refreshGit())
 	case protocol.TurnAborted:
-		return m.endTurn(true, "")
+		return tea.Batch(m.endTurn(true, ""), m.refreshGit())
 	case protocol.ShutdownComplete:
 		return m.quit()
 	}
@@ -859,6 +901,9 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 	}
 	if m.picker != nil {
 		return m.handlePickerKey(k)
+	}
+	if m.surface != nil {
+		return m.handleSurfaceKey(k)
 	}
 	if m.awaitingList || m.awaitingResume {
 		// The composer is hidden while sessions load; don't let keys
@@ -1226,6 +1271,10 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return clearTerminal(m.out)
 	case "pwd":
 		m.commit(infoCell(m.st, "Current working directory: "+tildePath(m.cwd)))
+	case "statusline":
+		return m.surfaceCommand(surfaceStatus, args)
+	case "title":
+		return m.surfaceCommand(surfaceTitle, args)
 	case "resume":
 		if args != "" {
 			return m.requestResume(args)
@@ -1364,6 +1413,8 @@ func (m *model) View() tea.View {
 		bottom = append(bottom, m.selections[0].Lines(w, m.height-len(bottom)-2, st)...)
 	} else if m.picker != nil {
 		bottom = append(bottom, m.picker.Lines(w, m.height-2, m.cwd, st)...)
+	} else if m.surface != nil {
+		bottom = append(bottom, m.surface.Lines(w, m.surfacePreview(), st)...)
 	} else if m.awaitingList || m.awaitingResume {
 		bottom = append(bottom, Line{}, L(S("• ", st.Dim)).Append(st.Shimmer("Loading saved sessions")...))
 	} else {
@@ -1386,7 +1437,13 @@ func (m *model) View() tea.View {
 		case m.composer.files != nil:
 			below = m.composer.files.Lines(w, st, m.filesBusy)
 		default:
-			below = []Line{m.footerLine(w)}
+			// Codex: the status line sits above the hint row, and the
+			// context indicator moves into it (as an item).
+			if sl := m.statusLineRow(w); sl != nil {
+				below = []Line{sl, m.footerLine(w, false)}
+			} else {
+				below = []Line{m.footerLine(w, true)}
+			}
 		}
 		// On short terminals show the composer rows around the cursor
 		// instead of letting the frame clamp cut off the part being edited.
@@ -1438,17 +1495,6 @@ func (m *model) View() tea.View {
 	return v
 }
 
-func (m *model) title() string {
-	dir := filepath.Base(m.cwd)
-	if m.needsAction() {
-		return actionTitle() + " — " + m.agent
-	}
-	if m.running {
-		return spinnerFrame() + " " + m.agent + " — " + dir
-	}
-	return m.agent + " — " + dir
-}
-
 func (m *model) statusLines(w int) []Line {
 	st := m.st
 	header := m.statusHeader
@@ -1495,7 +1541,7 @@ func (m *model) queuedLines(w int) []Line {
 	return out
 }
 
-func (m *model) footerLine(w int) Line {
+func (m *model) footerLine(w int, showContext bool) Line {
 	st := m.st
 	k := func(s string) Span { return S(s, st.Bold) }
 	d := func(s string) Span { return S(s, st.Dim) }
@@ -1520,9 +1566,13 @@ func (m *model) footerLine(w int) Line {
 	default:
 		left = nil // Codex hides hints while you type; context stays
 	}
-	right := L(d(fmt.Sprintf("%d%% context left", m.contextLeft())), P("  "))
-	if m.contextWindow <= 0 && m.tokensUsed > 0 {
+	var right Line
+	switch {
+	case !showContext:
+	case m.contextWindow <= 0 && m.tokensUsed > 0:
 		right = L(d(fmt.Sprintf("%s used", compactCount(m.tokensUsed))), P("  "))
+	default:
+		right = L(d(fmt.Sprintf("%d%% context left", m.contextLeft())), P("  "))
 	}
 	gap := w - left.Width() - right.Width()
 	if gap < 1 {

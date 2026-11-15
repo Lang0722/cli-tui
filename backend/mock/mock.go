@@ -109,7 +109,7 @@ func (b *Backend) configured(f *sessionFile) protocol.SessionConfigured {
 		Version: version, AgentName: agentName,
 	}
 	if f != nil {
-		sc.SessionID = f.Meta.ID
+		sc.SessionID, sc.Title = f.Meta.ID, f.Meta.Title
 		// Copy: the session keeps growing while the UI replays this.
 		sc.InitialMessages = append(protocol.EventList(nil), f.Events...)
 		if f.Meta.Cwd != "" {
@@ -140,13 +140,19 @@ func (b *Backend) emit(m protocol.EventMsg) { b.emitIn(b.session(), m) }
 func (b *Backend) emitIn(sess *sessionFile, m protocol.EventMsg) {
 	if replayable(m) && sess != nil {
 		b.mu.Lock()
+		before := sess.Meta.Title
 		sess.record(m, time.Now())
+		retitled := sess.Meta.Title != before && sess == b.cur
+		title := sess.Meta.Title
 		err := b.store.save(sess)
 		report := err != nil && !b.saveErr
 		b.saveErr = b.saveErr || err != nil
 		b.mu.Unlock()
 		if report {
 			b.notice(protocol.Warning{Message: "could not save the session: " + err.Error()})
+		}
+		if retitled {
+			defer b.notice(protocol.SessionTitle{Title: title})
 		}
 	}
 	b.events <- protocol.Event{ID: fmt.Sprint(b.turn.Load()), Msg: m}
@@ -252,11 +258,19 @@ func (b *Backend) handle(op protocol.Op) {
 	case protocol.Rewind:
 		b.stopTurn()
 		b.mu.Lock()
+		var title *string
 		if b.cur != nil {
+			before := b.cur.Meta.Title
 			b.cur.rewind(op.UserMessageIndex)
 			_ = b.store.save(b.cur)
+			if t := b.cur.Meta.Title; t != before {
+				title = &t
+			}
 		}
 		b.mu.Unlock()
+		if title != nil {
+			b.notice(protocol.SessionTitle{Title: *title})
+		}
 	case protocol.Interrupt:
 		b.mu.Lock()
 		if b.cancel != nil {

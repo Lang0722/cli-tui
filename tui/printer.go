@@ -28,12 +28,20 @@ import (
 type printer struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
-	queue   []string
-	held    bool
-	busy    bool // a batch is being printed
+	queue   []string // individual lines
+	held    holdReason
+	busy    bool // a line is being handed to the program
 	stopped bool
 	wake    chan struct{}
 }
+
+// holdReason says why output is paused; output flows when none is set.
+type holdReason uint8
+
+const (
+	holdPager holdReason = 1 << iota // alt-screen pager is open
+	holdClear                        // the terminal is being cleared for a reflow
+)
 
 func newPrinter() *printer {
 	p := &printer{wake: make(chan struct{}, 1)}
@@ -44,7 +52,7 @@ func newPrinter() *printer {
 // push queues text (may contain newlines). Never blocks.
 func (p *printer) push(s string) {
 	p.mu.Lock()
-	p.queue = append(p.queue, s)
+	p.queue = append(p.queue, strings.Split(s, "\n")...)
 	p.mu.Unlock()
 	p.signal()
 }
@@ -56,51 +64,60 @@ func (p *printer) signal() {
 	}
 }
 
-// hold pauses or resumes output (used while the alt-screen pager is open).
-func (p *printer) hold(v bool) {
+// hold pauses (on) or resumes output for one reason.
+func (p *printer) hold(r holdReason, on bool) {
 	p.mu.Lock()
-	p.held = v
+	if on {
+		p.held |= r
+	} else {
+		p.held &^= r
+	}
 	p.mu.Unlock()
 	p.signal()
 	p.cond.Broadcast()
 }
 
-// run prints until stop is called. println is tea.Program.Println.
+// releaseAll resumes output regardless of reason (quitting).
+func (p *printer) releaseAll() {
+	p.mu.Lock()
+	p.held = 0
+	p.mu.Unlock()
+	p.signal()
+	p.cond.Broadcast()
+}
+
+// run prints until stop is called. println is tea.Program.Println. Lines
+// are taken one at a time so a hold (pager opening, terminal clearing) or a
+// reset takes effect between lines, never mid-batch.
 func (p *printer) run(println func(...any)) {
 	for {
 		<-p.wake
 		time.Sleep(35 * time.Millisecond)
-		p.mu.Lock()
-		if p.stopped {
+		for {
+			p.mu.Lock()
+			if p.stopped {
+				p.mu.Unlock()
+				return
+			}
+			if p.held != 0 || len(p.queue) == 0 {
+				p.mu.Unlock()
+				p.cond.Broadcast()
+				break
+			}
+			line := p.queue[0]
+			p.queue = p.queue[1:]
+			p.busy = true
 			p.mu.Unlock()
-			return
-		}
-		if p.held || len(p.queue) == 0 {
+
+			if line == "" {
+				line = " " // Bubble Tea drops empty prints
+			}
+			println(line)
+
+			p.mu.Lock()
+			p.busy = false
 			p.mu.Unlock()
 			p.cond.Broadcast()
-			continue
-		}
-		batch := p.queue
-		p.queue = nil
-		p.busy = true
-		p.mu.Unlock()
-
-		for _, s := range batch {
-			for _, line := range strings.Split(s, "\n") {
-				if line == "" {
-					line = " " // Bubble Tea drops empty prints
-				}
-				println(line)
-			}
-		}
-
-		p.mu.Lock()
-		p.busy = false
-		more := len(p.queue) > 0
-		p.mu.Unlock()
-		p.cond.Broadcast()
-		if more {
-			p.signal()
 		}
 	}
 }
@@ -115,7 +132,7 @@ func (p *printer) drained(timeout time.Duration) {
 	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for (len(p.queue) > 0 || p.busy) && !p.held && time.Now().Before(deadline) {
+	for (len(p.queue) > 0 || p.busy) && p.held == 0 && time.Now().Before(deadline) {
 		p.signal()
 		p.cond.Wait()
 	}

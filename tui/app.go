@@ -148,6 +148,8 @@ type model struct {
 	toolByID     map[string]*toolCell
 	hadTools     bool
 	queued       []pendingInput
+	turnHasAgent bool   // an agent message was committed this turn
+	deferred     []Cell // commits held while an answer streams
 	kittyKeys    bool // terminal reports Shift+Enter distinctly
 	ticking      bool
 
@@ -176,7 +178,7 @@ type model struct {
 	freeformTitle string
 	sessionStart  int // index in committed of the current session's header
 	lastHeader    *headerCell
-	pendingReflow bool
+	pendingReflow reflowMode
 	reflowGen     int
 }
 
@@ -185,12 +187,12 @@ type model struct {
 // and released when the pager closes.
 func (m *model) openPager() {
 	m.pager = newTranscriptPager(func() []Cell { return m.committed }, m.liveTranscript, m.st)
-	m.out.hold(true)
+	m.out.hold(holdPager, true)
 }
 
 func (m *model) openStaticPager(title string, lines []Line) {
 	m.pager = newStaticPager(title, lines, m.st)
-	m.out.hold(true)
+	m.out.hold(holdPager, true)
 }
 
 // liveTranscript is the in-progress part of the turn in transcript form.
@@ -219,7 +221,7 @@ func (m *model) liveTranscript(width int) []Line {
 
 func (m *model) closePager() {
 	m.pager = nil
-	m.out.hold(false)
+	m.out.hold(holdPager, false)
 }
 
 // quit clears the live area, lets pending scrollback output reach the
@@ -228,7 +230,7 @@ func (m *model) quit() tea.Cmd {
 	m.quitting = true
 	m.userQuit = !m.closed
 	m.pager = nil
-	m.out.hold(false)
+	m.out.releaseAll()
 	return m.out.quitCmd()
 }
 
@@ -302,6 +304,13 @@ func (m *model) printLines(lines []Line, separate bool) {
 }
 
 func (m *model) commit(cells ...Cell) {
+	if m.stream.active {
+		// Never print into the middle of a streaming answer: hold other
+		// cells until it is finalized (keeps scrollback and transcript in
+		// the same order).
+		m.deferred = append(m.deferred, cells...)
+		return
+	}
 	for _, c := range cells {
 		if h, ok := c.(headerCell); ok {
 			m.lastHeader, m.sessionStart = &h, len(m.committed)
@@ -383,6 +392,7 @@ func (m *model) finalizeStream(final string) {
 		if strings.TrimSpace(final) != "" {
 			m.flushActive(true)
 			m.commit(agentCell{final})
+			m.turnHasAgent = true
 		}
 		return
 	}
@@ -397,7 +407,12 @@ func (m *model) finalizeStream(final string) {
 		m.printLines(rows[m.stream.emitted:], m.stream.emitted == 0)
 	}
 	m.committed = append(m.committed, agentCell{src})
+	m.turnHasAgent = true
 	m.stream = streamState{}
+	if d := m.deferred; len(d) > 0 {
+		m.deferred = nil
+		m.commit(d...)
+	}
 }
 
 // --- reasoning -----------------------------------------------------------
@@ -477,9 +492,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case backendMsg:
 		cmd := m.handleEvent(msg.ev)
 		var reflow tea.Cmd
-		if m.pendingReflow && !m.stream.active {
-			m.pendingReflow = false
-			reflow = m.reflow(false)
+		if m.pendingReflow != reflowNone && !m.stream.active {
+			mode := m.pendingReflow
+			m.pendingReflow = reflowNone
+			reflow = m.reflow(mode == reflowHeader)
 		}
 		return m, tea.Batch(cmd, reflow, m.waitEvent(), m.ensureTick())
 	case backendDone:
@@ -518,7 +534,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.PasteMsg:
-		if m.pager == nil && len(m.approvals) == 0 && m.picker == nil && !m.awaitingList && !m.awaitingResume {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && !m.awaitingList && !m.awaitingResume {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -592,6 +608,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		if m.replaying {
 			break
 		}
+		m.turnHasAgent = false
 		m.running, m.turnStart = true, time.Now()
 		m.statusHeader, m.statusDetail, m.hadTools = "Working", "", false
 		if e.ContextWindow > 0 {
@@ -610,9 +627,14 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		}
 		m.streamDelta(e.Delta)
 	case protocol.AgentMessage:
+		if m.reasoning.Len() > 0 {
+			m.finalizeReasoning("") // keep reasoning before its answer
+		}
 		m.finalizeStream(e.Message)
 	case protocol.ExecCommandBegin:
-		m.finalizeStream("")
+		if e.Source != "user_shell" {
+			m.finalizeStream("") // a user "!" command doesn't split the answer
+		}
 		m.hadTools = true
 		parsed := e.Parsed
 		if len(parsed) == 0 {
@@ -737,26 +759,28 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 		// Mark anything still running as failed (Codex marks them red).
 		m.abortActive()
 		m.flushActive(true)
-		m.approvals = nil
+		m.dropTurnPrompts()
 		m.commit(errorCell(m.st, "Conversation interrupted - tell "+m.agent+" what to do differently"))
 		if m.replaying {
 			return nil
 		}
 	} else {
 		if m.stream.active {
-			m.finalizeStream("")
-		} else if last != "" && !m.lastCommittedIsAgent() {
+			m.finalizeStream(last) // also repairs dropped deltas
+		} else if last != "" && !m.turnHasAgent {
 			m.finalizeStream(last)
 		}
 		m.flushActive(true)
+		m.dropTurnPrompts()
 		if m.replaying {
 			return nil
 		}
-		if el := time.Since(m.turnStart); m.hadTools && el >= time.Second {
+		if el := time.Since(m.turnStart); m.running && !m.turnStart.IsZero() && m.hadTools && el >= time.Second {
 			m.commit(separatorCell{el, time.Now()})
 		}
 	}
 	m.running = false
+	m.turnHasAgent = false
 	m.statusDetail = ""
 	if aborted && len(m.queued) > 0 {
 		// Restore queued input into the composer for editing.
@@ -783,6 +807,14 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 		body = "Turn complete"
 	}
 	return m.notify(m.agent, body)
+}
+
+// dropTurnPrompts closes approvals, pickers and typed answers that belong
+// to a turn that has ended.
+func (m *model) dropTurnPrompts() {
+	m.approvals = nil
+	m.selections = nil
+	m.freeformID = ""
 }
 
 func (m *model) lastCommittedIsAgent() bool {
@@ -882,7 +914,7 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			return imageMsg{p, err}
 		}
 	case "!":
-		if m.composer.Empty() && !m.composer.shell {
+		if m.composer.Empty() && !m.composer.shell && m.freeformID == "" {
 			m.composer.shell = true // the "!" is absorbed, as in Codex
 			return nil
 		}
@@ -925,11 +957,13 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		switch {
 		case m.composer.slash != nil || m.composer.files != nil:
 			m.closePopups()
-		case m.running:
-			m.submit(protocol.Interrupt{})
 		case m.freeformID != "" && m.composer.Empty():
+			// Skip the typed answer (before "interrupt": the question is
+			// usually asked mid-turn).
 			m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1})
 			m.freeformID = ""
+		case m.running:
+			m.submit(protocol.Interrupt{})
 		case m.composer.Empty() && time.Now().Before(m.escArmed):
 			// Codex backtrack: browse earlier prompts, Enter rewinds.
 			m.escArmed = time.Time{}
@@ -952,7 +986,7 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 	case "ctrl+g":
 		return m.openEditor()
 	case "?":
-		if m.composer.Empty() {
+		if m.composer.Empty() && m.freeformID == "" {
 			m.shortcuts = true
 			return nil
 		}
@@ -1035,9 +1069,10 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			return nil
 		}
 		if m.composer.shell {
-			cmd := strings.TrimSpace(m.composer.Submit())
+			cmd := strings.TrimSpace(m.composer.String())
 			m.composer.shell = false
-			m.composer.history[len(m.composer.history)-1] = "!" + cmd
+			m.composer.addHistory("!"+cmd, nil)
+			m.composer.Clear()
 			m.submit(protocol.ShellCommand{Command: cmd})
 			return nil
 		}
@@ -1051,6 +1086,10 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	case "tab":
+		if m.freeformID != "" || !m.running && !m.composer.Empty() {
+			// Codex: Tab submits when idle (and for a typed answer).
+			return m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+		}
 		if m.running && !m.composer.Empty() && !m.composer.shell {
 			full, images := m.composer.SubmitWithImages()
 			m.queued = append(m.queued, pendingInput{strings.TrimSpace(full), images})
@@ -1131,7 +1170,7 @@ func (m *model) commandBlocked(name string) bool {
 		return false
 	}
 	for _, c := range m.opts.Commands {
-		if c.Name == name && (!c.Local || name == "resume") {
+		if c.Name == name && (!c.Local || name == "resume" || name == "clear") {
 			m.commit(errorCell(m.st, "'/"+name+"' is disabled while a task is in progress."))
 			return true
 		}
@@ -1177,10 +1216,14 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 	case "clear":
 		// Clear the terminal and start a new chat; the backend's new
 		// session header is printed afresh.
+		// The cleared conversation is gone from the transcript too, so a
+		// later reflow can't bring it back.
+		m.committed, m.sessionStart, m.lastHeader = nil, 0, nil
+		m.printedAny = false
 		m.out.reset()
-		m.printedAny, m.lastHeader = false, nil
+		m.out.hold(holdClear, true)
 		m.submit(protocol.SlashCommand{Name: "new"})
-		return clearTerminal()
+		return clearTerminal(m.out)
 	case "pwd":
 		m.commit(infoCell(m.st, "Current working directory: "+tildePath(m.cwd)))
 	case "resume":
@@ -1308,9 +1351,14 @@ func (m *model) View() tea.View {
 	if m.running && !(m.stream.active && m.stream.emitted > 0) {
 		bottom = append(bottom, m.statusLines(w)...)
 	}
-	bottom = append(bottom, m.queuedLines(w)...)
+	queued := m.queuedLines(w)
+	if modal := len(m.approvals) > 0 || len(m.selections) > 0; modal && len(queued) > 3 {
+		// An open approval/question needs the room more than the preview.
+		queued = append(queued[:2], L(P("  "), S(fmt.Sprintf("↳ … %d queued", len(m.queued)), st.Dim)))
+	}
+	bottom = append(bottom, queued...)
 	if len(m.approvals) > 0 {
-		maxH := max(8, m.height-len(bottom)-2)
+		maxH := max(6, m.height-len(bottom)-2)
 		bottom = append(bottom, m.approvals[0].Lines(w, maxH, m.cwd, st)...)
 	} else if len(m.selections) > 0 {
 		bottom = append(bottom, m.selections[0].Lines(w, m.height-len(bottom)-2, st)...)
@@ -1331,17 +1379,25 @@ func (m *model) View() tea.View {
 			bottom = append(bottom[:len(bottom)-1], L(P("  "), S(m.freeformTitle, st.Bold)), Line{}.Fill(w, band))
 		}
 		rows, crow, ccol := m.composer.Render(w, st, placeholder, true)
+		var below []Line
+		switch {
+		case m.composer.slash != nil:
+			below = m.composer.slash.Lines(w, st)
+		case m.composer.files != nil:
+			below = m.composer.files.Lines(w, st, m.filesBusy)
+		default:
+			below = []Line{m.footerLine(w)}
+		}
+		// On short terminals show the composer rows around the cursor
+		// instead of letting the frame clamp cut off the part being edited.
+		if avail := m.height - 1 - len(bottom) - 1 - len(below); len(rows) > avail && avail >= 1 {
+			start := max(0, min(crow-avail+1, len(rows)-avail))
+			rows, crow = rows[start:start+avail], crow-start
+		}
 		cursorRow, cursorCol = len(bottom)+crow, ccol
 		bottom = append(bottom, rows...)
 		bottom = append(bottom, Line{}.Fill(w, band))
-		switch {
-		case m.composer.slash != nil:
-			bottom = append(bottom, m.composer.slash.Lines(w, st)...)
-		case m.composer.files != nil:
-			bottom = append(bottom, m.composer.files.Lines(w, st, m.filesBusy)...)
-		default:
-			bottom = append(bottom, m.footerLine(w))
-		}
+		bottom = append(bottom, below...)
 	}
 
 	// Active area (running cells + streaming tail), clipped to fit.

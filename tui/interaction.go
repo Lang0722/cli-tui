@@ -190,10 +190,13 @@ func (m *model) handleSelectionKey(k tea.KeyPressMsg) tea.Cmd {
 func (m *model) reflow(headerOnly bool) tea.Cmd {
 	if m.stream.active {
 		// Rows already streamed live only in the scrollback; redo after.
-		m.pendingReflow = true
+		if headerOnly && m.pendingReflow != reflowFull {
+			m.pendingReflow = reflowHeader
+		} else {
+			m.pendingReflow = reflowFull
+		}
 		return nil
 	}
-	m.out.reset()
 	var lines []Line
 	add := func(c Cell) {
 		if t, ok := c.(interface{ transcriptOnly() bool }); ok && t.transcriptOnly() && !m.opts.ShowReasoning {
@@ -214,25 +217,35 @@ func (m *model) reflow(headerOnly bool) tea.Cmd {
 		}
 	}
 	m.printedAny = len(lines) > 0
-	s := renderLines(lines)
-	out := m.out
-	return tea.Sequence(clearTerminal(), func() tea.Msg {
-		if s != "" {
-			out.push(s)
-		}
-		return nil
-	})
+	// Queue the transcript now (so later commits stay after it) but hold
+	// output until the clear has reached the terminal.
+	m.out.reset()
+	m.out.hold(holdClear, true)
+	if len(lines) > 0 {
+		m.out.push(renderLines(lines))
+	}
+	return clearTerminal(m.out)
 }
 
-// clearTerminal clears the screen and the scrollback. Bubble Tea erases the
-// screen on its next frame flush, and some terminals (tmux with
-// scroll-on-clear) copy an erased screen into history, so the scrollback is
-// cleared (E3) only after that flush.
-func clearTerminal() tea.Cmd {
+type reflowMode uint8
+
+const (
+	reflowNone reflowMode = iota
+	reflowHeader
+	reflowFull
+)
+
+// clearTerminal erases the whole screen and the scrollback, lets Bubble Tea
+// redraw the live frame at the top, then releases held output.
+func clearTerminal(out *printer) tea.Cmd {
 	return tea.Sequence(
+		tea.Raw("\x1b[H\x1b[2J\x1b[3J"),
 		func() tea.Msg { return tea.ClearScreen() },
-		func() tea.Msg { time.Sleep(40 * time.Millisecond); return nil },
-		tea.Raw("\x1b[3J"),
+		func() tea.Msg {
+			time.Sleep(50 * time.Millisecond) // a frame flush
+			out.hold(holdClear, false)
+			return nil
+		},
 	)
 }
 

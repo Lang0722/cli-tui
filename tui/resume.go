@@ -255,6 +255,7 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) {
 		m.cwd = e.Cwd
 	}
 	m.tokensUsed = 0
+	m.dropTurnPrompts() // pickers/approvals of the previous session are stale
 	h := headerCell{m.agent, m.version, m.model, m.effort, m.cwd}
 	if e.Resumed && len(e.InitialMessages) == 0 {
 		// Resumed an empty session: nothing to replay.

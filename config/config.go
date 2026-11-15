@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -105,4 +107,18 @@ func Save(path string, c Config) error {
 		return err
 	}
 	return nil
+}
+
+// MarshalTOML writes one binding as a string and several (or none, which
+// unbinds) as an array, like Codex' keymap editor.
+func (b Bindings) MarshalTOML() ([]byte, error) {
+	q := func(s string) string { return strconv.Quote(s) }
+	if len(b) == 1 {
+		return []byte(q(b[0])), nil
+	}
+	parts := make([]string, len(b))
+	for i, s := range b {
+		parts[i] = q(s)
+	}
+	return []byte("[" + strings.Join(parts, ", ") + "]"), nil
 }

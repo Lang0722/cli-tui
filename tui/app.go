@@ -66,10 +66,22 @@ type Options struct {
 	ConfigPath string
 }
 
+// ValidateConfig reports settings the TUI can't apply. Codex refuses to
+// start with an invalid keymap rather than guess.
+func ValidateConfig(c config.Config) error {
+	if _, err := newKeymap(c.TUI.Keymap); err != nil {
+		return fmt.Errorf("Invalid `tui.keymap` configuration: %w", err)
+	}
+	return nil
+}
+
 // Run starts the TUI and blocks until the user quits.
 func Run(ctx context.Context, opts Options) error {
 	if opts.Commands == nil {
 		opts.Commands = DefaultCommands
+	}
+	if err := ValidateConfig(opts.Config); err != nil {
+		return err
 	}
 	m := newModel(ctx, opts)
 	p := tea.NewProgram(m, tea.WithContext(ctx))
@@ -174,6 +186,11 @@ type model struct {
 	git            gitInfo
 	configWarnings []string // shown once the first session is configured
 
+	// keymap (/keymap)
+	keys     *keymap
+	chord    *pendingChord
+	keymapUI *keymapUI
+
 	composer  *composer
 	approvals []*approval
 	files     []string
@@ -266,6 +283,12 @@ func newModel(ctx context.Context, opts Options) *model {
 		focused:  true,
 	}
 	m.applySurfaceConfig(opts.Config.TUI)
+	if km, err := newKeymap(opts.Config.TUI.Keymap); err == nil {
+		m.setKeymap(km)
+	} else {
+		m.setKeymap(defaultKeymap()) // Run reports the error before starting
+		m.configWarnings = append(m.configWarnings, "Invalid `tui.keymap` configuration: "+err.Error())
+	}
 	return m
 }
 
@@ -527,6 +550,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case resumeTimeoutMsg:
 		m.onResumeTimeout(msg)
 		return m, nil
+	case redrawMsg:
+		if m.chord != nil && !m.chord.until.IsZero() && time.Now().After(m.chord.until) {
+			m.chord = nil // timed out: drop the HUD
+		}
+		return m, nil
 	case tickMsg:
 		m.ticking = false
 		return m, m.ensureTick()
@@ -559,7 +587,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.PasteMsg:
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && !m.awaitingList && !m.awaitingResume {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.keymapUI == nil && !m.awaitingList && !m.awaitingResume {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -881,10 +909,67 @@ func (m *model) flash(s string) {
 // ---------------------------------------------------------------------------
 // keys
 
+// keyContexts are the keymap contexts that apply right now, first wins.
+func (m *model) keyContexts() []string {
+	switch {
+	case m.keymapUI != nil:
+		return nil // /keymap captures keys itself
+	case m.pager != nil:
+		return []string{"pager"}
+	case len(m.approvals) > 0:
+		return []string{"approval", "list", "global"}
+	case len(m.selections) > 0, m.picker != nil, m.surface != nil:
+		return []string{"list"}
+	case m.awaitingList || m.awaitingResume:
+		return nil
+	}
+	return []string{"global", "chat", "composer", "editor"}
+}
+
 func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
+	if m.keymapUI != nil {
+		return m.handleKeymapUIKey(k)
+	}
+	spec, _ := keySpec(k)
+	ctxs := m.keyContexts()
+	act := ""
+	if p := m.chord; p != nil {
+		m.chord = nil
+		switch {
+		case spec == "esc", p.until.IsZero() && spec == p.first:
+			return nil // cancelled (esc, or the leader again)
+		case !p.until.IsZero() && time.Now().After(p.until):
+			// expired: handle the key on its own
+		default:
+			if act = m.keys.completeChord(p, spec); act == "" {
+				return nil // not a chord: swallowed, as in Codex
+			}
+		}
+	}
+	if act == "" && spec != "" {
+		if m.keys.startsChord(spec, ctxs...) {
+			p := &pendingChord{first: spec, ctxs: ctxs, at: time.Now()}
+			if spec != m.keys.leader {
+				p.until = p.at.Add(time.Second)
+			}
+			m.chord = p
+			cmds := []tea.Cmd{redrawAfter(350 * time.Millisecond)}
+			if !p.until.IsZero() {
+				cmds = append(cmds, redrawAfter(time.Second+10*time.Millisecond))
+			}
+			return tea.Batch(cmds...)
+		}
+		act = m.keys.match(spec, ctxs...)
+	}
+	return m.dispatchKey(k, act)
+}
+
+// dispatchKey handles a key whose keymap action (ctx.action, or "") is
+// known. Keys that aren't remappable are matched by name.
+func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	key := k.String()
 	if m.pager != nil {
-		if m.pager.handleKey(key, k.Text, m.height) {
+		if m.pager.handleKey(key, k.Text, strings.TrimPrefix(act, "pager."), m.height) {
 			bt := m.pager.backtrack
 			m.closePager()
 			if bt != nil && bt.chosen >= 0 {
@@ -894,16 +979,16 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 	if len(m.approvals) > 0 {
-		return m.handleApprovalKey(key)
+		return m.handleApprovalKey(key, act)
 	}
 	if len(m.selections) > 0 {
-		return m.handleSelectionKey(k)
+		return m.handleSelectionKey(k, act)
 	}
 	if m.picker != nil {
-		return m.handlePickerKey(k)
+		return m.handlePickerKey(k, act)
 	}
 	if m.surface != nil {
-		return m.handleSurfaceKey(k)
+		return m.handleSurfaceKey(k, act)
 	}
 	if m.awaitingList || m.awaitingResume {
 		// The composer is hidden while sessions load; don't let keys
@@ -920,22 +1005,22 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 	}
 	if m.shortcuts {
 		m.shortcuts = false
-		if key == "?" || key == "esc" {
+		if act == "composer.toggle_shortcuts" || key == "esc" {
 			return nil
 		}
 	}
 
 	if c := m.composer; c.search != nil {
-		switch key {
-		case "esc", "ctrl+c":
+		switch {
+		case key == "esc" || key == "ctrl+c":
 			c.endSearch(false)
-		case "enter":
+		case key == "enter":
 			c.endSearch(true)
-		case "ctrl+r":
+		case act == "composer.history_search_previous":
 			c.searchStep(-1)
-		case "ctrl+s":
+		case act == "composer.history_search_next":
 			c.searchStep(1)
-		case "backspace":
+		case key == "backspace":
 			if r := []rune(c.search.query); len(r) > 0 {
 				c.search.query = string(r[:len(r)-1])
 				c.searchRefresh()
@@ -949,10 +1034,6 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 	switch key {
-	case "ctrl+r":
-		m.closePopups()
-		m.composer.startSearch()
-		return nil
 	case "ctrl+v", "alt+v":
 		return func() tea.Msg {
 			p, err := clipboardImage()
@@ -998,61 +1079,81 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			m.hint, m.hintUntil = "⌃d again to quit", m.ctrlCArmed
 			return nil
 		}
-	case "esc":
+	case "ctrl+z":
+		return tea.Suspend
+	}
+	// Esc: close a popup, skip a typed answer, interrupt (chat.interrupt_turn,
+	// esc by default) or, when idle, Esc Esc backtrack (fixed).
+	if key == "esc" || act == "chat.interrupt_turn" {
 		switch {
-		case m.composer.slash != nil || m.composer.files != nil:
+		case key == "esc" && (m.composer.slash != nil || m.composer.files != nil):
 			m.closePopups()
-		case m.freeformID != "" && m.composer.Empty():
+			return nil
+		case key == "esc" && m.freeformID != "" && m.composer.Empty():
 			// Skip the typed answer (before "interrupt": the question is
 			// usually asked mid-turn).
 			m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1})
 			m.freeformID = ""
-		case m.running:
+			return nil
+		case m.running && act == "chat.interrupt_turn":
 			m.submit(protocol.Interrupt{})
-		case m.composer.Empty() && time.Now().Before(m.escArmed):
+			return nil
+		case key == "esc" && !m.running && m.composer.Empty() && time.Now().Before(m.escArmed):
 			// Codex backtrack: browse earlier prompts, Enter rewinds.
 			m.escArmed = time.Time{}
 			m.hintUntil = time.Time{}
 			m.startBacktrack()
-		case m.composer.Empty():
+			return nil
+		case key == "esc" && !m.running && m.composer.Empty():
 			m.escArmed = time.Now().Add(2 * time.Second)
 			m.hint, m.hintUntil = "esc again to edit previous message", m.escArmed
+			return nil
 		}
-		return nil
-	case "ctrl+t":
+		if key == "esc" {
+			return nil
+		}
+	}
+	switch act {
+	case "global.open_transcript":
 		m.openPager()
 		return nil
-	case "ctrl+o":
+	case "global.find_transcript":
+		m.openPager()
+		m.pager.finding = true
+		return nil
+	case "global.copy":
 		return m.copyLastResponse()
-	case "ctrl+l":
+	case "global.clear_terminal":
 		return m.reflow(true)
-	case "ctrl+z":
-		return tea.Suspend
-	case "ctrl+g":
+	case "global.open_external_editor":
 		return m.openEditor()
-	case "?":
+	case "composer.history_search_previous", "composer.history_search_next":
+		m.closePopups()
+		m.composer.startSearch()
+		return nil
+	case "composer.toggle_shortcuts":
 		if m.composer.Empty() && m.freeformID == "" {
 			m.shortcuts = true
 			return nil
 		}
 	}
 
-	// popups
+	// popups (fixed keys, like Codex' list navigation in the composer)
 	if p := m.composer.slash; p != nil {
-		switch key {
-		case "up", "ctrl+p":
+		switch {
+		case key == "up" || key == "ctrl+p":
 			p.move(-1)
 			return nil
-		case "down", "ctrl+n":
+		case key == "down" || key == "ctrl+n":
 			p.move(1)
 			return nil
-		case "tab":
+		case key == "tab":
 			if c, ok := p.current(); ok {
 				m.composer.Set("/" + c.Name + " ")
 				m.closePopups()
 			}
 			return nil
-		case "enter":
+		case act == "composer.submit" || key == "enter":
 			if c, ok := p.current(); ok {
 				if m.commandBlocked(c.Name) {
 					return nil
@@ -1065,14 +1166,14 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 	}
 	if p := m.composer.files; p != nil {
-		switch key {
-		case "up", "ctrl+p":
+		switch {
+		case key == "up" || key == "ctrl+p":
 			p.move(-1)
 			return nil
-		case "down", "ctrl+n":
+		case key == "down" || key == "ctrl+n":
 			p.move(1)
 			return nil
-		case "tab", "enter":
+		case key == "tab" || key == "enter" || act == "composer.submit":
 			if len(p.matches) > 0 {
 				path := p.matches[p.selected]
 				if strings.ContainsAny(path, " \t") {
@@ -1090,57 +1191,20 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 	}
 
-	switch key {
-	case "enter":
-		text := strings.TrimSpace(m.composer.String())
-		if text == "" {
-			return nil
-		}
-		if strings.HasPrefix(text, "/") && !strings.ContainsAny(strings.SplitN(text, " ", 2)[0], "\n") {
-			name, args := splitCommand(text)
-			if m.lookupCommand(name) {
-				if m.commandBlocked(name) {
-					return nil // keep the text so it can be sent later
-				}
-				m.composer.Submit()
-				return m.runCommand(name, args)
-			}
-		}
-		if m.freeformID != "" {
-			answer := strings.TrimSpace(m.composer.Submit())
-			m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1, Text: answer})
-			m.commit(textCell{bullet: S("•", m.st.Dim), body: L(S(m.freeformTitle+": ", m.st.Dim), S(answer, m.st.Plain))})
-			m.freeformID = ""
-			return nil
-		}
-		if m.composer.shell {
-			cmd := strings.TrimSpace(m.composer.String())
-			m.composer.shell = false
-			m.composer.addHistory("!"+cmd, nil)
-			m.composer.Clear()
-			m.submit(protocol.ShellCommand{Command: cmd})
-			return nil
-		}
-		full, images := m.composer.SubmitWithImages()
-		in := pendingInput{strings.TrimSpace(full), images}
-		switch {
-		case !m.running, m.opts.SteerWhileRunning:
-			m.sendInput(in)
-		default:
-			m.queued = append(m.queued, in)
-		}
-		return nil
-	case "tab":
+	switch act {
+	case "composer.submit":
+		return m.submitComposer()
+	case "composer.queue":
 		if m.freeformID != "" || !m.running && !m.composer.Empty() {
 			// Codex: Tab submits when idle (and for a typed answer).
-			return m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+			return m.submitComposer()
 		}
 		if m.running && !m.composer.Empty() && !m.composer.shell {
 			full, images := m.composer.SubmitWithImages()
 			m.queued = append(m.queued, pendingInput{strings.TrimSpace(full), images})
 			return nil
 		}
-	case "shift+left", "alt+up":
+	case "chat.edit_queued_message":
 		// Codex: pop the last queued message back into the composer.
 		if n := len(m.queued); n > 0 && m.composer.Empty() {
 			last := m.queued[n-1]
@@ -1153,41 +1217,102 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 	}
 
-	if m.composer.HandleEditKey(k, max(m.width-3, 1)) {
+	editAct := ""
+	if strings.HasPrefix(act, "editor.") {
+		editAct = act[len("editor."):]
+	}
+	if m.composer.HandleEditKey(k, editAct, max(m.width-3, 1)) {
 		m.shortcuts = false
 		return m.refreshPopups()
 	}
 	return nil
 }
 
-func (m *model) handleApprovalKey(key string) tea.Cmd {
+func (m *model) submitComposer() tea.Cmd {
+	text := strings.TrimSpace(m.composer.String())
+	if text == "" {
+		return nil
+	}
+	if strings.HasPrefix(text, "/") && !strings.ContainsAny(strings.SplitN(text, " ", 2)[0], "\n") {
+		name, args := splitCommand(text)
+		if m.lookupCommand(name) {
+			if m.commandBlocked(name) {
+				return nil // keep the text so it can be sent later
+			}
+			m.composer.Submit()
+			return m.runCommand(name, args)
+		}
+	}
+	if m.freeformID != "" {
+		answer := strings.TrimSpace(m.composer.Submit())
+		m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1, Text: answer})
+		m.commit(textCell{bullet: S("•", m.st.Dim), body: L(S(m.freeformTitle+": ", m.st.Dim), S(answer, m.st.Plain))})
+		m.freeformID = ""
+		return nil
+	}
+	if m.composer.shell {
+		cmd := strings.TrimSpace(m.composer.String())
+		m.composer.shell = false
+		m.composer.addHistory("!"+cmd, nil)
+		m.composer.Clear()
+		m.submit(protocol.ShellCommand{Command: cmd})
+		return nil
+	}
+	full, images := m.composer.SubmitWithImages()
+	in := pendingInput{strings.TrimSpace(full), images}
+	switch {
+	case !m.running, m.opts.SteerWhileRunning:
+		m.sendInput(in)
+	default:
+		m.queued = append(m.queued, in)
+	}
+	return nil
+}
+
+func (m *model) handleApprovalKey(key, act string) tea.Cmd {
 	a := m.approvals[0]
 	decide := func(o approvalOption) {
 		m.submit(a.op(o.decision))
 		m.commit(decisionCell(a, o.decision, m.agent, m.st))
 		m.approvals = m.approvals[1:]
 	}
-	switch key {
-	case "up", "k", "ctrl+p", "shift+tab":
+	switch act {
+	case "list.move_up":
 		a.selected = (a.selected + len(a.options) - 1) % len(a.options)
-	case "down", "j", "ctrl+n", "tab":
+		return nil
+	case "list.move_down":
 		a.selected = (a.selected + 1) % len(a.options)
-	case "enter":
+		return nil
+	case "list.accept":
 		decide(a.options[a.selected])
+		return nil
+	case "approval.open_fullscreen":
+		m.openStaticPager(a.pagerTitle(), a.body(m.width, m.cwd, m.st))
+		return nil
+	case "global.open_transcript":
+		m.openPager()
+		return nil
+	case "list.cancel":
+		decide(approvalOption{decision: protocol.DecisionAbort})
+		return nil
+	}
+	if strings.HasPrefix(act, "approval.") {
+		if o, ok := a.byAction(act[len("approval."):]); ok {
+			decide(o)
+		}
+		return nil
+	}
+	switch key {
+	case "shift+tab":
+		a.selected = (a.selected + len(a.options) - 1) % len(a.options)
+	case "tab":
+		a.selected = (a.selected + 1) % len(a.options)
 	case "ctrl+c":
 		decide(approvalOption{decision: protocol.DecisionAbort})
-	case "ctrl+a":
-		m.openStaticPager(a.pagerTitle(), a.body(m.width, m.cwd, m.st))
-	case "ctrl+t":
-		m.openPager()
 	case "1", "2", "3", "4":
 		i := int(key[0] - '1')
 		if i < len(a.options) {
 			decide(a.options[i])
-		}
-	default:
-		if o, ok := a.byKey(key); ok {
-			decide(o)
 		}
 	}
 	return nil
@@ -1275,6 +1400,8 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return m.surfaceCommand(surfaceStatus, args)
 	case "title":
 		return m.surfaceCommand(surfaceTitle, args)
+	case "keymap":
+		return m.openKeymapUI(args)
 	case "resume":
 		if args != "" {
 			return m.requestResume(args)
@@ -1415,12 +1542,15 @@ func (m *model) View() tea.View {
 		bottom = append(bottom, m.picker.Lines(w, m.height-2, m.cwd, st)...)
 	} else if m.surface != nil {
 		bottom = append(bottom, m.surface.Lines(w, m.surfacePreview(), st)...)
+	} else if m.keymapUI != nil {
+		bottom = append(bottom, m.keymapLines(w, m.height-len(bottom)-2)...)
 	} else if m.awaitingList || m.awaitingResume {
 		bottom = append(bottom, Line{}, L(S("• ", st.Dim)).Append(st.Shimmer("Loading saved sessions")...))
 	} else {
 		if m.shortcuts {
 			bottom = append(bottom, m.shortcutLines(w)...)
 		}
+		bottom = append(bottom, m.chordHUD(w)...)
 		bottom = append(bottom, Line{})
 		band := st.UserBg
 		bottom = append(bottom, Line{}.Fill(w, band))
@@ -1537,8 +1667,15 @@ func (m *model) queuedLines(w int) []Line {
 		}
 		out = append(out, rows...)
 	}
-	out = append(out, L(P("    "), S("⇧←", st.Bold), S(" edit last queued message", st.Dim)))
+	if k := m.keys.primary("chat.edit_queued_message"); k != "" {
+		out = append(out, L(P("    "), S(k, st.Bold), S(" edit last queued message", st.Dim)))
+	}
 	return out
+}
+
+func (m *model) setKeymap(km *keymap) {
+	m.keys = km
+	m.st.Keys = km
 }
 
 func (m *model) footerLine(w int, showContext bool) Line {
@@ -1558,11 +1695,19 @@ func (m *model) footerLine(w int, showContext bool) Line {
 	case m.composer.shell:
 		left = L(P("  "), S("Shell mode", st.Accent), d(" · "), k("esc"), d(" to exit"))
 	case m.running && !m.composer.Empty():
-		left = L(P("  "), k("tab"), d(" to queue message"))
+		if q := m.keys.primary("composer.queue"); q != "" {
+			left = L(P("  "), k(q), d(" to queue message"))
+		}
 	case m.shortcuts:
-		left = L(P("  "), k("?"), d(" / "), k("esc"), d(" close"))
+		left = L(P("  "))
+		if q := m.keys.primary("composer.toggle_shortcuts"); q != "" {
+			left = append(left, k(q), d(" / "))
+		}
+		left = append(left, k("esc"), d(" close"))
 	case m.composer.Empty():
-		left = L(P("  "), k("?"), d(" for shortcuts"))
+		if q := m.keys.primary("composer.toggle_shortcuts"); q != "" {
+			left = L(P("  "), k(q), d(" for shortcuts"))
+		}
 	default:
 		left = nil // Codex hides hints while you type; context stays
 	}
@@ -1595,9 +1740,14 @@ func compactCount(n int64) string {
 // or 1 columns by width.
 func (m *model) shortcutLines(w int) []Line {
 	st := m.st
-	newline := "⌃j"
-	if m.kittyKeys {
-		newline = "⇧enter"
+	km := m.keys
+	newline := ""
+	for _, sp := range km.specs["editor.insert_newline"] {
+		if sp == "shift-enter" && !m.kittyKeys {
+			continue // only reaches us with the kitty protocol
+		}
+		newline = keyLabel(sp)
+		break
 	}
 	tab, ctrlc := "Queue message", "Quit"
 	if m.running {
@@ -1605,14 +1755,25 @@ func (m *model) shortcutLines(w int) []Line {
 	} else {
 		tab = "Send message"
 	}
+	type item = [2]string
 	groups := []struct {
 		title string
-		items [][2]string
+		items []item
 	}{
-		{"Compose", [][2]string{{"/", "Commands"}, {"@", "Mention files"}, {"!", "Shell command"}, {newline, "New line"},
-			{"⌃v", "Paste image"}, {"⌃g", "External editor"}, {"⌃r", "Search history"}, {"esc esc", "Edit last message"}}},
-		{"Session", [][2]string{{"tab", tab}, {"⇧←", "Edit queued message"}, {"esc", "Interrupt"}, {"⌃c", ctrlc}, {"⌃o", "Copy last response"}, {"⌃l", "Clear screen"}, {"⌃z", "Suspend"}}},
-		{"Transcript", [][2]string{{"⌃t", "Open transcript"}, {"/", "Find (in transcript)"}, {"pgup / pgdn", "Scroll"}, {"home / end", "Top / latest"}}},
+		{"Compose", []item{{"/", "Commands"}, {"@", "Mention files"}, {"!", "Shell command"}, {newline, "New line"},
+			{"⌃v", "Paste image"}, {km.primary("global.open_external_editor"), "External editor"}, {km.primary("composer.history_search_previous"), "Search history"}, {"esc esc", "Edit last message"}}},
+		{"Session", []item{{km.primary("composer.queue"), tab}, {km.primary("chat.edit_queued_message"), "Edit queued message"}, {km.primary("chat.interrupt_turn"), "Interrupt"}, {"⌃c", ctrlc}, {km.primary("global.copy"), "Copy last response"}, {km.primary("global.clear_terminal"), "Clear screen"}, {"⌃z", "Suspend"}}},
+		{"Transcript", []item{{km.primary("global.open_transcript"), "Open transcript"}, {km.primary("pager.find"), "Find (in transcript)"}, {"pgup / pgdn", "Scroll"}, {"home / end", "Top / latest"}}},
+	}
+	// Unbound actions have no hint.
+	for g := range groups {
+		kept := groups[g].items[:0]
+		for _, it := range groups[g].items {
+			if it[0] != "" {
+				kept = append(kept, it)
+			}
+		}
+		groups[g].items = kept
 	}
 	render := func(g int) []Line {
 		kw := 0
@@ -1694,5 +1855,6 @@ func (m *model) shortcutLines(w int) []Line {
 		}
 		out = append(out, l.Truncate(w))
 	}
+	out = append(out, Line{}, L(P("  "), S("/keymap", st.Accent), S(" customize shortcuts", st.Dim)))
 	return out
 }

@@ -42,6 +42,7 @@ var DefaultCommands = []Command{
 	{Name: "pwd", Description: "show the current working directory", Local: true},
 	{Name: "statusline", Description: "configure which items appear in the status line", Local: true},
 	{Name: "title", Description: "configure which items appear in the terminal title", Local: true},
+	{Name: "keymap", Description: "remap TUI shortcuts", Local: true},
 	{Name: "quit", Description: "exit the app", Local: true},
 	{Name: "exit", Description: "exit the app", Local: true, Alias: true},
 }

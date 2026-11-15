@@ -15,7 +15,7 @@ const (
 
 type approvalOption struct {
 	label    string
-	key      string
+	action   string // approval.* keymap action that picks it
 	decision protocol.ReviewDecision
 }
 
@@ -30,6 +30,20 @@ type approval struct {
 	changes  map[string]protocol.FileChange
 	options  []approvalOption
 	selected int
+	km       *keymap // for the key hints
+}
+
+// keyHint is the first configured key of an approval/list action ("y",
+// "esc"), as Codex prints it next to the options.
+func (a *approval) keyHint(id string) string {
+	km := a.km
+	if km == nil {
+		km = defaultKeymap()
+	}
+	if r := km.raw[id]; len(r) > 0 {
+		return r[0]
+	}
+	return ""
 }
 
 func newExecApproval(ev protocol.ExecApprovalRequest, agent string) *approval {
@@ -38,12 +52,12 @@ func newExecApproval(ev protocol.ExecApprovalRequest, agent string) *approval {
 	if strw(short) > 50 {
 		short = takeWidth(short, 49) + "…"
 	}
-	opts := []approvalOption{{"Yes, proceed", "y", protocol.DecisionApproved}}
+	opts := []approvalOption{{"Yes, proceed", "approve", protocol.DecisionApproved}}
 	if !strings.Contains(cmd, "\n") {
 		// Codex hides the prefix rule for multi-line commands.
-		opts = append(opts, approvalOption{"Yes, and don't ask again for commands that start with `" + short + "`", "p", protocol.DecisionApprovedForSession})
+		opts = append(opts, approvalOption{"Yes, and don't ask again for commands that start with `" + short + "`", "approve_for_prefix", protocol.DecisionApprovedForSession})
 	}
-	opts = append(opts, approvalOption{"No, and tell " + agent + " what to do differently", "esc", protocol.DecisionAbort})
+	opts = append(opts, approvalOption{"No, and tell " + agent + " what to do differently", "decline", protocol.DecisionAbort})
 	return &approval{
 		kind: approveExec, callID: ev.CallID, command: ev.Command, cwd: ev.Cwd, reason: ev.Reason,
 		options: opts,
@@ -54,9 +68,9 @@ func newPatchApproval(ev protocol.ApplyPatchApprovalRequest, agent string) *appr
 	return &approval{
 		kind: approvePatch, callID: ev.CallID, reason: ev.Reason, changes: ev.Changes,
 		options: []approvalOption{
-			{"Yes, proceed", "y", protocol.DecisionApproved},
-			{"Yes, and don't ask again for these files", "a", protocol.DecisionApprovedForSession},
-			{"No, and tell " + agent + " what to do differently", "esc", protocol.DecisionAbort},
+			{"Yes, proceed", "approve", protocol.DecisionApproved},
+			{"Yes, and don't ask again for these files", "approve_for_session", protocol.DecisionApprovedForSession},
+			{"No, and tell " + agent + " what to do differently", "decline", protocol.DecisionAbort},
 		},
 	}
 }
@@ -68,15 +82,15 @@ func (a *approval) op(d protocol.ReviewDecision) protocol.Op {
 	return protocol.PatchApproval{CallID: a.callID, Decision: d}
 }
 
-// byKey returns the option bound to a shortcut key.
-func (a *approval) byKey(k string) (approvalOption, bool) {
+// byAction returns the option an approval.* action picks.
+func (a *approval) byAction(action string) (approvalOption, bool) {
 	for _, o := range a.options {
-		if o.key == k {
+		if o.action == action {
 			return o, true
 		}
 	}
-	if k == "n" || k == "d" { // Codex: d deny (continue without it)
-		return approvalOption{"No", "n", protocol.DecisionDenied}, true
+	if action == "deny" { // Codex: d denies (the agent continues without it)
+		return approvalOption{"No", "deny", protocol.DecisionDenied}, true
 	}
 	return approvalOption{}, false
 }
@@ -101,14 +115,17 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 	if len(body) > bodyBudget {
 		// Codex: "[… N lines] ⌃a view all" opens the full request in a pager.
 		extra := len(body) - bodyBudget + 1
-		body = append(body[:bodyBudget-1], L(P("    "), S("[… "+itoa(extra)+" lines] ", st.Dim), S("⌃a", st.Bold), S(" view all", st.Dim)))
+		body = append(body[:bodyBudget-1], L(P("    "), S("[… "+itoa(extra)+" lines] ", st.Dim), S(keyLabel(a.keyHint("approval.open_fullscreen")), st.Bold), S(" view all", st.Dim)))
 	}
 	out = append(out, body...)
 	out = append(out, Line{}, Line{}) // Codex: two rows before the options
 
 	for i, o := range a.options {
 		num := itoa(i+1) + ". "
-		key := S(" ("+o.key+")", st.Dim)
+		var key Span
+		if h := a.keyHint("approval." + o.action); h != "" {
+			key = S(" ("+h+")", st.Dim)
+		}
 		var l Line
 		if i == a.selected {
 			l = L(S(num+o.label, st.AccentB), key)
@@ -118,7 +135,7 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 			out = append(out, Wrap(l, width, L(P("  ")), L(P(strings.Repeat(" ", 2+len(num)))))...)
 		}
 	}
-	out = append(out, Line{}, L(P("  "), S("Press ", st.Dim), S("enter", st.Bold), S(" to confirm or ", st.Dim), S("esc", st.Bold), S(" to cancel", st.Dim)))
+	out = append(out, Line{}, L(P("  "), S("Press ", st.Dim), S(a.keyHint("list.accept"), st.Bold), S(" to confirm or ", st.Dim), S(a.keyHint("approval.decline"), st.Bold), S(" to cancel", st.Dim)))
 	return out
 }
 

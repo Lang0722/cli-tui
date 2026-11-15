@@ -83,7 +83,9 @@ func (p *pager) content(width int) []Line {
 }
 
 // handleKey returns true when the pager should close.
-func (p *pager) handleKey(key, text string, height int) bool {
+// handleKey applies a pager.* keymap action (act, without the prefix) or a
+// fixed key. Returns true when the pager should close.
+func (p *pager) handleKey(key, text, act string, height int) bool {
 	page := max(1, height-4)
 	if p.finding {
 		switch key {
@@ -119,31 +121,36 @@ func (p *pager) handleKey(key, text string, height int) bool {
 			return true
 		}
 	}
-	switch key {
-	case "q", "esc", "ctrl+t", "ctrl+c":
+	switch act {
+	case "close", "close_transcript":
 		return true
-	case "up", "k":
+	case "scroll_up":
 		p.offset--
-	case "down", "j":
+	case "scroll_down":
 		p.offset++
-	case "pgup", "ctrl+b", "b", "shift+space":
+	case "page_up":
 		p.offset -= page
-	case "pgdown", "ctrl+f", " ", "space":
+	case "page_down":
 		p.offset += page
-	case "ctrl+u":
+	case "half_page_up":
 		p.offset -= page / 2
-	case "ctrl+d":
+	case "half_page_down":
 		p.offset += page / 2
-	case "home", "g", "ctrl+home":
+	case "jump_top":
 		p.offset = 0
-	case "end", "G", "ctrl+end":
+	case "jump_bottom":
 		p.offset, p.follow = 1<<30, true
-	case "/", "f3":
+	case "find":
 		p.finding, p.query, p.matches = true, "", nil
-	case "n":
-		p.jump(1)
-	case "N", "shift+n":
-		p.jump(-1)
+	case "":
+		switch key { // fixed keys
+		case "esc":
+			return true
+		case "n":
+			p.jump(1)
+		case "N", "shift+n":
+			p.jump(-1)
+		}
 	}
 	return false
 }
@@ -232,7 +239,13 @@ func (p *pager) render(width, height int) string {
 		out = append(out, L(P(" "), d("Find: "), S(p.query, st.Accent)),
 			L(P(" "), k("enter"), d(" accept · "), k("esc"), d(" cancel")))
 	} else {
-		second := L(P(" "), k("q"), d(" close · "), k("/"), d(" find"))
+		second := L(P(" "))
+		if c := st.key("pager.close"); c != "" {
+			second = append(second, k(c), d(" close · "))
+		}
+		if f := st.key("pager.find"); f != "" {
+			second = append(second, k(f), d(" find"))
+		}
 		if len(p.matches) > 0 {
 			second = append(second, d(" · "), k("n/N"), d(fmt.Sprintf(" next/prev (%d/%d)", p.cur+1, len(p.matches))))
 		} else if p.query != "" {

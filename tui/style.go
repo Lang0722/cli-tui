@@ -43,6 +43,9 @@ type Styles struct {
 	DiffDel   lipgloss.Style
 	diffTint  bool
 	hasBg     bool
+
+	// Keys lets hints show the (possibly remapped) shortcut of an action.
+	Keys      *keymap
 	bg, fg    [3]uint8
 	trueColor bool
 }
@@ -201,4 +204,22 @@ func osc8Supported() bool {
 		return false
 	}
 	return os.Getenv("TERM") != "dumb"
+}
+
+// key is the hint label of a keymap action, "" when it is unbound.
+func (st *Styles) key(id string) string {
+	km := st.Keys
+	if km == nil {
+		km = defaultKeymap()
+		st.Keys = km
+	}
+	return km.primary(id)
+}
+
+// transcriptHint is "(⌃t to view transcript)" with the current key.
+func (st *Styles) transcriptHint() string {
+	if k := st.key("global.open_transcript"); k != "" {
+		return " (" + k + " to view transcript)"
+	}
+	return ""
 }

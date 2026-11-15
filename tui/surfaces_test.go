@@ -132,7 +132,7 @@ func keyNamed(name string) tea.KeyPressMsg {
 	codes := map[string]rune{"up": tea.KeyUp, "down": tea.KeyDown, "left": tea.KeyLeft, "right": tea.KeyRight,
 		"enter": tea.KeyEnter, "esc": tea.KeyEscape, "tab": tea.KeyTab, "backspace": tea.KeyBackspace,
 		"space": tea.KeySpace, "home": tea.KeyHome, "end": tea.KeyEnd, "pgup": tea.KeyPgUp, "pgdown": tea.KeyPgDown,
-		"delete": tea.KeyDelete, "f3": tea.KeyF3}
+		"delete": tea.KeyDelete, "f3": tea.KeyF3, "f5": tea.KeyF5}
 	var mod tea.KeyMod
 	for {
 		switch {

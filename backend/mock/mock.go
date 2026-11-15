@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -95,7 +96,10 @@ func ResetDemo(dir string) error {
 		if err := os.Remove(f); err != nil {
 			return err
 		}
-		_ = os.Remove(f + ".tmp")
+		tmps, _ := filepath.Glob(strings.TrimSuffix(f, ".json") + ".*.tmp")
+		for _, t := range tmps {
+			_ = os.Remove(t) // left by an interrupted save
+		}
 	}
 	cwd, _ := os.Getwd()
 	return seedDemo(&store{dir: dir}, cwd)

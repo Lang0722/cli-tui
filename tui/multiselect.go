@@ -106,47 +106,55 @@ const (
 	msCancel
 )
 
-func (p *surfacePicker) handleKey(k tea.KeyPressMsg) msAction {
+// handleKey applies a key; act is its list.* keymap action ("" if none).
+func (p *surfacePicker) handleKey(k tea.KeyPressMsg, act string) msAction {
 	rows := p.rows()
 	p.selected = max(0, min(p.selected, len(rows)-1))
-	switch k.String() {
-	case "enter":
+	key := k.String()
+	if key == "space" || key == " " {
+		if len(rows) > 0 {
+			if r := rows[p.selected]; r < 0 {
+				p.colors = !p.colors
+			} else {
+				p.items[r].on = !p.items[r].on
+			}
+		}
+		return msNone
+	}
+	if k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
+		p.query += k.Text // printable keys (j/k too) search, as in Codex
+		p.selected = 0
+		return msNone
+	}
+	switch act {
+	case "list.accept":
 		return msSave
-	case "esc", "ctrl+c":
+	case "list.cancel":
 		return msCancel
-	case "up", "ctrl+p":
+	case "list.move_up":
 		if len(rows) > 0 {
 			p.selected = (p.selected + len(rows) - 1) % len(rows)
 		}
-	case "down", "ctrl+n":
+	case "list.move_down":
 		if len(rows) > 0 {
 			p.selected = (p.selected + 1) % len(rows)
 		}
-	case "pgup":
+	case "list.page_up":
 		p.selected = max(0, p.selected-msVisible)
-	case "pgdown":
+	case "list.page_down":
 		p.selected = max(0, min(len(rows)-1, p.selected+msVisible))
-	case "home":
+	case "list.jump_top":
 		p.selected = 0
-	case "end":
+	case "list.jump_bottom":
 		p.selected = max(0, len(rows)-1)
-	case "space":
-		if len(rows) == 0 {
-			break
-		}
-		if r := rows[p.selected]; r < 0 {
-			p.colors = !p.colors
-		} else {
-			p.items[r].on = !p.items[r].on
-		}
-	case "left", "ctrl+h", "right", "ctrl+l":
+	case "list.move_left", "list.move_right":
 		// Reorder: swap with the neighbour (not while searching).
 		if p.query != "" || len(rows) == 0 || rows[p.selected] < 0 {
 			break
 		}
 		i := rows[p.selected]
 		j := i + 1
-		if s := k.String(); s == "left" || s == "ctrl+h" {
+		if act == "list.move_left" {
 			j = i - 1
 		}
 		if j < 0 || j >= len(p.items) {
@@ -158,15 +166,15 @@ func (p *surfacePicker) handleKey(k tea.KeyPressMsg) msAction {
 		} else {
 			p.selected++
 		}
-	case "backspace":
-		if r := []rune(p.query); len(r) > 0 {
-			p.query = string(r[:len(r)-1])
-			p.selected = 0
-		}
-	default:
-		if k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
-			p.query += k.Text
-			p.selected = 0
+	case "":
+		switch key {
+		case "ctrl+c":
+			return msCancel
+		case "backspace":
+			if r := []rune(p.query); len(r) > 0 {
+				p.query = string(r[:len(r)-1])
+				p.selected = 0
+			}
 		}
 	}
 	return msNone

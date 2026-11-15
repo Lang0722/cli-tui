@@ -48,51 +48,58 @@ const (
 	pickerQuit
 )
 
-func (p *resumePicker) handleKey(k tea.KeyPressMsg, page int) (pickerAction, string) {
+func (p *resumePicker) handleKey(k tea.KeyPressMsg, page int, act string) (pickerAction, string) {
 	n := len(p.matches)
-	switch k.String() {
-	case "up", "ctrl+p":
+	if k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
+		p.query += k.Text // typing searches
+		p.selected = 0
+		p.filter()
+		return pickerNone, ""
+	}
+	switch act {
+	case "list.move_up":
 		if n > 0 {
 			p.selected = (p.selected - 1 + n) % n
 		}
-	case "down", "ctrl+n", "tab":
+	case "list.move_down":
 		if n > 0 {
 			p.selected = (p.selected + 1) % n
 		}
-	case "pgup":
+	case "list.page_up":
 		p.selected = max(0, p.selected-page)
-	case "pgdown":
+	case "list.page_down":
 		p.selected = max(0, min(n-1, p.selected+page))
-	case "home":
+	case "list.jump_top":
 		p.selected = 0
-	case "end":
+	case "list.jump_bottom":
 		p.selected = max(0, n-1)
-	case "enter":
+	case "list.accept":
 		if n > 0 {
 			return pickerResume, p.matches[p.selected].ID
 		}
-	case "esc":
+	case "list.cancel":
 		if p.query != "" {
 			p.query = ""
 			p.filter()
 			return pickerNone, ""
 		}
 		return pickerCancel, ""
-	case "ctrl+c":
-		if p.startup {
-			return pickerQuit, ""
-		}
-		return pickerCancel, ""
-	case "backspace":
-		if r := []rune(p.query); len(r) > 0 {
-			p.query = string(r[:len(r)-1])
-			p.filter()
-		}
-	default:
-		if k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
-			p.query += k.Text
-			p.selected = 0
-			p.filter()
+	case "":
+		switch k.String() {
+		case "tab":
+			if n > 0 {
+				p.selected = (p.selected + 1) % n
+			}
+		case "ctrl+c":
+			if p.startup {
+				return pickerQuit, ""
+			}
+			return pickerCancel, ""
+		case "backspace":
+			if r := []rune(p.query); len(r) > 0 {
+				p.query = string(r[:len(r)-1])
+				p.filter()
+			}
 		}
 	}
 	return pickerNone, ""
@@ -221,8 +228,8 @@ func (m *model) onSessionList(list []protocol.SessionSummary) {
 	m.picker = newResumePicker(list, m.pickerStartup)
 }
 
-func (m *model) handlePickerKey(k tea.KeyPressMsg) tea.Cmd {
-	act, id := m.picker.handleKey(k, 10)
+func (m *model) handlePickerKey(k tea.KeyPressMsg, keyAct string) tea.Cmd {
+	act, id := m.picker.handleKey(k, 10, keyAct)
 	switch act {
 	case pickerResume:
 		m.picker = nil

@@ -353,9 +353,8 @@ const (
 )
 
 const (
-	previewRows     = 3  // Codex tool_output PREVIEW_LINES
-	userShellRows   = 50 // Codex USER_SHELL_TOOL_CALL_MAX_LINES
-	transcriptHint  = "⌃t to view transcript"
+	previewRows     = 3         // Codex tool_output PREVIEW_LINES
+	userShellRows   = 50        // Codex USER_SHELL_TOOL_CALL_MAX_LINES
 	maxPreviewBytes = 16 * 1024 // Codex MAX_PREVIEW_LINE_BYTES
 )
 
@@ -399,7 +398,7 @@ func outputLines(lines []string, width int, st *Styles, failed bool, mode output
 			rows = append(rows, w...)
 		}
 		if omitted > 0 {
-			rows = append(rows, L(S(fmt.Sprintf("+%d %s (%s)", omitted, pluralWord(omitted, "line"), transcriptHint), st.Dim)).Truncate(body))
+			rows = append(rows, L(S(fmt.Sprintf("+%d %s%s", omitted, pluralWord(omitted, "line"), st.transcriptHint()), st.Dim)).Truncate(body))
 		}
 	case outputMiddle:
 		per := make([][]Line, len(lines))
@@ -431,7 +430,7 @@ func outputLines(lines []string, width int, st *Styles, failed bool, mode output
 			rows = append(rows, w...)
 		}
 		n := tail - head
-		rows = append(rows, L(S(fmt.Sprintf("… +%d %s (%s)", n, pluralWord(n, "line"), transcriptHint), st.Dim)).Truncate(body))
+		rows = append(rows, L(S(fmt.Sprintf("… +%d %s%s", n, pluralWord(n, "line"), st.transcriptHint()), st.Dim)).Truncate(body))
 		for _, w := range per[tail:] {
 			rows = append(rows, w...)
 		}

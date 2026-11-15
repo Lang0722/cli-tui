@@ -101,7 +101,7 @@ func TestRevComposerUpAcrossSoftWrap(t *testing.T) {
 	rows, crow, ccol := c.layout(10)
 	t.Logf("rows=%v crow=%d ccol=%d", rows, crow, ccol)
 	// cursor at end of row 1 (col 10); press up
-	c.HandleEditKey(tea.KeyPressMsg{Code: tea.KeyUp}, 10)
+	c.HandleEditKey(tea.KeyPressMsg{Code: tea.KeyUp}, "move_up", 10)
 	rows, crow, ccol = c.layout(10)
 	t.Logf("after up: cursor=%d crow=%d ccol=%d", c.cursor, crow, ccol)
 	if crow != 0 {
@@ -168,6 +168,9 @@ func key(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	case "tab":
 		return tea.KeyPressMsg{Code: tea.KeyTab}
+	}
+	if len([]rune(s)) > 1 {
+		return keyNamed(s)
 	}
 	r := []rune(s)
 	return tea.KeyPressMsg{Code: r[0], Text: s}

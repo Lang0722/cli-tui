@@ -119,41 +119,48 @@ const (
 	selCancel
 )
 
-// handleKey returns the action and the chosen item (-1 = freeform).
-func (v *selectionView) handleKey(k tea.KeyPressMsg) (selAction, int) {
+// handleKey returns the action and the chosen item (-1 = freeform). act
+// is the list.* keymap action for the key ("" if none).
+func (v *selectionView) handleKey(k tea.KeyPressMsg, act string) (selAction, int) {
 	vis := v.visible()
 	n := len(vis)
 	key := k.String()
-	switch key {
-	case "up", "ctrl+p":
+	if v.searchable() && k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
+		v.query += k.Text // search views keep j/k/digits as text
+		v.selected = 0
+		return selNone, 0
+	}
+	switch act {
+	case "list.move_up":
 		v.selected = (v.selected - 1 + n) % max(n, 1)
-	case "down", "ctrl+n":
+	case "list.move_down":
 		v.selected = (v.selected + 1) % max(n, 1)
-	case "enter":
+	case "list.page_up":
+		v.selected = max(0, v.selected-9)
+	case "list.page_down":
+		v.selected = max(0, min(n-1, v.selected+9))
+	case "list.jump_top":
+		v.selected = 0
+	case "list.jump_bottom":
+		v.selected = max(0, n-1)
+	case "list.accept":
 		if n > 0 {
 			return selChoose, vis[v.selected]
 		}
-	case "esc", "ctrl+c":
+	case "list.cancel":
 		if v.query != "" {
 			v.query = ""
 			return selNone, 0
 		}
 		return selCancel, 0
-	case "backspace":
-		if r := []rune(v.query); len(r) > 0 {
-			v.query = string(r[:len(r)-1])
-		}
-	default:
-		if v.searchable() && k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
-			v.query += k.Text // search views keep j/k/digits as text
-			v.selected = 0
-			return selNone, 0
-		}
+	case "":
 		switch {
-		case key == "k":
-			v.selected = (v.selected - 1 + n) % max(n, 1)
-		case key == "j":
-			v.selected = (v.selected + 1) % max(n, 1)
+		case key == "ctrl+c":
+			return selCancel, 0
+		case key == "backspace":
+			if r := []rune(v.query); len(r) > 0 {
+				v.query = string(r[:len(r)-1])
+			}
 		case len(key) == 1 && key[0] >= '1' && key[0] <= '9':
 			if i := int(key[0] - '1'); i < n {
 				return selChoose, vis[i]
@@ -163,9 +170,9 @@ func (v *selectionView) handleKey(k tea.KeyPressMsg) (selAction, int) {
 	return selNone, 0
 }
 
-func (m *model) handleSelectionKey(k tea.KeyPressMsg) tea.Cmd {
+func (m *model) handleSelectionKey(k tea.KeyPressMsg, key string) tea.Cmd {
 	v := m.selections[0]
-	act, idx := v.handleKey(k)
+	act, idx := v.handleKey(k, key)
 	switch act {
 	case selChoose:
 		m.selections = m.selections[1:]

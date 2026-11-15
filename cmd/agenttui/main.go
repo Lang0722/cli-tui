@@ -78,6 +78,9 @@ func main() {
 	}
 
 	cfg, err := config.Load(*configPath)
+	if err == nil {
+		err = tui.ValidateConfig(cfg)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agenttui: %v\nFix the config and retry.\n", err)
 		os.Exit(1)

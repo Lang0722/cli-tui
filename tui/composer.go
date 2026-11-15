@@ -229,28 +229,29 @@ func (c *composer) historyNext() bool {
 	return true
 }
 
-// HandleEditKey applies an editing key. Returns true if handled.
-func (c *composer) HandleEditKey(k tea.KeyPressMsg, width int) bool {
-	switch k.String() {
-	case "ctrl+j", "shift+enter", "alt+enter", "ctrl+enter":
+// HandleEditKey applies an editor.* keymap action (act, without the
+// "editor." prefix), or types the key's text. Returns true if handled.
+func (c *composer) HandleEditKey(k tea.KeyPressMsg, act string, width int) bool {
+	switch act {
+	case "insert_newline":
 		c.insert("\n")
-	case "left", "ctrl+b":
+	case "move_left":
 		if c.cursor > 0 {
 			c.cursor--
 		}
-	case "right", "ctrl+f":
+	case "move_right":
 		if c.cursor < len(c.text) {
 			c.cursor++
 		}
-	case "alt+left", "ctrl+left", "alt+b":
+	case "move_word_left":
 		c.cursor = c.wordLeft()
-	case "alt+right", "ctrl+right", "alt+f":
+	case "move_word_right":
 		c.cursor = c.wordRight()
-	case "home", "ctrl+a":
+	case "move_line_start":
 		c.cursor, _ = c.lineBounds()
-	case "end", "ctrl+e":
+	case "move_line_end":
 		_, c.cursor = c.lineBounds()
-	case "up", "ctrl+p":
+	case "move_up":
 		onFirst := !strings.ContainsRune(string(c.text[:c.cursor]), '\n')
 		if (c.Empty() || c.histIdx < len(c.history) || onFirst && c.cursor == 0) && c.historyPrev() {
 			return true
@@ -258,43 +259,52 @@ func (c *composer) HandleEditKey(k tea.KeyPressMsg, width int) bool {
 		if !c.moveVertical(-1, width) {
 			c.cursor = 0
 		}
-	case "down", "ctrl+n":
+	case "move_down":
 		if c.histIdx < len(c.history) && c.historyNext() {
 			return true
 		}
 		if !c.moveVertical(1, width) {
 			c.cursor = len(c.text)
 		}
-	case "backspace", "shift+backspace":
+	case "delete_backward":
 		c.backspace()
-	case "delete", "ctrl+d", "shift+delete":
+	case "delete_forward":
 		c.deleteForward()
-	case "ctrl+w", "alt+backspace", "ctrl+h", "ctrl+backspace", "ctrl+alt+h":
+	case "delete_backward_word":
 		c.kill(c.wordLeft(), c.cursor)
-	case "alt+d", "alt+delete", "ctrl+delete":
+	case "delete_forward_word":
 		c.kill(c.cursor, c.wordRight())
-	case "ctrl+u":
+	case "kill_line_start":
 		s, _ := c.lineBounds()
 		if s == c.cursor && s > 0 {
 			s--
 		}
 		c.kill(s, c.cursor)
-	case "ctrl+k":
+	case "kill_whole_line":
+		s, e := c.lineBounds()
+		if e < len(c.text) {
+			e++
+		} else if s > 0 {
+			s--
+		}
+		c.kill(s, e)
+	case "kill_line_end":
 		_, e := c.lineBounds()
 		if e == c.cursor && e < len(c.text) {
 			e++
 		}
 		c.kill(c.cursor, e)
-	case "ctrl+y":
+	case "yank":
 		c.yank()
-	case "tab":
-		c.insert("    ")
 	default:
-		if k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0 {
+		switch {
+		case k.Code == tea.KeyTab && k.Mod == 0:
+			c.insert("    ")
+		case k.Text != "" && k.Mod&(tea.ModCtrl|tea.ModAlt) == 0:
 			c.insert(k.Text)
-			return true
+		default:
+			return false
 		}
-		return false
 	}
 	return true
 }

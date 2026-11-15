@@ -558,9 +558,9 @@ func (m *model) surfaceCommand(kind surfaceKind, args string) tea.Cmd {
 	return nil
 }
 
-func (m *model) handleSurfaceKey(k tea.KeyPressMsg) tea.Cmd {
+func (m *model) handleSurfaceKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	p := m.surface
-	switch p.handleKey(k) {
+	switch p.handleKey(k, act) {
 	case msCancel:
 		m.surface = nil // the title preview ends with it
 	case msSave:

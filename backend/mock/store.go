@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -114,11 +113,13 @@ func (s *store) save(f *sessionFile) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path(f.Meta.ID) + fmt.Sprintf(".%d.tmp", os.Getpid())
-	fh, err := os.Create(tmp)
+	// A unique temp file per save: two stores (or goroutines) writing the
+	// same session must never share one, or a rename publishes a mix.
+	fh, err := os.CreateTemp(s.dir, f.Meta.ID+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := fh.Name()
 	if _, err := fh.Write(data); err != nil {
 		fh.Close()
 		os.Remove(tmp)

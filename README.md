@@ -6,10 +6,10 @@ It is tuned for **gnome-terminal (VTE)** and drives *your* agent loop through
 a small event protocol.
 
 **Scope, honestly:** Codex's TUI is about 335k lines of Rust. This is about
-14k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
+16k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
 streaming, composer, approvals, pickers, transcript pager, resume and
-backtrack, the configurable status line and window title, and the remappable
-keymap. Much of the rest of Codex depends on Codex's own services (login,
+backtrack, subagent threads, the configurable status line and window title,
+and the remappable keymap. Much of the rest of Codex depends on Codex's own services (login,
 model catalog, MCP setup, plugins, voice, cloud tasks, the agents dashboard),
 and that part is out of scope. The [parity table](#parity-with-codex) at the
 end lists each area.
@@ -68,6 +68,8 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | `demo` / `fix` / `edit` | a full coding turn: exploration, plan, patch approval, command approval, tool call, summary |
 | `markdown` / `table` | tables, highlighted code, nested and task lists, quotes, links |
 | `question` | a mid-turn question picker (choose, or type your own answer) |
+| `subagents` / `agents` | two helper agents: spawn, a worker's approval from its own thread, wait, close (watch them with Alt+←/→ or `/subagents`) |
+| `delegate` | a parent-owned `/root/reviewer` agent (activity rows, read-only view) |
 | `error` | an error event |
 | `!ls -la` | a real shell command you run ("You ran") |
 | `/model`, `/approvals` | backend-driven pickers |
@@ -140,6 +142,10 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 | `list_sessions` / `resume_session{id}` | resume picker / chosen session (an empty id means the most recent). If the session can't be loaded, send an `error`. |
 | `shutdown` | UI exit |
 
+`user_input`, `interrupt`, `shell_command`, the approvals and
+`selection_response` carry `thread_id` when they are for a subagent thread
+(see [Subagents](#subagents)).
+
 ### Events (backend → UI)
 
 Every event is optional. A turn is framed by `task_started` … `task_complete`
@@ -156,6 +162,9 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `patch_apply_begin` / `end` | `• Edited path (+a -d)` with a line-numbered, tinted, syntax-highlighted diff; `✘ Failed to apply patch` on failure |
 | `tool_call_begin` / `end` | `• Calling` / `• Called server.tool(args)` / `• Failed` |
 | `plan_update` | `• Updated Plan · 1/3 complete` checklist |
+| `thread_started{thread_id,nickname?,role?,path?,accepts_input?,model?}` / `thread_closed{thread_id}` | register / end a subagent thread |
+| `collab_tool_call{call_id,tool,status,receiver_thread_ids,prompt,model,reasoning_effort,agents_states}` | `• Spawned Robie [explorer] (model effort)`, `• Sent input to …`, `• Waiting for …` / `• Finished waiting` with each agent's state, `• Resumed …`, `• Closed …` |
+| `sub_agent_activity{kind,agent_thread_id,agent_path}` | ``• Started `/root/reviewer` `` (also `Interacted with`, `Interrupted`, `Completed`) |
 | `selection_request{id,title,items,allow_freeform}` | a picker in place of the composer (digits, j/k, search when there are more than 9 items) |
 | `session_list` | the resume picker |
 | `token_count` | `N% context left` (or `NK used`) |
@@ -183,6 +192,7 @@ These are the defaults. Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+V / Alt+V and the
 | Shift+← / Alt+↑ | pop the last queued message back for editing |
 | Ctrl+T | transcript pager: `/` find, `n`/`N`, pgup/pgdn, home/end, q |
 | Ctrl+O · Ctrl+L · Ctrl+Z | copy last response · clear the screen · suspend |
+| Alt+← / Alt+→ | watch the previous / next subagent thread (empty composer) |
 | `?` | shortcut overlay (empty composer) |
 
 \* Shift+Enter works only if the terminal reports it (kitty keyboard protocol);
@@ -190,8 +200,36 @@ the overlay shows ⇧enter or ⌃j accordingly.
 
 Local slash commands: `/status`, `/diff` (opens a pager), `/transcript`,
 `/resume`, `/copy`, `/export [file]`, `/clear`, `/pwd`, `/mention`,
-`/statusline`, `/title`, `/keymap`, `/quit`. All other commands are forwarded
+`/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. All other commands are forwarded
 to the backend.
+
+## Subagents
+
+A backend that runs helper agents (Codex' multi-agent mode) gives each
+one a thread id. Events for that thread carry it in the envelope; events
+without one belong to the main conversation:
+
+```
+{"msg":{"type":"thread_started","thread_id":"t1","nickname":"Robie","role":"explorer"}}
+{"thread_id":"t1","msg":{"type":"exec_command_begin","call_id":"c1","command":["ls"]}}
+```
+
+- The main transcript shows the collab rows. Each thread's own events
+  build that thread's transcript off screen.
+- `/subagents` lists the threads (green dot = open, `(current)`,
+  `(needs approval)` first). Alt+←/→ cycle through them with an empty
+  composer. Switching clears the screen and reprints the chosen thread,
+  and the footer names it (`Main [default]`, `Robie [explorer]`,
+  `` `/root/reviewer` ``).
+- Input, `!` commands and Esc / Ctrl+C go to the watched thread (with its
+  `thread_id`). A thread with `accepts_input:false` (or a `path` and no
+  `accepts_input`) is parent-owned: the composer reads "Viewing sub-agent —
+  direct input is disabled" and refuses prompts.
+- An approval or question from a thread you aren't watching opens where you
+  are, under a `Thread: <name>` header; `o` opens that thread.
+- When the watched thread closes, the UI switches back to main. A closed
+  thread's transcript stays viewable. For path-addressed agents,
+  `/subagents` first prints a "Sub-agents running" summary.
 
 **Revert.** With an empty composer, Esc Esc opens the transcript in backtrack
 mode; ←/→ (or h/l) pick an earlier prompt and Enter reverts to it. The UI
@@ -296,6 +334,9 @@ snapshots.
   - Diffs with tints and highlighting.
 - **Terminal and session:** title, notifications, resume, `/copy`,
   `/export`, `/clear`.
+- **Subagents:** collab and activity rows, per-thread transcripts,
+  `/subagents`, Alt+←/→, cross-thread approvals, parent-owned threads,
+  the running-agents feed.
 - **Settings:** configurable status line and window title (`/statusline`,
   `/title`); remappable keymap with chords, leader and the `/keymap` editor
   and inspector.
@@ -327,7 +368,7 @@ config/          settings file (TOML)
 backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, real "!" commands
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
-                 approval, interaction, pager, printer, resume, surfaces, keymap)
+                 approval, interaction, pager, printer, resume, surfaces, keymap, agents)
 cmd/agenttui     entry point
 examples/        echo_agent.py reference backend
 ```

@@ -138,7 +138,13 @@ type model struct {
 	width, height int
 	out           *printer
 	printedAny    bool
-	committed     []Cell
+
+	// The conversation on screen: the main thread or a watched subagent
+	// (agents.go). Its fields (transcript, turn state, tokens) are
+	// promoted, so m.committed is the displayed thread's transcript.
+	*convo
+	agents agentRegistry
+	bg     bool // handling a thread that isn't on screen: print nothing
 
 	// session
 	agent, model, effort, cwd, version string
@@ -154,26 +160,8 @@ type model struct {
 	pendingHeader  *headerCell
 	replaying      bool
 
-	// turn
-	running      bool
-	turnStart    time.Time
-	statusHeader string
-	statusDetail string
-	reasoning    strings.Builder
-	stream       streamState
-	active       []Cell
-	execByID     map[string]*execCall
-	toolByID     map[string]*toolCell
-	hadTools     bool
-	queued       []pendingInput
-	turnHasAgent bool   // an agent message was committed this turn
-	deferred     []Cell // commits held while an answer streams
-	kittyKeys    bool   // terminal reports Shift+Enter distinctly
-	ticking      bool
-
-	// tokens
-	tokensUsed, contextWindow int64
-	inputTokens, outputTokens int64
+	kittyKeys bool // terminal reports Shift+Enter distinctly
+	ticking   bool
 
 	// status line and window title (/statusline, /title)
 	statusItems    []string
@@ -181,8 +169,6 @@ type model struct {
 	titleItems     []string
 	surface        *surfacePicker
 	sessionTitle   string
-	planDone       int
-	planTotal      int
 	git            gitInfo
 	configWarnings []string // shown once the first session is configured
 
@@ -208,13 +194,45 @@ type model struct {
 	quitting bool
 	userQuit bool
 
-	selections    []*selectionView
-	freeformID    string // answering a selection with typed text
-	freeformTitle string
+	selections     []*selectionView
+	freeformID     string // answering a selection with typed text
+	freeformTitle  string
+	freeformThread string
+	reflowGen      int
+}
+
+// convo is one thread's conversation state.
+type convo struct {
+	thread string // "" for the main conversation
+
+	committed     []Cell
 	sessionStart  int // index in committed of the current session's header
 	lastHeader    *headerCell
 	pendingReflow reflowMode
-	reflowGen     int
+
+	// turn
+	running      bool
+	turnStart    time.Time
+	statusHeader string
+	statusDetail string
+	reasoning    strings.Builder
+	stream       streamState
+	active       []Cell
+	execByID     map[string]*execCall
+	toolByID     map[string]*toolCell
+	hadTools     bool
+	queued       []pendingInput
+	turnHasAgent bool   // an agent message was committed this turn
+	deferred     []Cell // commits held while an answer streams
+
+	// tokens
+	tokensUsed, contextWindow int64
+	inputTokens, outputTokens int64
+	planDone, planTotal       int
+}
+
+func newConvo(thread string) *convo {
+	return &convo{thread: thread, execByID: map[string]*execCall{}, toolByID: map[string]*toolCell{}}
 }
 
 // openPager shows the Ctrl+T transcript on the alternate screen. Scrollback
@@ -277,11 +295,11 @@ func newModel(ctx context.Context, opts Options) *model {
 		out:      newPrinter(),
 		agent:    "Agent",
 		cwd:      cwd,
-		execByID: map[string]*execCall{},
-		toolByID: map[string]*toolCell{},
+		convo:    newConvo(""),
 		composer: newComposer(),
 		focused:  true,
 	}
+	m.agents.init(m.convo)
 	m.applySurfaceConfig(opts.Config.TUI)
 	if km, err := newKeymap(opts.Config.TUI.Keymap); err == nil {
 		m.setKeymap(km)
@@ -335,7 +353,7 @@ func (m *model) submit(op protocol.Op) {
 // transcript output
 
 func (m *model) printLines(lines []Line, separate bool) {
-	if len(lines) == 0 {
+	if len(lines) == 0 || m.bg {
 		return
 	}
 	s := renderLines(lines)
@@ -533,7 +551,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.focused = false
 		return m, nil
 	case backendMsg:
-		cmd := m.handleEvent(msg.ev)
+		cmd := m.routeEvent(msg.ev)
 		var reflow tea.Cmd
 		if m.pendingReflow != reflowNone && !m.stream.active {
 			mode := m.pendingReflow
@@ -587,7 +605,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.PasteMsg:
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.keymapUI == nil && !m.awaitingList && !m.awaitingResume {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -649,6 +667,17 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		return fetchGitInfo(m.cwd)
 	case protocol.SessionTitle:
 		m.sessionTitle = e.Title
+	case protocol.CollabToolCall:
+		if c := m.collabRow(e); c != nil {
+			// Codex flushes the answer stream before a collab row.
+			m.finalizeStream("")
+			m.flushActive(true)
+			m.commit(c)
+		}
+	case protocol.SubAgentActivity:
+		if c := m.activityRow(e); c != nil {
+			m.commit(c) // held until a streaming answer is finalized
+		}
 	case protocol.SessionList:
 		m.onSessionList(e.Sessions)
 	case protocol.SelectionRequest:
@@ -657,7 +686,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		}
 		m.finalizeStream("")
 		m.flushActive(true)
-		m.selections = append(m.selections, &selectionView{req: e})
+		m.selections = append(m.selections, &selectionView{req: e, thread: m.thread})
 		return m.notify(m.agent, e.Title)
 	case protocol.UserMessage:
 		// Live input is drawn when submitted; only history is rendered here.
@@ -759,7 +788,9 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		}
 		m.finalizeStream("")
 		m.flushActive(true)
-		m.approvals = append(m.approvals, newExecApproval(e, m.agent))
+		a := newExecApproval(e, m.agent)
+		a.thread = m.thread
+		m.approvals = append(m.approvals, a)
 		return m.notify(m.agent, "Approval requested: "+displayCommand(e.Command))
 	case protocol.ApplyPatchApprovalRequest:
 		if m.replaying {
@@ -768,7 +799,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.finalizeStream("")
 		m.flushActive(true)
 		a := newPatchApproval(e, m.agent)
-		a.cwd = m.cwd
+		a.cwd, a.thread = m.cwd, m.thread
 		m.approvals = append(m.approvals, a)
 		return m.notify(m.agent, "Approval requested: edit files")
 	case protocol.PatchApplyBegin:
@@ -882,9 +913,24 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 // dropTurnPrompts closes approvals, pickers and typed answers that belong
 // to a turn that has ended.
 func (m *model) dropTurnPrompts() {
-	m.approvals = nil
-	m.selections = nil
-	m.freeformID = ""
+	// Only this thread's turn ended; other threads' requests stay.
+	var keepA []*approval
+	for _, a := range m.approvals {
+		if a.thread != m.thread {
+			keepA = append(keepA, a)
+		}
+	}
+	m.approvals = keepA
+	var keepS []*selectionView
+	for _, v := range m.selections {
+		if v.thread != m.thread {
+			keepS = append(keepS, v)
+		}
+	}
+	m.selections = keepS
+	if m.freeformThread == m.thread {
+		m.freeformID = ""
+	}
 }
 
 func (m *model) lastCommittedIsAgent() bool {
@@ -899,7 +945,7 @@ func (m *model) sendUser(text string) { m.sendInput(pendingInput{text: text}) }
 
 func (m *model) sendInput(in pendingInput) {
 	m.commit(userCell{text: in.text, images: in.images, steer: m.running})
-	m.submit(protocol.UserInput{Text: in.text, Images: in.images})
+	m.submit(protocol.UserInput{Text: in.text, Images: in.images, ThreadID: m.thread})
 }
 
 func (m *model) flash(s string) {
@@ -918,7 +964,7 @@ func (m *model) keyContexts() []string {
 		return []string{"pager"}
 	case len(m.approvals) > 0:
 		return []string{"approval", "list", "global"}
-	case len(m.selections) > 0, m.picker != nil, m.surface != nil:
+	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.agents.picker != nil:
 		return []string{"list"}
 	case m.awaitingList || m.awaitingResume:
 		return nil
@@ -990,6 +1036,9 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	if m.surface != nil {
 		return m.handleSurfaceKey(k, act)
 	}
+	if m.agents.picker != nil {
+		return m.handleAgentPickerKey(k, act)
+	}
 	if m.awaitingList || m.awaitingResume {
 		// The composer is hidden while sessions load; don't let keys
 		// reach it (they would be sent to the backend unseen).
@@ -1033,6 +1082,15 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 		}
 		return nil
 	}
+	// Codex' fixed Alt+←/→: watch the previous/next agent thread, only
+	// with an empty composer (otherwise they keep moving by word).
+	if (key == "alt+left" || key == "alt+right") && m.composer.Empty() && !m.composer.shell &&
+		m.composer.slash == nil && m.composer.files == nil && m.agents.hasSubagents() {
+		if key == "alt+left" {
+			return m.cycleThread(-1)
+		}
+		return m.cycleThread(1)
+	}
 	switch key {
 	case "ctrl+v", "alt+v":
 		return func() tea.Msg {
@@ -1062,7 +1120,7 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 			return m.quit()
 		case m.running:
 			// Interrupt, and arm quit in case the backend never answers.
-			m.submit(protocol.Interrupt{})
+			m.submit(protocol.Interrupt{ThreadID: m.thread})
 			m.ctrlCArmed = time.Now().Add(2 * time.Second)
 			m.hint, m.hintUntil = "⌃c again to quit", m.ctrlCArmed
 		default:
@@ -1092,11 +1150,11 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 		case key == "esc" && m.freeformID != "" && m.composer.Empty():
 			// Skip the typed answer (before "interrupt": the question is
 			// usually asked mid-turn).
-			m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1})
+			m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1, ThreadID: m.freeformThread})
 			m.freeformID = ""
 			return nil
 		case m.running && act == "chat.interrupt_turn":
-			m.submit(protocol.Interrupt{})
+			m.submit(protocol.Interrupt{ThreadID: m.thread})
 			return nil
 		case key == "esc" && !m.running && m.composer.Empty() && time.Now().Before(m.escArmed):
 			// Codex backtrack: browse earlier prompts, Enter rewinds.
@@ -1243,9 +1301,14 @@ func (m *model) submitComposer() tea.Cmd {
 			return m.runCommand(name, args)
 		}
 	}
+	if m.parentOwned() && m.freeformID == "" {
+		// Codex keeps the draft and refuses it; local commands still run.
+		m.commit(errorCell(m.st, parentOwnedMsg))
+		return nil
+	}
 	if m.freeformID != "" {
 		answer := strings.TrimSpace(m.composer.Submit())
-		m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1, Text: answer})
+		m.submit(protocol.SelectionResponse{ID: m.freeformID, Index: -1, Text: answer, ThreadID: m.freeformThread})
 		m.commit(textCell{bullet: S("•", m.st.Dim), body: L(S(m.freeformTitle+": ", m.st.Dim), S(answer, m.st.Plain))})
 		m.freeformID = ""
 		return nil
@@ -1255,7 +1318,7 @@ func (m *model) submitComposer() tea.Cmd {
 		m.composer.shell = false
 		m.composer.addHistory("!"+cmd, nil)
 		m.composer.Clear()
-		m.submit(protocol.ShellCommand{Command: cmd})
+		m.submit(protocol.ShellCommand{Command: cmd, ThreadID: m.thread})
 		return nil
 	}
 	full, images := m.composer.SubmitWithImages()
@@ -1273,8 +1336,17 @@ func (m *model) handleApprovalKey(key, act string) tea.Cmd {
 	a := m.approvals[0]
 	decide := func(o approvalOption) {
 		m.submit(a.op(o.decision))
-		m.commit(decisionCell(a, o.decision, m.agent, m.st))
+		if a.thread == m.thread {
+			// Codex writes no decision row for another thread's request.
+			m.commit(decisionCell(a, o.decision, m.agent, m.st))
+		}
 		m.approvals = m.approvals[1:]
+	}
+	if act == "approval.open_thread" {
+		if a.thread != m.thread {
+			return m.selectThread(a.thread)
+		}
+		return nil
 	}
 	switch act {
 	case "list.move_up":
@@ -1402,6 +1474,8 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return m.surfaceCommand(surfaceTitle, args)
 	case "keymap":
 		return m.openKeymapUI(args)
+	case "subagents":
+		return m.openAgentPicker()
 	case "resume":
 		if args != "" {
 			return m.requestResume(args)
@@ -1535,13 +1609,20 @@ func (m *model) View() tea.View {
 	bottom = append(bottom, queued...)
 	if len(m.approvals) > 0 {
 		maxH := max(6, m.height-len(bottom)-2)
-		bottom = append(bottom, m.approvals[0].Lines(w, maxH, m.cwd, st)...)
+		a := m.approvals[0]
+		a.threadLabel = ""
+		if a.thread != m.thread {
+			a.threadLabel = m.threadLabel(a.thread)
+		}
+		bottom = append(bottom, a.Lines(w, maxH, m.cwd, st)...)
 	} else if len(m.selections) > 0 {
 		bottom = append(bottom, m.selections[0].Lines(w, m.height-len(bottom)-2, st)...)
 	} else if m.picker != nil {
 		bottom = append(bottom, m.picker.Lines(w, m.height-2, m.cwd, st)...)
 	} else if m.surface != nil {
 		bottom = append(bottom, m.surface.Lines(w, m.surfacePreview(), st)...)
+	} else if m.agents.picker != nil {
+		bottom = append(bottom, m.agentPickerLines(w)...)
 	} else if m.keymapUI != nil {
 		bottom = append(bottom, m.keymapLines(w, m.height-len(bottom)-2)...)
 	} else if m.awaitingList || m.awaitingResume {
@@ -1555,6 +1636,9 @@ func (m *model) View() tea.View {
 		band := st.UserBg
 		bottom = append(bottom, Line{}.Fill(w, band))
 		placeholder := "Ask " + m.agent + " to do anything"
+		if m.parentOwned() {
+			placeholder = "Viewing sub-agent — direct input is disabled"
+		}
 		if m.freeformID != "" {
 			placeholder = "Type your answer (esc to skip)"
 			bottom = append(bottom[:len(bottom)-1], L(P("  "), S(m.freeformTitle, st.Bold)), Line{}.Fill(w, band))
@@ -1704,6 +1788,9 @@ func (m *model) footerLine(w int, showContext bool) Line {
 			left = append(left, k(q), d(" / "))
 		}
 		left = append(left, k("esc"), d(" close"))
+	case showContext && m.footerAgentLabel() != "" && (m.composer.Empty() || !m.running):
+		// Codex shows the watched agent where the hint would be.
+		left = L(P("  "), d(m.footerAgentLabel()))
 	case m.composer.Empty():
 		if q := m.keys.primary("composer.toggle_shortcuts"); q != "" {
 			left = L(P("  "), k(q), d(" for shortcuts"))
@@ -1762,7 +1849,7 @@ func (m *model) shortcutLines(w int) []Line {
 	}{
 		{"Compose", []item{{"/", "Commands"}, {"@", "Mention files"}, {"!", "Shell command"}, {newline, "New line"},
 			{"⌃v", "Paste image"}, {km.primary("global.open_external_editor"), "External editor"}, {km.primary("composer.history_search_previous"), "Search history"}, {"esc esc", "Edit last message"}}},
-		{"Session", []item{{km.primary("composer.queue"), tab}, {km.primary("chat.edit_queued_message"), "Edit queued message"}, {km.primary("chat.interrupt_turn"), "Interrupt"}, {"⌃c", ctrlc}, {km.primary("global.copy"), "Copy last response"}, {km.primary("global.clear_terminal"), "Clear screen"}, {"⌃z", "Suspend"}}},
+		{"Session", []item{{km.primary("composer.queue"), tab}, {km.primary("chat.edit_queued_message"), "Edit queued message"}, {km.primary("chat.interrupt_turn"), "Interrupt"}, {"⌃c", ctrlc}, {km.primary("global.copy"), "Copy last response"}, {km.primary("global.clear_terminal"), "Clear screen"}, {"⌃z", "Suspend"}, {"⌥← / ⌥→", "Subagents (empty prompt)"}}},
 		{"Transcript", []item{{km.primary("global.open_transcript"), "Open transcript"}, {km.primary("pager.find"), "Find (in transcript)"}, {"pgup / pgdn", "Scroll"}, {"home / end", "Top / latest"}}},
 	}
 	// Unbound actions have no hint.

@@ -20,6 +20,7 @@ import (
 
 type selectionView struct {
 	req      protocol.SelectionRequest
+	thread   string // the thread that asked
 	selected int
 	query    string
 }
@@ -177,15 +178,15 @@ func (m *model) handleSelectionKey(k tea.KeyPressMsg, key string) tea.Cmd {
 	case selChoose:
 		m.selections = m.selections[1:]
 		if idx < 0 {
-			m.freeformID = v.req.ID
+			m.freeformID, m.freeformThread = v.req.ID, v.thread
 			m.freeformTitle = v.req.Title
 			return nil
 		}
-		m.submit(protocol.SelectionResponse{ID: v.req.ID, Index: idx})
+		m.submit(protocol.SelectionResponse{ID: v.req.ID, Index: idx, ThreadID: v.thread})
 		m.commit(textCell{bullet: S("•", m.st.Dim), body: L(S(v.req.Title+": ", m.st.Dim), S(v.req.Items[idx].Name, m.st.Plain))})
 	case selCancel:
 		m.selections = m.selections[1:]
-		m.submit(protocol.SelectionResponse{ID: v.req.ID, Index: -1})
+		m.submit(protocol.SelectionResponse{ID: v.req.ID, Index: -1, ThreadID: v.thread})
 	}
 	return nil
 }
@@ -195,6 +196,9 @@ func (m *model) handleSelectionKey(k tea.KeyPressMsg, key string) tea.Cmd {
 // (Codex re-emits its scrollback on resize), or only the header (Ctrl+L).
 
 func (m *model) reflow(headerOnly bool) tea.Cmd {
+	if m.bg {
+		return nil // reprinted when the thread is shown
+	}
 	if m.stream.active {
 		// Rows already streamed live only in the scrollback; redo after.
 		if headerOnly && m.pendingReflow != reflowFull {
@@ -299,6 +303,9 @@ func (m *model) rewindTo(cellIdx int) tea.Cmd {
 		reason = "the selected prompt is a steer and cannot be edited independently"
 	case m.running:
 		reason = "the selected prompt belongs to a turn that is still in progress"
+	case m.thread != "":
+		// Rewind ops address the main conversation only.
+		reason = "only the main thread can be reverted"
 	}
 	if reason != "" {
 		m.restorePrompt(uc)

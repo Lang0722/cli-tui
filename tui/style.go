@@ -27,6 +27,7 @@ type Styles struct {
 	Red     lipgloss.Style
 	RedB    lipgloss.Style
 	Magenta lipgloss.Style
+	Yellow  lipgloss.Style
 	Code    lipgloss.Style
 	Link    lipgloss.Style
 
@@ -64,6 +65,7 @@ func newStyles() *Styles {
 		Red:           n.Foreground(lipgloss.Red),
 		RedB:          n.Foreground(lipgloss.Red).Bold(true),
 		Magenta:       n.Foreground(lipgloss.Magenta),
+		Yellow:        n.Foreground(lipgloss.Yellow),
 		Code:          n.Foreground(lipgloss.Cyan),
 		Link:          n.Foreground(lipgloss.Cyan).Underline(true),
 		UserBg:        n,

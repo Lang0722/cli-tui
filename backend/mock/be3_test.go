@@ -1,6 +1,7 @@
 package mock
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -12,7 +13,10 @@ import (
 func TestBeTurnFramingRace(t *testing.T) {
 	bad := 0
 	for iter := 0; iter < 30 && bad == 0; iter++ {
-		b, _ := New(t.TempDir())
+		// Not t.TempDir: turns left running keep saving after the test.
+		dir, _ := os.MkdirTemp("", "be3")
+		defer os.RemoveAll(dir)
+		b, _ := New(dir)
 		drain(b)
 		b.Submit(bg, protocol.UserInput{Text: "error"})
 		// wait for the Error event, then hammer

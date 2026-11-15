@@ -334,6 +334,7 @@ var kmActions = []kmAction{
 	{"approval", "approve_for_prefix", d("p"), "Approve with an exec-policy prefix when available.", false},
 	{"approval", "deny", d("d"), "Choose the explicit deny option when available.", false},
 	{"approval", "decline", d("esc", "n"), "Decline and provide corrective guidance.", false},
+	{"approval", "open_thread", d("o"), "Open the thread that requested approval.", false},
 }
 
 func findAction(ctx, name string) (kmAction, bool) {

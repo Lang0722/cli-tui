@@ -32,29 +32,36 @@ type UserInput struct {
 	// Images are local file paths attached with Ctrl+V / Alt+V (clipboard
 	// image saved as PNG) or by pasting/dragging an image file path.
 	Images []string `json:"images,omitempty"`
+	// ThreadID targets a subagent thread the user is watching ("" = main).
+	ThreadID string `json:"thread_id,omitempty"`
 }
 
 // ShellCommand is a command the user typed in "!" shell mode. The backend
 // runs it and reports it with ExecCommandBegin/End carrying
 // Source: "user_shell" (rendered as "You ran").
 type ShellCommand struct {
-	Command string `json:"command"`
+	Command  string `json:"command"`
+	ThreadID string `json:"thread_id,omitempty"` // the watched thread
 }
 
 // Interrupt asks the backend to abort the running turn. The backend should
 // answer with TurnAborted.
-type Interrupt struct{}
+type Interrupt struct {
+	ThreadID string `json:"thread_id,omitempty"` // the watched thread
+}
 
 // ExecApproval answers an ExecApprovalRequest.
 type ExecApproval struct {
 	CallID   string         `json:"call_id"`
 	Decision ReviewDecision `json:"decision"`
+	ThreadID string         `json:"thread_id,omitempty"` // thread that asked
 }
 
 // PatchApproval answers an ApplyPatchApprovalRequest.
 type PatchApproval struct {
 	CallID   string         `json:"call_id"`
 	Decision ReviewDecision `json:"decision"`
+	ThreadID string         `json:"thread_id,omitempty"` // thread that asked
 }
 
 // SlashCommand is forwarded for slash commands the TUI does not handle
@@ -98,8 +105,11 @@ const (
 // Event is a single message from the backend. ID ties events to a turn/
 // submission and is informational only.
 type Event struct {
-	ID  string
-	Msg EventMsg
+	ID string
+	// Thread is the subagent thread this event belongs to; "" is the main
+	// conversation (see agents.go).
+	Thread string
+	Msg    EventMsg
 }
 
 // EventMsg is any event payload.

@@ -189,7 +189,7 @@ func replayable(m protocol.EventMsg) bool {
 		protocol.ExecCommandEnd, protocol.PatchApplyBegin, protocol.PatchApplyEnd,
 		protocol.PlanUpdate, protocol.ToolCallBegin, protocol.ToolCallEnd,
 		protocol.TokenCount, protocol.Error, protocol.Warning, protocol.BackgroundEvent,
-		protocol.TurnAborted:
+		protocol.TurnAborted, protocol.CollabToolCall, protocol.SubAgentActivity, protocol.ThreadStarted:
 		return true
 	}
 	return false

@@ -80,6 +80,10 @@ func (t *turn) run(text string) {
 		if ok = t.sleep(400 * time.Millisecond); ok {
 			t.emit(protocol.Error{Message: "stream disconnected before completion: mock error requested"})
 		}
+	case containsAny(lower, "subagent", "agents", "helpers"):
+		ok = t.agentsDemo()
+	case containsAny(lower, "delegate", "reviewer"):
+		ok = t.delegateDemo()
 	case containsAny(lower, "demo", "timeout", "fix", "edit", "refactor"):
 		ok = t.toolDemo(text)
 	case containsAny(lower, "markdown", "table"):

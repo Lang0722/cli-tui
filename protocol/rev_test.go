@@ -30,7 +30,7 @@ func TestRevRoundTrip(t *testing.T) {
 			t.Errorf("mismatch\n got %#v\nwant %#v\n%s", got.Msg, e, b)
 		}
 	}
-	for _, o := range []Op{UserInput{Text: "x", Images: []string{"/tmp/a.png"}}, ShellCommand{"ls"}, Interrupt{}, ExecApproval{"c", DecisionApprovedForSession}, PatchApproval{"p", DecisionAbort}, SlashCommand{"model", "a"}, Shutdown{}, ListSessions{}, ResumeSession{"id"}} {
+	for _, o := range []Op{UserInput{Text: "x", Images: []string{"/tmp/a.png"}}, ShellCommand{Command: "ls"}, Interrupt{}, ExecApproval{CallID: "c", Decision: DecisionApprovedForSession, ThreadID: "t1"}, PatchApproval{CallID: "p", Decision: DecisionAbort}, SlashCommand{"model", "a"}, Shutdown{}, ListSessions{}, ResumeSession{"id"}} {
 		b, _ := MarshalOp(o)
 		got, err := UnmarshalOp(b)
 		if err != nil || !reflect.DeepEqual(got, o) {

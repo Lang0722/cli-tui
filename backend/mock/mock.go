@@ -44,6 +44,7 @@ type Backend struct {
 	pending   []protocol.UserInput // input received while a turn was running
 	saveErr   bool                 // a save failure was already reported
 	active    *turn                // the running turn, if any
+	agents    map[string]*subagent // open helper threads (agents.go)
 	cur       *sessionFile         // nil until the first message of a new session
 
 	// Submit only enqueues; ops run in order on the mock's own goroutine so
@@ -65,6 +66,7 @@ func New(dir string) (*Backend, error) {
 		store:     store{dir: dir},
 		cwd:       cwd,
 		approvals: map[string]chan protocol.ReviewDecision{},
+		agents:    map[string]*subagent{},
 		answers:   map[string]chan protocol.SelectionResponse{},
 		model:     modelName,
 		effort:    effort,
@@ -229,6 +231,18 @@ func (b *Backend) opLoop() {
 func (b *Backend) handle(op protocol.Op) {
 	switch op := op.(type) {
 	case protocol.UserInput:
+		if op.ThreadID != "" {
+			if a := b.agent(op.ThreadID); a != nil {
+				select {
+				case a.inputs <- op.Text:
+				default:
+					b.notice(protocol.Warning{Message: a.label() + " is busy; try again shortly."})
+				}
+			} else {
+				b.notice(protocol.Error{Message: "Agent thread " + op.ThreadID + " is closed."})
+			}
+			return
+		}
 		b.mu.Lock()
 		if b.cancel != nil {
 			// Input during a turn (agenttui -steer): run it next, in order,
@@ -276,6 +290,12 @@ func (b *Backend) handle(op protocol.Op) {
 			b.notice(protocol.SessionTitle{Title: *title})
 		}
 	case protocol.Interrupt:
+		if op.ThreadID != "" {
+			if a := b.agent(op.ThreadID); a != nil {
+				a.interrupt()
+			}
+			return
+		}
 		b.mu.Lock()
 		if b.cancel != nil {
 			b.cancel()
@@ -293,6 +313,7 @@ func (b *Backend) handle(op protocol.Op) {
 		b.notice(protocol.SessionList{Sessions: list})
 	case protocol.ResumeSession:
 		b.stopTurn()
+		b.closeAgents()
 		f, err := b.store.load(op.ID)
 		if err != nil {
 			b.notice(protocol.Error{Message: "resume: no saved session " + op.ID + ": " + err.Error()})
@@ -401,6 +422,7 @@ func (b *Backend) slash(op protocol.SlashCommand) {
 	switch op.Name {
 	case "new":
 		b.stopTurn()
+		b.closeAgents()
 		b.mu.Lock()
 		b.cur = nil
 		b.mu.Unlock()

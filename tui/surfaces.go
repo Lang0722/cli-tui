@@ -359,6 +359,13 @@ func (m *model) statusLineRow(w int) Line {
 		return nil // the picker shows its own preview
 	}
 	l := m.statusLineFor(ids, colors, func(id string) string { return m.itemValue(id, false) })
+	if a := m.footerAgentLabel(); a != "" {
+		// Codex appends the watched agent to the status line.
+		if len(l) > 0 {
+			l = append(l, S(" · ", m.st.Dim))
+		}
+		l = append(l, S(a, m.st.Dim))
+	}
 	if len(l) == 0 {
 		return nil
 	}

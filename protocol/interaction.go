@@ -28,6 +28,8 @@ type SelectionResponse struct {
 	ID    string `json:"id"`
 	Index int    `json:"index"`
 	Text  string `json:"text,omitempty"`
+	// ThreadID is the thread that asked ("" = main).
+	ThreadID string `json:"thread_id,omitempty"`
 }
 
 // Rewind is sent by Esc Esc backtracking (Codex "edit previous message"):

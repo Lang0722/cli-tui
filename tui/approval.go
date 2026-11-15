@@ -31,6 +31,10 @@ type approval struct {
 	options  []approvalOption
 	selected int
 	km       *keymap // for the key hints
+	thread   string  // the thread that asked ("" = main)
+	// threadLabel is set while the request is shown in another thread's
+	// view (Codex' cross-thread prompt: "Thread: …", "o to open thread").
+	threadLabel string
 }
 
 // keyHint is the first configured key of an approval/list action ("y",
@@ -77,9 +81,9 @@ func newPatchApproval(ev protocol.ApplyPatchApprovalRequest, agent string) *appr
 
 func (a *approval) op(d protocol.ReviewDecision) protocol.Op {
 	if a.kind == approveExec {
-		return protocol.ExecApproval{CallID: a.callID, Decision: d}
+		return protocol.ExecApproval{CallID: a.callID, Decision: d, ThreadID: a.thread}
 	}
-	return protocol.PatchApproval{CallID: a.callID, Decision: d}
+	return protocol.PatchApproval{CallID: a.callID, Decision: d, ThreadID: a.thread}
 }
 
 // byAction returns the option an approval.* action picks.
@@ -102,6 +106,9 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 		title = "Would you like to make the following edits?"
 	}
 	out = append(out, Line{}, L(P("  "), S(title, st.Bold)), Line{})
+	if a.threadLabel != "" {
+		out = append(out, L(P("  "), S("Thread: "+sanitizeLine(a.threadLabel), st.Bold)), Line{})
+	}
 	if r := strings.TrimSpace(a.reason); r != "" {
 		out = append(out, Wrap(L(S("Reason: ", st.Plain), S(sanitize(r), st.Italic)), width, L(P("  ")), L(P("  ")))...)
 		out = append(out, Line{})
@@ -135,7 +142,13 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 			out = append(out, Wrap(l, width, L(P("  ")), L(P(strings.Repeat(" ", 2+len(num)))))...)
 		}
 	}
-	out = append(out, Line{}, L(P("  "), S("Press ", st.Dim), S(a.keyHint("list.accept"), st.Bold), S(" to confirm or ", st.Dim), S(a.keyHint("approval.decline"), st.Bold), S(" to cancel", st.Dim)))
+	hint := L(P("  "), S("Press ", st.Dim), S(a.keyHint("list.accept"), st.Bold), S(" to confirm or ", st.Dim), S(a.keyHint("approval.decline"), st.Bold), S(" to cancel", st.Dim))
+	if a.threadLabel != "" {
+		if o := a.keyHint("approval.open_thread"); o != "" {
+			hint = append(hint, S(" or ", st.Dim), S(o, st.Bold), S(" to open thread", st.Dim))
+		}
+	}
+	out = append(out, Line{}, hint)
 	return out
 }
 

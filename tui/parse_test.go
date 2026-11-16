@@ -248,7 +248,7 @@ func TestNotATable(t *testing.T) {
 	// One delimiter cell for two header cells: not a table but a setext
 	// heading (as pulldown-cmark parses it).
 	got := plainMD(RenderMarkdown("a | b\n---", newStyles(), 80))
-	if len(got) != 1 || got[0] != "## a | b" {
+	if len(got) != 1 || got[0] != "a | b" {
 		t.Errorf("pipe line + underline: %q", got)
 	}
 	got = plainMD(RenderMarkdown("a | b\n\n---", newStyles(), 80))
@@ -314,7 +314,7 @@ func TestMiddleTruncate(t *testing.T) {
 func TestMarkdownFidelityRound2(t *testing.T) {
 	st := newStyles()
 	got := plainMD(RenderMarkdown("# Title\nIntro text\nSummary:\n- item\n## Next\n> quote\n> - in list\nlazy line\n\n> Level 1\n> > Level 2", st, 80))
-	want := []string{"# Title", "", "Intro text", "Summary:", "", "• item", "", "## Next", "", "> quote", ">", "> • in list", ">   lazy line", "", "> Level 1", ">", "> > Level 2"}
+	want := []string{"Title", "", "Intro text", "Summary:", "", "• item", "", "Next", "", "> quote", ">", "> • in list", ">   lazy line", "", "> Level 1", ">", "> > Level 2"}
 	g := strings.Join(got, "|")
 	g = strings.ReplaceAll(g, "> |", ">|")
 	if g != strings.Join(want, "|") {

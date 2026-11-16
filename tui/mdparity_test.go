@@ -74,7 +74,7 @@ func TestCodexBlockStyles(t *testing.T) {
 			}
 		}
 	}
-	if h := md[len(md)-1].Line; h.Plain() != "> # head" || !h[len(h)-1].Style.GetBold() {
+	if h := md[len(md)-1].Line; h.Plain() != "> head" || !h[len(h)-1].Style.GetBold() {
 		t.Error("heading in a quote lost its style")
 	}
 	bullets := RenderMarkdown("- a", st, 80)

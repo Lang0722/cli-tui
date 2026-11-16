@@ -7,26 +7,27 @@ import (
 	"agenttui/protocol"
 )
 
+// Headings are drawn without their "#" marks; the style shows the level.
 func TestMarkdownHeadings(t *testing.T) {
 	st := newStyles()
 	for _, c := range []struct{ src, want string }{
-		{"# Title", "# Title"},
-		{"###### Six", "###### Six"},
+		{"# Title", "Title"},
+		{"###### Six", "Six"},
 		{"####### seven", "####### seven"}, // not a heading
 		{"#hashtag", "#hashtag"},
-		{"## Closed ##", "## Closed"},
-		{"## Closed##", "## Closed##"}, // the closing run needs a space
-		{"### #", "###"},
-		{"#", "#"},
-		{"   ## indented", "## indented"},
-		{"Title\n=====", "# Title"},
-		{"Sub\n---", "## Sub"},
-		{"Two\nlines\n===", "# Two|lines"},
+		{"## Closed ##", "Closed"},
+		{"## Closed##", "Closed##"}, // the closing run needs a space
+		{"### #", ""},
+		{"#", ""},
+		{"   ## indented", "indented"},
+		{"Title\n=====", "Title"},
+		{"Sub\n---", "Sub"},
+		{"Two\nlines\n===", "Two|lines"},
 		{"para\n\n---", "para||———"},
-		{"- # In item", "• # In item"},
+		{"- # In item", "• In item"},
 		{"> quoted\n---", "> quoted||———"},
-		{"> ## In quote", "> ## In quote"},
-		{"## **bold** and `code`", "## bold and code"},
+		{"> ## In quote", "> In quote"},
+		{"## **bold** and `code`", "bold and code"},
 	} {
 		got := strings.TrimRight(strings.Join(plainMD(RenderMarkdown(c.src, st, 80)), "|"), " ")
 		if got != c.want {
@@ -63,7 +64,7 @@ func TestStreamSetextHeadingNotCommittedEarly(t *testing.T) {
 	}
 	m.streamDelta("--------\n\nBody text\n\n")
 	got := plain(m.stream.printed)
-	if len(got) == 0 || got[0] != "• ## Overview" {
+	if len(got) == 0 || got[0] != "• Overview" {
 		t.Errorf("printed = %q", got)
 	}
 }

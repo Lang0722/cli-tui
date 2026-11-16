@@ -383,12 +383,8 @@ func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 			out, paraStart, paraSrc = out[:paraStart], -1, nil
 			last = "heading"
 			hs := headingStyle(level, st)
-			for k, t := range text {
-				l := Line{}
-				if k == 0 {
-					l = L(S(strings.Repeat("#", level)+" ", hs))
-				}
-				out = append(out, mdLine{Line: append(l, inline(t, hs, st)...)})
+			for _, t := range text {
+				out = append(out, mdLine{Line: inline(t, hs, st)})
 			}
 		case reRule.MatchString(raw): // "* * *" is a rule, not a list item
 			independent()
@@ -398,9 +394,8 @@ func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 			independent()
 			start("heading")
 			level, text := parseHeading(trimmed)
-			hs := headingStyle(level, st)
-			l := L(S(strings.Repeat("#", level)+" ", hs))
-			out = append(out, mdLine{Line: append(l, inline(text, hs, st)...)})
+			// Shown without its "#" marks; the style tells the level.
+			out = append(out, mdLine{Line: inline(text, headingStyle(level, st), st)})
 		case isList:
 			if last != "list" {
 				independent()
@@ -488,9 +483,7 @@ func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 			}
 			if reHeading.MatchString(body) { // "- ## Title"
 				level, text := parseHeading(body)
-				hs := headingStyle(level, st)
-				pre = append(pre, S(strings.Repeat("#", level)+" ", hs))
-				body, bodyStyle = text, hs
+				body, bodyStyle = text, headingStyle(level, st)
 			}
 			out = append(out, mdLine{Line: append(pre, inline(body, bodyStyle, st)...), Hang: L(P(strings.Repeat(" ", lv.hang)))})
 		default:

@@ -15,7 +15,7 @@ func TestMathRendering(t *testing.T) {
 	s.waitIdle()
 	all := s.all()
 	for _, want := range []string{
-		"## Math rendering",
+		"• Math rendering", // a heading, without its "##"
 		"Inline math such as α² + β₁₀ on ℝⁿ, √(x²+y²) or ((a)/(b)) is drawn",
 		"money ($5 and $10) and",
 		"shell variables ($HOME) are left alone.",

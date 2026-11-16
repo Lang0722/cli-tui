@@ -415,9 +415,9 @@ snapshots.
   backtrack and rewind; resize reflow.
 - **Rendering:**
   - Markdown with tables (falling back to records when narrow), task lists,
-    nested lists, quotes, rules and highlighted code. Headings keep their
-    `#` marks and use Codex's per-level styles (h1 bold underlined, h2 bold,
-    h3 bold italic, h4–h6 italic); setext (`===` / `---` underlined)
+    nested lists, quotes, rules and highlighted code. Headings are drawn
+    without their `#` marks, in Codex's per-level styles (h1 bold
+    underlined, h2 bold, h3 bold italic, h4–h6 italic); setext (`===` / `---` underlined)
     headings, closing `#`s and headings in list items are supported.
   - Lists follow CommonMark and Codex: items nest by content column, ordered
     lists count from their first number, and a blank row follows an item

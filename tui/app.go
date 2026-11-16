@@ -88,6 +88,7 @@ func Run(ctx context.Context, opts Options) error {
 		testHookModel(m)
 	}
 	p := tea.NewProgram(m, tea.WithContext(ctx))
+	m.send = p.Send
 	go m.out.run(p.Println)
 	_, err := p.Run()
 	m.out.stop()
@@ -158,6 +159,9 @@ type model struct {
 	width, height int
 	out           *printer
 	printedAny    bool
+	sepPrinted    bool // the blank row that separates the next cell is already printed
+	overlayTall   bool // the last frame's overlay covered most of the screen
+	send          func(tea.Msg)
 
 	// The conversation on screen: the main thread or a watched subagent
 	// (agents.go). Its fields (transcript, turn state, tokens) are
@@ -247,6 +251,10 @@ type convo struct {
 	queued       []pendingInput
 	turnHasAgent bool   // an agent message was committed this turn
 	deferred     []Cell // commits held while an answer streams
+	// statusHidden: assistant output replaced the status row (Codex keeps
+	// it hidden until new work starts, so the turn's end doesn't shrink
+	// the bottom pane).
+	statusHidden bool
 
 	// tokens
 	tokensUsed, contextWindow int64
@@ -399,10 +407,10 @@ func (m *model) printLines(lines []Line, separate bool) {
 		return
 	}
 	s := renderLines(lines)
-	if separate && m.printedAny {
+	if separate && m.printedAny && !m.sepPrinted {
 		s = "\n" + s
 	}
-	m.printedAny = true
+	m.printedAny, m.sepPrinted = true, false
 	m.out.push(s)
 }
 
@@ -571,6 +579,7 @@ func (m *model) finalizeStream(final string) {
 			m.flushActive(true)
 			m.commit(agentCell{final})
 			m.turnHasAgent = true
+			m.statusHidden = true
 		}
 		return
 	}
@@ -582,10 +591,20 @@ func (m *model) finalizeStream(final string) {
 	}
 	rows := m.streamSegment(src)
 	if skip := m.stream.emitted - m.stream.baseRows; len(rows) > skip {
-		m.printLines(rows[skip:], m.stream.emitted == 0)
+		if m.stream.emitted == 0 {
+			m.printLines(rows[skip:], true)
+		} else {
+			// The live tail leaves the frame together with the blank row
+			// above it. Print that row now too (it separates the next cell)
+			// so the frame's bottom stays where it was instead of leaving a
+			// blank row under the footer.
+			m.printLines(append(rows[skip:len(rows):len(rows)], Line{}), false)
+			m.sepPrinted = true
+		}
 	}
 	m.committed = append(m.committed, agentCell{src})
 	m.turnHasAgent = true
+	m.statusHidden = true // Codex: committed answer replaces the status row
 	m.stream = streamState{}
 	if d := m.deferred; len(d) > 0 {
 		m.deferred = nil
@@ -691,6 +710,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chord = nil // timed out: drop the HUD
 		}
 		return m, nil
+	case restoreViewportMsg:
+		// Mid-turn, the turn's own output fills the rows below.
+		if m.pager == nil && m.picker == nil && !m.overlayShown() && !m.running && m.printedAny && !m.opts.NoReflow {
+			return m, m.reflow(false)
+		}
+		return m, nil
 	case tickMsg:
 		m.ticking = false
 		return m, m.ensureTick()
@@ -779,12 +804,18 @@ func (m *model) notify(title, body string) tea.Cmd {
 }
 
 func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
+	switch ev.Msg.(type) {
+	case protocol.TaskStarted, protocol.ExecCommandBegin, protocol.ToolCallBegin, protocol.PatchApplyBegin,
+		protocol.StreamError, protocol.AgentReasoningDelta, protocol.CollabToolCall,
+		protocol.ExecApprovalRequest, protocol.ApplyPatchApprovalRequest:
+		m.statusHidden = false // Codex: ensure_status_indicator when work resumes
+	}
 	switch e := ev.Msg.(type) {
 	case protocol.SessionConfigured:
 		if m.replaying {
 			break
 		}
-		m.onSessionConfigured(e)
+		clear := m.onSessionConfigured(e)
 		m.sessionTitle = e.Title
 		m.planDone, m.planTotal = 0, 0
 		m.inputTokens, m.outputTokens = 0, 0
@@ -792,7 +823,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 			m.commit(warningCell(m.st, w))
 		}
 		m.configWarnings = nil
-		return fetchGitInfo(m.cwd)
+		return tea.Batch(clear, fetchGitInfo(m.cwd))
 	case protocol.SessionTitle:
 		m.sessionTitle = e.Title
 	case protocol.SessionUpdated:
@@ -1773,6 +1804,18 @@ func (m *model) View() tea.View {
 		v.WindowTitle = m.title()
 		return v
 	}
+	if m.picker != nil {
+		// Like Codex, the resume picker is a full-screen view in the
+		// alternate screen, so it leaves no gap in the inline area.
+		lines := m.picker.Lines(m.width, m.height, m.cwd, m.st)
+		if len(lines) > m.height {
+			lines = lines[:m.height]
+		}
+		v := tea.NewView(renderLines(lines))
+		v.AltScreen = true
+		v.WindowTitle = m.title()
+		return v
+	}
 	w := m.width
 	st := m.st
 	var bottom []Line
@@ -1780,7 +1823,7 @@ func (m *model) View() tea.View {
 
 	// Codex hides the status row while the answer streams into the
 	// transcript (a one-line partial answer keeps "Working").
-	if m.running && !(m.stream.active && m.stream.emitted > 0) {
+	if m.running && !m.statusHidden && !(m.stream.active && m.stream.emitted > 0) {
 		bottom = append(bottom, m.statusLines(w)...)
 	}
 	queued := m.queuedLines(w)
@@ -1799,8 +1842,6 @@ func (m *model) View() tea.View {
 		bottom = append(bottom, a.Lines(w, maxH, m.cwd, st)...)
 	} else if len(m.selections) > 0 {
 		bottom = append(bottom, m.selections[0].Lines(w, m.height-len(bottom)-2, st)...)
-	} else if m.picker != nil {
-		bottom = append(bottom, m.picker.Lines(w, m.height-2, m.cwd, st)...)
 	} else if m.surface != nil {
 		bottom = append(bottom, m.surface.Lines(w, m.surfacePreview(), st)...)
 	} else if m.agents.picker != nil {
@@ -1874,6 +1915,7 @@ func (m *model) View() tea.View {
 		top = top[max(0, len(top)-max(room, 0)):]
 	}
 
+	m.noteOverlayHeight(len(bottom))
 	// Never let the live frame reach the terminal height (see printer).
 	if over := len(bottom) - (m.height - 1); over > 0 {
 		bottom = bottom[over:]

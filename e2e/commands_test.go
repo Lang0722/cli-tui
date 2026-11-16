@@ -99,6 +99,8 @@ func TestBacktrackRewind(t *testing.T) {
 	s := start(t, opts{})
 	s.turn("first prompt here", "first prompt here")
 	s.turn("second prompt here", "second prompt here")
+	// The mock counts the earlier messages in each reply.
+	s.waitFor("(2 earlier messages in this session.)")
 	s.keys("Escape")
 	s.waitScreen("esc again to edit previous message")
 	s.keys("Escape")
@@ -107,14 +109,14 @@ func TestBacktrackRewind(t *testing.T) {
 	s.keys("Enter")
 	s.waitGone("Browsing transcript")
 	s.poll("the rewound prompt in the composer", func() bool { return s.composerLine() == "first prompt here" })
-	// The backend dropped the rewound prompt and everything after it: the
-	// mock counts the earlier messages in each reply.
+	// Like Codex, the screen and scrollback are rebuilt from the trimmed
+	// transcript.
+	s.waitScreen("Conversation reverted to this point.")
+	s.notContains("second prompt here")
+	// The backend dropped the rewound prompt and everything after it.
 	s.keys("C-u")
 	s.turn("after the rewind", "› after the rewind")
 	all := s.all()
-	if !strings.Contains(all, "(2 earlier messages in this session.)") {
-		t.Errorf("the second prompt's reply did not count the first turn")
-	}
 	if tail := all[strings.LastIndex(all, "› after the rewind"):]; strings.Contains(tail, "earlier messages") {
 		t.Errorf("rewound messages still in the backend's history:\n%s", tail)
 	}

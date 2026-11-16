@@ -44,7 +44,8 @@ func TestRevStreamFlushOrder(t *testing.T) {
 	ev(protocol.AgentMessageDelta{Delta: "hello\nworld"})
 	ev(protocol.TaskComplete{})
 	all := m.out.takeQueued()
-	if got := ansiStrip(strings.Join(all, "|")); got != "• hello|  world" {
+	// the trailing "" is the separator printed with the end of the stream
+	if got := ansiStrip(strings.Join(all, "|")); got != "• hello|  world|" {
 		t.Errorf("stream flush order: %q", got)
 	}
 }

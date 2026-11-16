@@ -323,3 +323,27 @@ func echoAgent(t *testing.T) string {
 	}
 	return p
 }
+
+// gapBelow is the number of blank rows under the last non-blank row of the
+// visible screen.
+func (s *term) gapBelow() int {
+	lines := strings.Split(strings.TrimSuffix(s.screen(), "\n"), "\n")
+	gap := 0
+	for i := len(lines) - 1; i >= 0 && strings.TrimSpace(lines[i]) == ""; i-- {
+		gap++
+	}
+	return gap
+}
+
+// altScreen reports whether the alternate screen is active.
+func (s *term) altScreen() bool {
+	out, _ := exec.Command("tmux", "-L", s.socket, "display-message", "-p", "-t", "0", "#{alternate_on}").Output()
+	return strings.TrimSpace(string(out)) == "1"
+}
+
+// waitPinned waits until the footer is on the last row (no blank rows
+// below the bottom pane).
+func (s *term) waitPinned(what string) {
+	s.t.Helper()
+	s.poll("the composer pinned to the bottom "+what, func() bool { return s.gapBelow() == 0 })
+}

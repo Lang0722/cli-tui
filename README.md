@@ -301,6 +301,18 @@ exactly what your terminal sends for a key. Contexts are `global`, `chat`,
   scrollback are cleared, and the transcript is re-emitted at the new width.
   This also clears shell output from before the session started; use
   `-no-reflow` to keep it.
+- **Where the composer sits.** The live area is anchored at its top row, as
+  in Codex: output inserted above pushes it down until it reaches the bottom,
+  and after a turn it stays on the last rows. Specifically:
+  - The resume picker is full-screen (alternate screen). Resuming from inside
+    a session clears the screen and replays the chosen conversation, as Codex
+    does when switching threads.
+  - Closing a tall overlay (`/keymap`, `/statusline`, a long picker or
+    approval) rebuilds the screen so the composer returns to the bottom.
+  - Esc Esc rewinds rebuild the screen from the trimmed transcript.
+  - A short popup (e.g. the `/` command list) leaves blank rows under the
+    composer when it closes, until the next output fills them. Codex behaves
+    the same way.
 - **Colors.** Text uses the 16 ANSI colors, so your profile's palette applies.
   The prompt bands, the shimmer and the diff tints are blended from the real
   background, read via OSC 11.
@@ -414,6 +426,8 @@ go test ./...
     `/statusline` and `/export`;
   - the Ctrl+T pager and find, Esc Esc rewind and `@` file mentions;
   - resume (picker and `-last`), resize reflow and subagents;
+  - layout: the composer stays on the last row after turns, approvals,
+    `/resume` inside a session and closing `/keymap`;
   - the stdio backend (`examples/echo_agent.py`).
 
   They need `tmux` (and `python3` for the stdio test); they are skipped

@@ -55,6 +55,7 @@ func TestStreamIncrementalMatchesFull(t *testing.T) {
 			}
 			ev(m, protocol.AgentMessage{Message: src})
 			got := strings.TrimLeft(sanitize(strings.Join(m.out.takeQueued(), "\n")), "\n")
+			got = strings.TrimSuffix(got, "\n") // the separator printed when the stream ends
 			ref := newTestModel()
 			ref.width = width
 			want := sanitize(renderLines(ref.streamRows(src)))

@@ -21,14 +21,16 @@ import (
 //     frame is shorter than the terminal (View clamps it).
 //   - The frame buffer changes on every Update but reaches the terminal on
 //     the next frame tick; an insert in between is positioned with the new
-//     frame height over the old frame and leaves part of it behind. Waiting
-//     a couple of frames before a batch lets that flush happen first.
+//     frame height over the old frame and leaves part of it behind (or a
+//     gap under the composer). Each line waits until it has been queued for
+//     a couple of frames (settle), so that flush happens first.
 //   - Inserts while the alternate screen (Ctrl+T pager) is shown would be
 //     written into the alt buffer and lost, so printing can be held.
 type printer struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
-	queue   []string // individual lines
+	queue   []string    // individual lines
+	queued  []time.Time // when each line was queued
 	held    holdReason
 	busy    bool // a line is being handed to the program
 	stopped bool
@@ -39,8 +41,9 @@ type printer struct {
 type holdReason uint8
 
 const (
-	holdPager holdReason = 1 << iota // alt-screen pager is open
-	holdClear                        // the terminal is being cleared for a reflow
+	holdPager  holdReason = 1 << iota // alt-screen pager is open
+	holdClear                         // the terminal is being cleared for a reflow
+	holdPicker                        // alt-screen resume picker is open
 )
 
 func newPrinter() *printer {
@@ -52,7 +55,12 @@ func newPrinter() *printer {
 // push queues text (may contain newlines). Never blocks.
 func (p *printer) push(s string) {
 	p.mu.Lock()
-	p.queue = append(p.queue, strings.Split(s, "\n")...)
+	lines := strings.Split(s, "\n")
+	now := time.Now()
+	p.queue = append(p.queue, lines...)
+	for range lines {
+		p.queued = append(p.queued, now)
+	}
 	p.mu.Unlock()
 	p.signal()
 }
@@ -86,13 +94,27 @@ func (p *printer) releaseAll() {
 	p.cond.Broadcast()
 }
 
-// run prints until stop is called. println is tea.Program.Println. Lines
-// are taken one at a time so a hold (pager opening, terminal clearing) or a
-// reset takes effect between lines, never mid-batch.
+// settle is how long a line waits after being queued: two frame ticks, so
+// the frame produced by the same Update has reached the terminal first.
+const settle = 35 * time.Millisecond
+
+// run prints until stop is called. println is tea.Program.Println.
+//
+// A line is printed only once it has been queued for settle. The frame that
+// changed together with it (e.g. a finished answer leaving the live area)
+// has then been drawn, and the inserted lines fill the rows that frame gave
+// up. Printed earlier, they would be inserted above the old, taller frame,
+// which then shrinks and leaves blank rows under the composer. Lines are
+// handed over one at a time so a hold (pager opening, terminal clearing) or
+// a reset takes effect between lines.
 func (p *printer) run(println func(...any)) {
 	for {
-		<-p.wake
-		time.Sleep(35 * time.Millisecond)
+		p.mu.Lock()
+		pending := len(p.queue) > 0 && p.held == 0
+		p.mu.Unlock()
+		if !pending {
+			<-p.wake
+		}
 		for {
 			p.mu.Lock()
 			if p.stopped {
@@ -100,12 +122,18 @@ func (p *printer) run(println func(...any)) {
 				return
 			}
 			if p.held != 0 || len(p.queue) == 0 {
+				p.busy = false
 				p.mu.Unlock()
 				p.cond.Broadcast()
 				break
 			}
+			if wait := settle - time.Since(p.queued[0]); wait > 0 {
+				p.mu.Unlock()
+				time.Sleep(wait)
+				continue
+			}
 			line := p.queue[0]
-			p.queue = p.queue[1:]
+			p.queue, p.queued = p.queue[1:], p.queued[1:]
 			p.busy = true
 			p.mu.Unlock()
 
@@ -113,11 +141,6 @@ func (p *printer) run(println func(...any)) {
 				line = " " // Bubble Tea drops empty prints
 			}
 			println(line)
-
-			p.mu.Lock()
-			p.busy = false
-			p.mu.Unlock()
-			p.cond.Broadcast()
 		}
 	}
 }
@@ -157,7 +180,7 @@ func (p *printer) quitCmd() tea.Cmd {
 // reset drops everything queued (the transcript is about to be re-emitted).
 func (p *printer) reset() {
 	p.mu.Lock()
-	p.queue = nil
+	p.queue, p.queued = nil, nil
 	p.mu.Unlock()
 }
 
@@ -167,6 +190,6 @@ func (p *printer) takeQueued() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	q := p.queue
-	p.queue = nil
+	p.queue, p.queued = nil, nil
 	return q
 }

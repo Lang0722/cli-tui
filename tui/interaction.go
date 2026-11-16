@@ -238,6 +238,32 @@ func (m *model) reflow(headerOnly bool) tea.Cmd {
 	return clearTerminal(m.out)
 }
 
+// restoreViewportMsg asks for a reflow after a screen-filling overlay closed.
+type restoreViewportMsg struct{}
+
+// overlayShown reports whether the bottom pane shows an overlay in place of
+// (or above) the composer.
+func (m *model) overlayShown() bool {
+	return len(m.approvals) > 0 || len(m.selections) > 0 || m.surface != nil || m.agents.picker != nil ||
+		m.keymapUI != nil || m.shortcuts
+}
+
+// noteOverlayHeight is called by View with the bottom pane's height. The
+// inline frame keeps its top row when it shrinks, so closing an overlay that
+// covered most of the screen would leave the composer high up with blank
+// rows below. Codex rebuilds the scrollback when a full-height overlay
+// closes (app.rs restoring_inline_viewport); our tall overlays (/keymap,
+// /statusline, long pickers and approvals) stop short of the full height, so
+// any overlay covering at least half the screen counts. Smaller popups keep
+// their position until new output fills the rows below, as in Codex.
+func (m *model) noteOverlayHeight(h int) {
+	tall := m.height > 0 && m.overlayShown() && h >= m.height/2
+	if m.overlayTall && !tall && m.printedAny && !m.opts.NoReflow && m.send != nil {
+		go m.send(restoreViewportMsg{})
+	}
+	m.overlayTall = tall
+}
+
 type reflowMode uint8
 
 const (
@@ -250,15 +276,22 @@ const (
 // redraw the live frame at the top, then releases held output.
 func clearTerminal(out *printer) tea.Cmd {
 	return tea.Sequence(
+		// Let the frame that leaves the alternate screen (resume picker,
+		// pager) reach the terminal first; cleared there, the erase would
+		// hit the alt buffer and leave the main scrollback intact.
+		func() tea.Msg { time.Sleep(frameFlush); return nil },
 		tea.Raw("\x1b[H\x1b[2J\x1b[3J"),
 		func() tea.Msg { return tea.ClearScreen() },
 		func() tea.Msg {
-			time.Sleep(50 * time.Millisecond) // a frame flush
+			time.Sleep(frameFlush)
 			out.hold(holdClear, false)
 			return nil
 		},
 	)
 }
+
+// frameFlush is long enough for a pending frame to reach the terminal.
+const frameFlush = 50 * time.Millisecond
 
 type reflowMsg struct{ gen int }
 

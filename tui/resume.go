@@ -116,7 +116,7 @@ func (p *resumePicker) Lines(width, maxHeight int, cwd string, st *Styles) []Lin
 
 	const updW, msgW = 14, 6
 	out = append(out, L(P("    "), S(fmt.Sprintf("%-*s%*s  ", updW, "Updated", msgW-2, "Msgs"), st.Dim), S("Conversation", st.Dim)))
-	rows := max(3, min(12, maxHeight-len(out)-3))
+	rows := max(3, maxHeight-len(out)-3)
 	if len(p.matches) == 0 {
 		out = append(out, L(P("    "), S("no sessions match", st.Dim.Italic(true))))
 	}
@@ -225,22 +225,29 @@ func (m *model) onSessionList(list []protocol.SessionSummary) {
 		m.commit(infoCell(m.st, "No saved sessions to resume"))
 		return
 	}
-	m.picker = newResumePicker(list, m.pickerStartup)
+	m.setPicker(newResumePicker(list, m.pickerStartup))
 }
 
 func (m *model) handlePickerKey(k tea.KeyPressMsg, keyAct string) tea.Cmd {
 	act, id := m.picker.handleKey(k, 10, keyAct)
 	switch act {
 	case pickerResume:
-		m.picker = nil
+		m.setPicker(nil)
 		return m.requestResume(id)
 	case pickerCancel:
-		m.picker = nil
+		m.setPicker(nil)
 		m.showPendingHeader()
 	case pickerQuit:
 		return m.quit()
 	}
 	return nil
+}
+
+// setPicker opens (p != nil) or closes the resume picker. It is drawn in the
+// alternate screen, so scrollback output waits while it is open.
+func (m *model) setPicker(p *resumePicker) {
+	m.picker = p
+	m.out.hold(holdPicker, p != nil)
 }
 
 func (m *model) showPendingHeader() {
@@ -253,7 +260,7 @@ func (m *model) showPendingHeader() {
 
 // onSessionConfigured prints the header for a new session, or the header
 // plus the replayed transcript for a resumed one.
-func (m *model) onSessionConfigured(e protocol.SessionConfigured) {
+func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 	if e.AgentName != "" {
 		m.agent = e.AgentName
 	}
@@ -264,29 +271,42 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) {
 	}
 	m.tokensUsed = 0
 	m.dropTurnPrompts() // pickers/approvals of the previous session are stale
+	var cmd tea.Cmd
+	if e.Resumed && m.printedAny && !m.stream.active {
+		// Switching to a resumed session from inside another one: like
+		// Codex (clear_for_thread_switch), clear the screen and scrollback
+		// and replay from the top, so the composer ends up below the
+		// resumed conversation instead of wherever the old frame was.
+		m.committed, m.sessionStart, m.lastHeader = nil, 0, nil
+		m.printedAny, m.sepPrinted = false, false
+		m.out.reset()
+		m.out.hold(holdClear, true)
+		cmd = clearTerminal(m.out)
+	}
 	h := headerCell{m.agent, m.version, m.model, m.effort, m.cwd}
 	if e.Resumed && len(e.InitialMessages) == 0 {
 		// Resumed an empty session: nothing to replay.
 		m.awaitingResume = false
 		m.deferHeader, m.pendingHeader = false, nil
 		m.commit(h)
-		return
+		return cmd
 	}
 	if len(e.InitialMessages) == 0 {
 		if m.deferHeader {
 			m.pendingHeader = &h
-			return
+			return cmd
 		}
 		m.commit(h)
-		return
+		return cmd
 	}
 	m.awaitingResume = false
 	m.deferHeader, m.pendingHeader = false, nil
-	m.picker = nil
+	m.setPicker(nil)
 	m.commit(h)
 	m.replay(e.InitialMessages)
 	m.commit(textCell{bullet: S("↻", m.st.Accent), body: L(S("Resumed session ", m.st.Dim), S(e.SessionID, m.st.Plain),
 		S(fmt.Sprintf(" · %d events · continue below", len(e.InitialMessages)), m.st.Dim))})
+	return cmd
 }
 
 // onSessionUpdated applies settings changed mid-session. Like Codex, a

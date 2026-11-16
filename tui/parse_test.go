@@ -243,7 +243,13 @@ func TestCodeHighlight(t *testing.T) {
 }
 
 func TestNotATable(t *testing.T) {
+	// One delimiter cell for two header cells: not a table but a setext
+	// heading (as pulldown-cmark parses it).
 	got := plainMD(RenderMarkdown("a | b\n---", newStyles(), 80))
+	if len(got) != 1 || got[0] != "## a | b" {
+		t.Errorf("pipe line + underline: %q", got)
+	}
+	got = plainMD(RenderMarkdown("a | b\n\n---", newStyles(), 80))
 	if len(got) != 3 || got[2] != "———" {
 		t.Errorf("pipe line + rule became a table: %q", got)
 	}

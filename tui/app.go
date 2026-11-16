@@ -84,6 +84,7 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	m := newModel(ctx, opts)
+	m.bsIsDEL = backspaceSendsDEL()
 	if testHookModel != nil {
 		testHookModel(m)
 	}
@@ -186,6 +187,7 @@ type model struct {
 	replaying      bool
 
 	kittyKeys bool // terminal reports Shift+Enter distinctly
+	bsIsDEL   bool // Backspace sends DEL, so 0x08 is Ctrl+Backspace (keynorm.go)
 	ticking   bool
 
 	// status line and window title (/statusline, /title)
@@ -482,6 +484,12 @@ func (m *model) wrapSegment(md []mdLine, first bool) []Line {
 	return wrapMarkdown(md, m.width, lead, L(P("  ")))
 }
 
+// readyRows is the part of rows (wrapped from md) that may be printed:
+// the rows rendered from md[hold:] stay in the live tail.
+func (m *model) readyRows(md []mdLine, rows []Line, hold int) []Line {
+	return rows[:len(rows)-len(wrapMarkdown(md[hold:], m.width, L(P("  ")), L(P("  "))))]
+}
+
 // streamSegment renders the source after base.
 func (m *model) streamSegment(src string) []Line {
 	return m.segmentRows(src[m.stream.base:], m.stream.base == 0)
@@ -504,10 +512,13 @@ func (m *model) streamDelta(d string) {
 	if i <= m.stream.emittedSrc {
 		return
 	}
-	md, split := renderMarkdownSplit(src[m.stream.base:i], m.st, m.width-2)
+	md, split, hold := renderMarkdownSplit(src[m.stream.base:i], m.st, m.width-2)
 	rows := m.wrapSegment(md, m.stream.base == 0)
-	if n := m.stream.baseRows + len(rows); n > m.stream.emitted {
-		fresh := rows[m.stream.emitted-m.stream.baseRows:]
+	// A trailing paragraph stays in the live tail: a setext underline on
+	// the next line would make it a heading.
+	ready := m.readyRows(md, rows, hold)
+	if n := m.stream.baseRows + len(ready); n > m.stream.emitted {
+		fresh := ready[m.stream.emitted-m.stream.baseRows:]
 		m.printLines(fresh, m.stream.emitted == 0)
 		m.stream.printed = append(m.stream.printed, fresh...)
 		m.stream.emitted = n
@@ -529,6 +540,9 @@ func (m *model) advanceStreamBase(src string, end int, line int, rows []Line) {
 	tail := m.segmentRows(src[k:end], false)
 	if len(tail) == 0 || len(tail) >= len(rows) || renderLines(tail) != renderLines(rows[len(rows)-len(tail):]) {
 		return // e.g. a fence just opened: wait for its first rendered row
+	}
+	if m.stream.baseRows+len(rows)-len(tail) > m.stream.emitted {
+		return // rows before the new base are still held back (not printed)
 	}
 	m.stream.baseRows += len(rows) - len(tail)
 	m.stream.base = k
@@ -568,7 +582,8 @@ func (m *model) rewrapStream() {
 	m.stream.base, m.stream.baseRows = 0, 0
 	m.stream.printed = nil
 	if m.stream.emitted > 0 {
-		m.stream.printed = m.streamRows(m.stream.src.String()[:m.stream.emittedSrc])
+		md, _, hold := renderMarkdownSplit(m.stream.src.String()[:m.stream.emittedSrc], m.st, m.width-2)
+		m.stream.printed = m.readyRows(md, m.wrapSegment(md, true), hold)
 	}
 	m.stream.emitted = len(m.stream.printed)
 	m.stream.tailCache = tailCache{}
@@ -767,7 +782,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyPressMsg:
-		return m, tea.Batch(m.handleKey(msg), m.ensureTick())
+		return m, tea.Batch(m.handleKey(m.normalizeKey(msg)), m.ensureTick())
 	}
 	return m, nil
 }
@@ -1178,15 +1193,21 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 		case !p.until.IsZero() && time.Now().After(p.until):
 			// expired: handle the key on its own
 		default:
-			if act = m.keys.completeChord(p, spec); act == "" {
+			act = m.keys.completeChord(p, spec)
+			for _, alt := range m.legacyAlternates(spec) {
+				if act == "" {
+					act = m.keys.completeChord(p, alt)
+				}
+			}
+			if act == "" {
 				return nil // not a chord: swallowed, as in Codex
 			}
 		}
 	}
 	if act == "" && spec != "" {
-		if m.keys.startsChord(spec, ctxs...) {
-			p := &pendingChord{first: spec, ctxs: ctxs, at: time.Now()}
-			if spec != m.keys.leader {
+		startChord := func(first string) tea.Cmd {
+			p := &pendingChord{first: first, ctxs: ctxs, at: time.Now()}
+			if first != m.keys.leader {
 				p.until = p.at.Add(time.Second)
 			}
 			m.chord = p
@@ -1196,7 +1217,20 @@ func (m *model) handleKey(k tea.KeyPressMsg) tea.Cmd {
 			}
 			return tea.Batch(cmds...)
 		}
+		if m.keys.startsChord(spec, ctxs...) {
+			return startChord(spec)
+		}
 		act = m.keys.match(spec, ctxs...)
+		// A legacy terminal can't tell some keys apart (keynorm.go).
+		for _, alt := range m.legacyAlternates(spec) {
+			if act != "" {
+				break
+			}
+			if m.keys.startsChord(alt, ctxs...) {
+				return startChord(alt)
+			}
+			act = m.keys.match(alt, ctxs...)
+		}
 	}
 	return m.dispatchKey(k, act)
 }

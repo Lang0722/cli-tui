@@ -19,13 +19,14 @@ type mdLine struct {
 }
 
 var (
-	reHeading  = regexp.MustCompile(`^(#{1,6})\s+(.*)$`)
+	reHeading  = regexp.MustCompile(`^(#{1,6})(?:[ \t]+(.*))?$`)
+	reSetext   = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
 	reBullet   = regexp.MustCompile(`^(\s*)([-*+])\s+(.*)$`)
 	reOrdered  = regexp.MustCompile(`^(\s*)(\d+)[.)]\s+(.*)$`)
 	reTask     = regexp.MustCompile(`^\[([ xX])\]\s+(.*)$`)
 	reFence    = regexp.MustCompile("^ {0,3}(```+|~~~+)\\s*([\\w+#.-]*)")
 	reRule     = regexp.MustCompile(`^\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$`)
-	reURL      = regexp.MustCompile(`https?://[^\s<>()\[\]]+[^\s<>()\[\].,;:!?'"]`)
+	reURL      = regexp.MustCompile(`https?://[^\s<>()\[\]\x{E000}-\x{E006}]+[^\s<>()\[\].,;:!?'"\x{E000}-\x{E006}]`) // math markers (math.go) end a URL
 	reTableSep = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$`)
 	reQuote    = regexp.MustCompile(`^\s*((?:>\s?)+)(.*)$`)
 )
@@ -38,25 +39,43 @@ var (
 // complete (see tableHoldback), so rows for a prefix of the source stay
 // stable as more text arrives.
 func RenderMarkdown(src string, st *Styles, width int) []mdLine {
-	return renderBlocks(strings.Split(sanitize(src), "\n"), st, width, nil)
+	text, _, _ := scanMath(sanitize(src), false)
+	return renderBlocks(strings.Split(text, "\n"), st, width, nil)
 }
 
-// renderMarkdownSplit renders like RenderMarkdown and also returns the
+// mdSplit reports where a streamed render may be cut (renderMarkdownSplit).
+type mdSplit struct {
+	clean int // last source line (> 0) starting an independent block, or 0
+	// hold is the first row that may still change: a trailing paragraph
+	// that a setext underline ("---") on the next line would turn into a
+	// heading, or the block holding an unclosed display formula's opener
+	// (see scanMath); len(rows) if none.
+	hold     int
+	nested   bool        // inside a blockquote (display math is laid out nested)
+	noSplit  []mathRange // source lines (from, to] inside formulas or code (scanMath)
+	holdLine int         // source line of an unclosed display opener, or -1
+}
+
+// renderMarkdownSplit renders like RenderMarkdown and also reports the
 // last source line (> 0) that starts a block independently of everything
 // before it, or 0: rendering from that line on yields the same rows as
-// the tail of the whole render (after the separator row).
-func renderMarkdownSplit(src string, st *Styles, width int) ([]mdLine, int) {
-	clean := 0
-	out := renderBlocks(strings.Split(sanitize(src), "\n"), st, width, &clean)
-	return out, clean
+// the tail of the whole render (after the separator row). Rows from hold
+// on may still change when the next line arrives.
+func renderMarkdownSplit(src string, st *Styles, width int) (out []mdLine, clean, hold int) {
+	text, noSplit, holdLine := scanMath(sanitize(src), true)
+	sp := mdSplit{noSplit: noSplit, holdLine: holdLine}
+	out = renderBlocks(strings.Split(text, "\n"), st, width, &sp)
+	return out, sp.clean, sp.hold
 }
 
-func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
+func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 	var out []mdLine
 	last := ""            // kind of the previous block
 	sawBlank := false     // a blank source line since the previous block
 	var listIndents []int // source indents of the open list levels
 	listContent := -1     // source content column of the last list item
+	paraStart := -1       // first row of the open top-level paragraph
+	var paraSrc []string  // its source lines (a setext underline restyles them)
 
 	// start begins a new block of kind k, inserting the separator row.
 	start := func(k string) {
@@ -66,13 +85,31 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 		last, sawBlank = k, false
 	}
 
+	// heldRow is the first row of the iteration that consumed line
+	// sp.holdLine (an unclosed display opener), or -1.
+	heldRow, iterRow := -1, 0
+	holdAt := func(i int) {
+		if sp != nil && sp.holdLine >= 0 && heldRow < 0 && i > sp.holdLine {
+			heldRow = iterRow
+		}
+	}
 	for i := 0; i < len(lines); i++ {
+		holdAt(i)
+		iterRow = len(out)
 		raw := lines[i]
+		if raw == mathPadLine {
+			continue // a line inside a display formula (math.go)
+		}
 		trimmed := strings.TrimSpace(raw)
 		// independent: this block doesn't depend on the parser state
 		independent := func() {
-			if clean != nil && i > 0 {
-				*clean = i
+			if sp != nil && i > 0 {
+				for _, r := range sp.noSplit {
+					if r.start < i && i <= r.end {
+						return
+					}
+				}
+				sp.clean = i
 			}
 		}
 
@@ -101,7 +138,10 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 			var code []string
 			j := i + 1
 			for ; j < len(lines); j++ {
-				lj := unindent(lines[j])
+				if lines[j] == mathPadLine {
+					continue // restored with its formula's first line
+				}
+				lj := restoreMathSource(unindent(lines[j]))
 				if c := reFence.FindStringSubmatch(lj); c != nil && c[1][0] == marker[0] && len(c[1]) >= len(marker) && strings.TrimSpace(lj) == c[1] {
 					break
 				}
@@ -143,7 +183,9 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 				}
 				// lazy continuation: plain text right after quoted text
 				if t != "" && len(inner) > 0 && strings.TrimSpace(inner[len(inner)-1]) != "" &&
-					!reBullet.MatchString(lines[j]) && !reOrdered.MatchString(lines[j]) && !reHeading.MatchString(t) && reFence.FindStringIndex(lines[j]) == nil {
+					!reBullet.MatchString(lines[j]) && !reOrdered.MatchString(lines[j]) && !reHeading.MatchString(t) && reFence.FindStringIndex(lines[j]) == nil &&
+					!reRule.MatchString(lines[j]) && !reSetext.MatchString(lines[j]) {
+					// (an underline can't be lazy: "> a\n---" is a quote and a rule)
 					inner = append(inner, t)
 					continue
 				}
@@ -153,7 +195,7 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 			start("quote")
 			listIndents = listIndents[:0]
 			q := st.Green
-			for _, r := range renderBlocks(inner, st, max(1, width-2), nil) {
+			for _, r := range renderBlocks(inner, st, max(1, width-2), &mdSplit{nested: true, holdLine: -1}) {
 				line := append(L(S("> ", q)), r.Line...)
 				hang := append(L(S("> ", q)), r.Hang...)
 				out = append(out, mdLine{Line: line, Hang: hang, Fixed: r.Fixed, Keep: r.Keep || len(r.Line) == 0})
@@ -164,12 +206,12 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 
 		// Table: a row with pipes followed by a delimiter row with the same
 		// number of cells.
-		if strings.Contains(raw, "|") && i+1 < len(lines) && reTableSep.MatchString(lines[i+1]) &&
+		if strings.Contains(raw, "|") && !strings.HasPrefix(trimmed, mathDispOpen) && i+1 < len(lines) && reTableSep.MatchString(lines[i+1]) &&
 			len(splitRow(lines[i+1])) == len(splitRow(raw)) {
 			aligns := parseAligns(lines[i+1])
 			j := i + 2
 			rows := [][]string{splitRow(raw)}
-			for ; j < len(lines) && strings.Contains(lines[j], "|") && strings.TrimSpace(lines[j]) != ""; j++ {
+			for ; j < len(lines) && strings.Contains(lines[j], "|") && strings.TrimSpace(lines[j]) != "" && !strings.HasPrefix(strings.TrimSpace(lines[j]), mathDispOpen); j++ {
 				rows = append(rows, splitRow(lines[j]))
 			}
 			independent()
@@ -185,6 +227,24 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 			listContent = -1
 		}
 		switch {
+		case last == "para" && !sawBlank && paraStart >= 0 && reSetext.MatchString(raw):
+			// Setext heading: the paragraph above becomes an h1 ("===")
+			// or h2 ("---") and is drawn like an ATX one ("# Title").
+			level := 1
+			if strings.TrimSpace(raw)[0] == '-' {
+				level = 2
+			}
+			text := paraSrc
+			out, paraStart, paraSrc = out[:paraStart], -1, nil
+			last = "heading"
+			hs := headingStyle(level, st)
+			for k, t := range text {
+				l := Line{}
+				if k == 0 {
+					l = L(S(strings.Repeat("#", level)+" ", hs))
+				}
+				out = append(out, mdLine{Line: append(l, inline(t, hs, st)...)})
+			}
 		case reRule.MatchString(raw): // "* * *" is a rule, not a list item
 			independent()
 			start("rule")
@@ -194,14 +254,10 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 			independent()
 			start("heading")
 			listIndents = listIndents[:0]
-			m := reHeading.FindStringSubmatch(trimmed)
-			hs := st.Bold
-			if len(m[1]) == 1 {
-				hs = hs.Underline(true)
-			}
-			l := L(S(m[1]+" ", hs))
-			l = append(l, inline(m[2], hs, st)...)
-			out = append(out, mdLine{Line: l})
+			level, text := parseHeading(trimmed)
+			hs := headingStyle(level, st)
+			l := L(S(strings.Repeat("#", level)+" ", hs))
+			out = append(out, mdLine{Line: append(l, inline(text, hs, st)...)})
 		case isList:
 			if last != "list" {
 				independent()
@@ -241,6 +297,12 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 				body = t[2]
 			}
 			pre := L(P(indent), S(marker, markerStyle))
+			if reHeading.MatchString(body) { // "- ## Title"
+				level, text := parseHeading(body)
+				hs := headingStyle(level, st)
+				pre = append(pre, S(strings.Repeat("#", level)+" ", hs))
+				body, bodyStyle = text, hs
+			}
 			out = append(out, mdLine{Line: append(pre, inline(body, bodyStyle, st)...), Hang: L(P(indent + strings.Repeat(" ", strw(marker))))})
 		default:
 			// Paragraph text. A line right after a list item (no blank) is
@@ -248,8 +310,9 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 			// indented paragraph continues the item, otherwise the list ends.
 			lead := raw[:len(raw)-len(strings.TrimLeft(raw, " "))]
 			hang := L(P(lead))
+			inList := last == "list" && (!sawBlank || len(lead) >= 2)
 			switch {
-			case last == "list" && (!sawBlank || len(lead) >= 2):
+			case inList:
 				n := len(listIndents)
 				lead = strings.Repeat(" ", 4*(n-1)+2)
 				hang = L(P(lead))
@@ -263,15 +326,69 @@ func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 				independent()
 				start("para")
 				listIndents = listIndents[:0]
+				paraStart, paraSrc = len(out), nil
+			}
+			paraSrc = append(paraSrc, trimmed)
+			if mraw, formula, pending, ok := parseDisplayMarker(trimmed); ok {
+				// Display math: its own rows, never wrapped when spatial.
+				rows, spatial := displayMathRows(mraw, formula, pending, inList || sp != nil && sp.nested, width)
+				for _, r := range rows {
+					if strings.TrimSpace(r) == "" {
+						out = append(out, mdLine{Keep: true}) // a blank line of source
+						continue
+					}
+					out = append(out, mdLine{Line: L(P(lead), S(r, st.Plain)), Hang: hang, Fixed: spatial})
+				}
+				continue
 			}
 			l := L(P(lead))
 			out = append(out, mdLine{Line: append(l, inline(trimmed, st.Plain, st)...), Hang: hang})
 		}
 	}
+	holdAt(len(lines))
 	for len(out) > 0 && len(out[len(out)-1].Line) == 0 && !out[len(out)-1].Fixed && !out[len(out)-1].Keep {
 		out = out[:len(out)-1]
 	}
+	if sp != nil {
+		sp.hold = len(out)
+		if last == "para" && !sawBlank && paraStart >= 0 && paraStart < len(out) {
+			sp.hold = paraStart
+		}
+		if heldRow >= 0 {
+			for heldRow < len(out) && len(out[heldRow].Line) == 0 && !out[heldRow].Fixed && !out[heldRow].Keep {
+				heldRow++ // the separator row above the block is final
+			}
+			sp.hold = min(sp.hold, heldRow)
+		}
+	}
 	return out
+}
+
+// parseHeading splits an ATX heading ("## Title ##") into its level and
+// text, dropping the optional closing run of "#".
+func parseHeading(s string) (int, string) {
+	m := reHeading.FindStringSubmatch(s)
+	text := strings.TrimSpace(m[2])
+	if t := strings.TrimRight(text, "#"); t == "" {
+		text = ""
+	} else if t != text && (strings.HasSuffix(t, " ") || strings.HasSuffix(t, "\t")) {
+		text = strings.TrimSpace(t)
+	}
+	return len(m[1]), text
+}
+
+// headingStyle is Codex's per-level heading style: h1 bold underlined,
+// h2 bold, h3 bold italic, h4–h6 italic.
+func headingStyle(level int, st *Styles) lipgloss.Style {
+	switch level {
+	case 1:
+		return st.Bold.Underline(true)
+	case 2:
+		return st.Bold
+	case 3:
+		return st.Bold.Italic(true)
+	}
+	return st.Plain.Italic(true)
 }
 
 // tableHoldback returns how much of the completed source (up to the last
@@ -528,9 +645,34 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 	for i := 0; i < len(s); {
 		c := s[i]
 		switch {
-		case c == '\\' && i+1 < len(s) && strings.ContainsRune("\\`*_[]()#+-.!~", rune(s[i+1])):
+		case c == '\\' && i+1 < len(s) && strings.ContainsRune(`!"#$%&'()*+,-./:;<=>?@[\]^_{|}~`+"`", rune(s[i+1])):
+			// CommonMark: any ASCII punctuation can be escaped.
 			buf.WriteByte(s[i+1])
 			i += 2
+		case c == 0xEE && i+2 < len(s) && s[i+1] == 0x80 && s[i+2] >= 0x80 && s[i+2] <= 0x86 && !strings.HasPrefix(s[i:], mathLitOpen) && !strings.HasPrefix(s[i:], mathDispOpen):
+			// A stray math marker (math.go) is never shown.
+			if strings.HasPrefix(s[i:], mathNewline) {
+				buf.WriteByte(' ')
+			}
+			i += 3
+		case c == 0xEE && strings.HasPrefix(s[i:], mathLitOpen):
+			// A formula (math.go): literal text, no markdown inside.
+			end := strings.Index(s[i:], mathLitClose)
+			if end < 0 {
+				end = len(s) - i
+			}
+			end = min(len(s), i+end+len(mathLitClose))
+			buf.WriteString(expandMathMarkers(s[i:end]))
+			i = end
+		case c == 0xEE && strings.HasPrefix(s[i:], mathDispOpen):
+			// A display formula where only text fits: its source.
+			end := strings.Index(s[i:], mathDispClose)
+			if end < 0 {
+				end = len(s) - i
+			}
+			end = min(len(s), i+end+len(mathDispClose))
+			buf.WriteString(expandMathMarkers(s[i:end]))
+			i = end
 		case c == '`':
 			n := 0
 			for i+n < len(s) && s[i+n] == '`' {
@@ -544,7 +686,7 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 				continue
 			}
 			flush()
-			code := s[i+n : i+n+end]
+			code := restoreMathSource(s[i+n : i+n+end])
 			if strings.HasPrefix(code, " ") && strings.HasSuffix(code, " ") && len(code) > 1 {
 				code = code[1 : len(code)-1]
 			}
@@ -613,6 +755,7 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 		case c == '[':
 			if label, url, n, ok := parseLink(s[i:]); ok {
 				flush()
+				url = restoreMathSource(url)
 				ls := st.Link.Inherit(cur()).Hyperlink(url)
 				out = append(out, inline(label, ls, st)...)
 				if !st.LinkLabelOnly && label != url && !strings.HasPrefix(url, "#") {

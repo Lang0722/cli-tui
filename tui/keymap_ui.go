@@ -701,6 +701,9 @@ func (m *model) keymapLines(width, height int) []Line {
 			instr = "Press the key that follows the configured leader. Esc cancels."
 		}
 		out = append(out, L(P("  "), S(instr, st.Plain)))
+		if !m.kittyKeys {
+			out = append(out, Wrap(L(dim(legacyKeysNote)), width, L(P("  ")), L(P("  ")))...)
+		}
 		if u.captureErr != "" {
 			out = append(out, Wrap(L(S("Error: "+u.captureErr, st.Red)), width, L(P("  ")), L(P("  ")))...)
 		}
@@ -719,11 +722,17 @@ func (m *model) keymapLines(width, height int) []Line {
 		}
 		k := u.lastKey
 		spec, err := keySpec(k)
+		if !m.kittyKeys {
+			out = append(out, Wrap(L(dim(legacyKeysNote)), width, L(P("  ")), L(P("  ")))...)
+		}
 		out = append(out, L(P("  "), dim("Detected: "), S(k.String(), st.Plain)))
 		if err != nil {
 			out = append(out, L(P("  "), dim("Config key: "), S(err.Error(), st.Red)).Truncate(width))
 		} else {
 			out = append(out, L(P("  "), dim("Config key: "), S(spec, st.Plain)))
+			if alt := m.shiftedLegacySpec(spec); alt != "" {
+				out = append(out, L(P("  "), dim("Also matches: "), S(alt, st.Plain), dim(" (when "+spec+" is unbound)")).Truncate(width))
+			}
 		}
 		out = append(out, L(P("  "), dim(fmt.Sprintf("Raw event: code=%q, modifiers=%s, text=%q", k.Code, modString(k.Mod), k.Text))).Truncate(width), Line{})
 		out = append(out, L(P("  "), dim("Assigned actions:")))

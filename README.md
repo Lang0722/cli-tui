@@ -67,6 +67,7 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | anything | a markdown chat answer |
 | `demo` / `fix` / `edit` | a full coding turn: exploration, plan, patch approval, command approval, tool call, summary |
 | `markdown` / `table` | tables, highlighted code, nested and task lists, quotes, links |
+| `math` / `latex` | inline and display TeX formulas rendered in Unicode |
 | `question` | a mid-turn question picker (choose, or type your own answer) |
 | `subagents` / `agents` | two helper agents: spawn, a worker's approval from its own thread, wait, close (watch them with Alt+←/→ or `/subagents`) |
 | `delegate` | a parent-owned `/root/reviewer` agent (activity rows, read-only view) |
@@ -194,7 +195,7 @@ These are the defaults. Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+V / Alt+V and the
 | Esc | interrupt; close a popup. With an empty composer, Esc Esc opens backtrack: ←/→ pick a prompt, Enter rewinds. |
 | Ctrl+C | clear input → interrupt → press twice to quit |
 | ↑/↓, Ctrl+R / Ctrl+S | history; reverse-i-search |
-| Ctrl+W, Alt+Backspace, Ctrl+Backspace, Ctrl+U/K, Alt+D, Ctrl+Y | word and line kills, then yank |
+| Ctrl+W, Alt+Backspace, Ctrl+Backspace, Ctrl+U/K, Alt+D, Ctrl+Delete, Ctrl+Y | word and line kills, then yank |
 | Ctrl+V / Alt+V | paste a clipboard image (needs `wl-paste` or `xclip`) |
 | Ctrl+G | edit the prompt in `$VISUAL` / `$EDITOR` |
 | Shift+← / Alt+↑ | pop the last queued message back for editing |
@@ -338,6 +339,20 @@ exactly what your terminal sends for a key. Contexts are `global`, `chat`,
   background, read via OSC 11.
 - **Links** are OSC 8 hyperlinks showing only their label (Ctrl+click opens
   them).
+- **Keys VTE can't tell apart.** VTE has neither the kitty keyboard protocol
+  nor xterm's modifyOtherKeys, so some combinations arrive as the bytes of
+  others:
+  - Ctrl+Backspace sends ^H, the same byte as Ctrl+H. When the terminal's
+    Backspace sends DEL (the default; checked through the terminal's erase
+    character), ^H is taken as Ctrl+Backspace and deletes the previous word.
+    A custom `ctrl-h` binding still fires when `ctrl-backspace` is unbound.
+  - Ctrl+Shift+*letter* sends the same byte as Ctrl+*letter*. A
+    `ctrl-shift-<letter>` binding (and `ctrl-alt-shift-<letter>`) therefore
+    also fires on Ctrl+*letter* when nothing in the active context is bound
+    to Ctrl+*letter* itself. `/keymap` says so when it captures a key.
+    Ctrl+Shift with arrows, Delete, Home/End and function keys is reported
+    distinctly and works as is.
+  - Ctrl+Delete (delete the next word) is reported distinctly.
 - **Clipboard.** VTE ignores OSC 52, so `/copy` and Ctrl+O use `wl-copy`,
   `xclip` or `xsel`.
 - **Notifications.** When the window is unfocused, a finished turn or an
@@ -397,7 +412,17 @@ snapshots.
   backtrack and rewind; resize reflow.
 - **Rendering:**
   - Markdown with tables (falling back to records when narrow), task lists,
-    nested lists, quotes, rules and highlighted code.
+    nested lists, quotes, rules and highlighted code. Headings keep their
+    `#` marks and use Codex's per-level styles (h1 bold underlined, h2 bold,
+    h3 bold italic, h4–h6 italic); setext (`===` / `---` underlined)
+    headings, closing `#`s and headings in list items are supported.
+  - TeX math, as in Codex: `$…$` and `\(…\)` inline, standalone `$$…$$`
+    and `\[…\]` display formulas, laid out in Unicode (scripts, fractions,
+    roots, `\mathbb`, accents, `\sum`/`\int` limits, `aligned` and
+    `pmatrix`, `\boxed`, …). Code, links and HTML are left alone, and so are
+    `$5`, `$HOME` and `echo $$`. Unsupported formulas, and display layouts
+    wider than the terminal, stay as written. While streaming, an unclosed
+    display formula stays in the live area until it closes.
   - Diffs with tints and highlighting.
 - **Terminal and session:** title, notifications, resume, `/copy`,
   `/export`, `/clear`.

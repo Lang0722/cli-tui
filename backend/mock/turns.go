@@ -91,6 +91,8 @@ func (t *turn) run(text string) {
 		ok = t.toolDemo(text)
 	case containsAny(lower, "markdown", "table"):
 		ok = t.markdownShowcase()
+	case containsAny(lower, "math", "latex", "formula", "equation"):
+		ok = t.mathShowcase()
 	case containsAny(lower, "question", "ask me", "choose"):
 		ok = t.question()
 	case containsAny(lower, "help", "what can you"):
@@ -136,6 +138,7 @@ func isGreeting(s string) bool {
 
 const tryList = "- **chat** about anything: I answer with markdown\n" +
 	"- say **markdown** or **table**: tables, code, lists, links\n" +
+	"- say **math** (or *latex*): inline and display formulas\n" +
 	"- say **question**: I ask you to pick an option (or type your own)\n" +
 	"- `!ls` runs a shell command (\"You ran\"); `/model` opens a picker\n" +
 	"- **Esc Esc** to rewind to an earlier prompt, **Ctrl+T** for the transcript\n" +
@@ -304,6 +307,26 @@ func (t *turn) toolDemo(text string) bool {
 		"```go\nctx, cancel := context.WithTimeout(ctx, s.timeout)\ndefer cancel()\n```\n\n" +
 		"Run `go test ./...` to verify. You said: _" + text + "_"
 	return t.say(final)
+}
+
+func (t *turn) mathShowcase() bool {
+	if !t.stream("**Typesetting formulas**", true) || !t.sleep(300*time.Millisecond) {
+		return false
+	}
+	md := "## Math rendering\n\n" +
+		"Inline math such as $\\alpha^2 + \\beta_{10}$ on $\\mathbb{R}^n$, \\(\\sqrt{x^2+y^2}\\) or " +
+		"$\\frac{a}{b}$ is drawn with Unicode; money ($5 and $10) and shell variables ($HOME) are left alone.\n\n" +
+		"The quadratic formula:\n\n$$\nx=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}\n$$\n\n" +
+		"\\[\n\\int_0^1 x^2\\,dx=\\frac{1}{3}\n\\]\n\n" +
+		"$$\\sum_{i=1}^{N} x_i \\le \\prod_{j=0}^{n} y_j$$\n\n" +
+		"$$A=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$$\n\n" +
+		"- In a list, display math stays compact:\n\n  $$\\int_0^1 x\\,dx$$\n\n" +
+		"Unsupported TeX stays as written: $\\unknown{x}$, and code is never touched: `$\\alpha$`."
+	if !t.say(md) {
+		return false
+	}
+	t.addTokens(1100)
+	return true
 }
 
 func (t *turn) markdownShowcase() bool {

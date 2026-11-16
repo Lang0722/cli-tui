@@ -18,11 +18,22 @@ var mdPool = []string{
 	"\\* escaped", "2**3**4", "~~strike~~", "http://example.com/autolink",
 }
 
-func randomMarkdown(r *rand.Rand) string {
+// mathPool mixes display and inline formulas with markdown they interact
+// with (math.go).
+var mathPool = []string{
+	"", "", "$$", "$$", "\\[", "\\]", "x^2 + y^2", "\\frac{a}{b}", "x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}",
+	"Inline $\\alpha^2$ and \\(\\beta_1\\) text.", "$$\\sum_{i=1}^N x_i$$", "  $$\\int_0^1 x\\,dx$$", "echo $$",
+	"$5 and $10", "$$ trailing", "- item with $x_1$", "> quote $\\alpha$", "Paragraph", "---", "```", "`$x$` code",
+	"$$A=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$$", "## Heading $\\gamma$", "\\begin{aligned}x&=1\\\\y&=2\\end{aligned}",
+}
+
+func randomMarkdown(r *rand.Rand) string { return randomFrom(r, mdPool) }
+
+func randomFrom(r *rand.Rand, pool []string) string {
 	n := 5 + r.Intn(60)
 	var b strings.Builder
 	for i := 0; i < n; i++ {
-		b.WriteString(mdPool[r.Intn(len(mdPool))])
+		b.WriteString(pool[r.Intn(len(pool))])
 		b.WriteString("\n")
 	}
 	if r.Intn(2) == 0 {
@@ -39,6 +50,33 @@ func TestStreamIncrementalMatchesFull(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		docs = append(docs, randomMarkdown(r))
 	}
+	checkStreamIncremental(t, r, docs)
+}
+
+// Math (math.go) streams like the rest, and its markers never leak.
+func TestStreamIncrementalMathMatchesFull(t *testing.T) {
+	r := rand.New(rand.NewSource(2))
+	mixed := append(append([]string{}, mathPool...), mdPool...)
+	var docs []string
+	for i := 0; i < 400; i++ {
+		pool := mathPool
+		if i%3 == 0 {
+			pool = mixed
+		}
+		docs = append(docs, randomFrom(r, pool))
+	}
+	for _, d := range docs {
+		for _, l := range RenderMarkdown(d, newStyles(), 40) {
+			if strings.ContainsAny(renderLines([]Line{l.Line}), mathMarkers) {
+				t.Fatalf("marker leaked: %q in %q", l.Line.Plain(), d)
+			}
+		}
+	}
+	checkStreamIncremental(t, r, docs)
+}
+
+func checkStreamIncremental(t *testing.T, r *rand.Rand, docs []string) {
+	t.Helper()
 	for di, src := range docs {
 		for _, width := range []int{60, 100} {
 			m := newTestModel()

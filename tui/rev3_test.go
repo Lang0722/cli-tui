@@ -41,11 +41,12 @@ func TestRevStreamFlushOrder(t *testing.T) {
 	m := newTestModel()
 	ev := func(e protocol.EventMsg) { m.handleEvent(protocol.Event{Msg: e}) }
 	ev(protocol.TaskStarted{})
-	ev(protocol.AgentMessageDelta{Delta: "hello\nworld"})
+	// (a list item: a paragraph line would stay in the live tail)
+	ev(protocol.AgentMessageDelta{Delta: "- hello\nworld"})
 	ev(protocol.TaskComplete{})
 	all := m.out.takeQueued()
 	// the trailing "" is the separator printed with the end of the stream
-	if got := ansiStrip(strings.Join(all, "|")); got != "• hello|  world|" {
+	if got := ansiStrip(strings.Join(all, "|")); got != "• • hello|    world|" {
 		t.Errorf("stream flush order: %q", got)
 	}
 }

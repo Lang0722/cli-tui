@@ -95,8 +95,8 @@ func (t *turn) run(text string) {
 		ok = t.mathShowcase()
 	case containsAny(lower, "question", "ask me", "choose"):
 		ok = t.question()
-	case containsAny(lower, "think", "reason"):
-		ok = t.reasoningShowcase()
+	case containsAny(lower, "investigate", "debug", "look into", "step by step"):
+		ok = t.investigate()
 	case containsAny(lower, "help", "what can you"):
 		ok = t.help()
 	case isGreeting(lower):
@@ -142,7 +142,7 @@ const tryList = "- **chat** about anything: I answer with markdown\n" +
 	"- say **markdown** or **table**: tables, code, lists, links\n" +
 	"- say **math** (or *latex*): inline and display formulas\n" +
 	"- say **question**: I ask you to pick an option (or type your own)\n" +
-	"- say **think** (or *reasoning*): reasoning in sections before the answer\n" +
+	"- say **investigate** (or *debug*): I chat between tool calls, as models do while they work\n" +
 	"- `!ls` runs a shell command (\"You ran\"); `/model` opens a picker\n" +
 	"- **Esc Esc** to rewind to an earlier prompt, **Ctrl+T** for the transcript\n" +
 	"- say **demo** (or *fix*, *edit*): explore files, propose a patch, ask to run tests\n" +
@@ -332,38 +332,46 @@ func (t *turn) mathShowcase() bool {
 	return true
 }
 
-// reasoningShowcase streams reasoning in three sections, each opening
-// with a "**Title**" that becomes the status header, then answers. The
-// reasoning shows as one gray italic block in Ctrl+T (and in the
-// scrollback with -show-reasoning), without the first title.
-func (t *turn) reasoningShowcase() bool {
-	sections := []string{
-		"**Reading the question**\n\nThe user wants to see how **reasoning** is shown. " +
-			"It should read apart from the answer: gray and italic, with `code` keeping its color.",
-		"**Weighing the options**\n\nTwo things matter here:\n\n" +
-			"- the opening title is the status header, so the block doesn't repeat it\n" +
-			"- every section belongs to the same block, not one block per section",
-		"**Drafting the answer**\n\nKeep it short and point at where the reasoning is: " +
-			"the transcript (Ctrl+T), or the scrollback when started with `-show-reasoning`.",
+// investigate is a turn that alternates short messages with tool calls,
+// as a model does while it works: chat, explore, chat, run, chat, explore,
+// chat, answer. Codex renders each in-between message as an ordinary
+// agent message ("• ...") between the tool cells. Nothing needs approval.
+func (t *turn) investigate() bool {
+	think := func(title string) bool {
+		// reasoning: its title is the status header (Ctrl+T shows it)
+		return t.stream("**"+title+"**", true) && t.sleep(400*time.Millisecond)
 	}
-	for i, sec := range sections {
-		if i > 0 {
-			t.emit(protocol.AgentReasoningSectionBreak{})
-		}
-		if !t.stream(sec, true) || !t.sleep(700*time.Millisecond) {
-			return false
-		}
+	chat := func(text string) bool { return t.say(text) && t.sleep(300*time.Millisecond) }
+	sh := func(id, cmd, out string, code int) bool {
+		return t.exec(id, []string{"bash", "-lc", cmd}, out, code)
 	}
-	md := "## Reasoning demo\n\n" +
-		"I thought in three sections before answering. While I did, the status line showed each " +
-		"section's title in turn: *Reading the question*, *Weighing the options*, *Drafting the answer*.\n\n" +
-		"- Press **Ctrl+T** to see the reasoning: one gray italic block above this answer, " +
-		"without the first title (it was the status header)\n" +
-		"- Start with `agenttui -show-reasoning` to have it printed here in the scrollback too"
+	ok := think("Locating the flaky test") &&
+		chat("I'll look for the test that times out and the code it exercises.") &&
+		sh("i1", "rg -n \"TestFetch\" --type go", "internal/fetch/fetch_test.go:18:func TestFetchRetries(t *testing.T) {\n", 0) &&
+		sh("i2", "sed -n '1,60p' internal/fetch/fetch_test.go", "package fetch\n", 0) &&
+		sh("i3", "sed -n '1,80p' internal/fetch/fetch.go", "package fetch\n", 0) &&
+		think("Reproducing the failure") &&
+		chat("`TestFetchRetries` waits on a real `time.Sleep` between retries. Let me run it a few times to see how it fails.") &&
+		sh("i4", "go test ./internal/fetch -run TestFetchRetries -count=5",
+			"--- FAIL: TestFetchRetries (2.01s)\n    fetch_test.go:31: timed out after 2s waiting for 3 attempts\nFAIL\nFAIL\texample/internal/fetch\t6.214s\n", 1) &&
+		think("Checking the backoff") &&
+		chat("It fails when the backoff adds up to more than the test's 2 s deadline. I'll check how the delay is computed.") &&
+		sh("i5", "rg -n \"backoff|Sleep\" internal/fetch", "internal/fetch/fetch.go:44:\tdelay := base << attempt\ninternal/fetch/fetch.go:45:\ttime.Sleep(delay + jitter())\n", 0) &&
+		sh("i6", "sed -n '40,52p' internal/fetch/fetch.go", "\tdelay := base << attempt\n", 0) &&
+		chat("Found it: the delay doubles from **500 ms** and jitter adds up to 250 ms more, so three attempts can take 2.25 s.")
+	if !ok {
+		return false
+	}
+	md := "## Why `TestFetchRetries` is flaky\n\n" +
+		"The retry delay is `base << attempt` plus random jitter, slept for real:\n\n" +
+		"| Attempt | Delay | With jitter |\n|---|---|---|\n| 1 | 500 ms | up to 750 ms |\n| 2 | 1 s | up to 1.25 s |\n\n" +
+		"Three attempts need 1.5–2.25 s, and the test gives up at 2 s.\n\n" +
+		"**Fix:** inject the sleep function (`fetch.WithSleep`) so the test can use a fake clock, " +
+		"or raise the deadline. Say **fix** if you want me to make the change."
 	if !t.say(md) {
 		return false
 	}
-	t.addTokens(900)
+	t.addTokens(4200)
 	return true
 }
 

@@ -301,9 +301,11 @@ func shellQuote(s string) string {
 // send ParsedCommand. Only simple, side-effect-free commands are grouped.
 func parseCommand(cmd []string) []protocol.ParsedCommand {
 	script := displayCommand(cmd)
-	if strings.ContainsAny(script, "\n;&|><`$") {
+	// Shell operators count only outside quotes: rg "a|b" is one search.
+	ops := unquoted(script)
+	if strings.ContainsAny(ops, "\n;&|><`$") {
 		// Allow a trailing "| head"/"| tail"/"| sed -n" filter.
-		if i := strings.Index(script, "|"); i > 0 && !strings.ContainsAny(script, "\n;&><`$") && strings.Count(script, "|") == 1 {
+		if i := strings.Index(ops, "|"); i > 0 && !strings.ContainsAny(ops, "\n;&><`$") && strings.Count(ops, "|") == 1 {
 			rest := strings.Fields(script[i+1:])
 			if len(rest) > 0 && (rest[0] == "head" || rest[0] == "tail" || rest[0] == "wc" || rest[0] == "sort") {
 				script = strings.TrimSpace(script[:i])
@@ -404,6 +406,32 @@ func parseCommand(cmd []string) []protocol.ParsedCommand {
 	}
 	pc.Kind = protocol.CmdUnknown
 	return []protocol.ParsedCommand{pc}
+}
+
+// unquoted is script with the inside of its quotes blanked (same length),
+// so operators inside quoted arguments aren't taken for shell syntax.
+// "$" and "`" still expand inside double quotes, so they are kept there.
+func unquoted(script string) string {
+	b := []byte(script)
+	var q byte
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case q == 0 && c == '\\' && i+1 < len(b):
+			b[i+1] = '_'
+			i++
+		case q == 0 && (c == '\'' || c == '"'):
+			q = c
+		case q != 0 && c == q:
+			q = 0
+		case q == '"' && c == '\\' && i+1 < len(b):
+			b[i], b[i+1] = '_', '_'
+			i++
+		case q != 0 && !(q == '"' && (c == '$' || c == '`')):
+			b[i] = '_'
+		}
+	}
+	return string(b)
 }
 
 var reSedPrint = regexp.MustCompile(`^(\d+|\$)(,(\d+|\$))?p$`)

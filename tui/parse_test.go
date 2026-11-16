@@ -23,6 +23,13 @@ func TestParseCommand(t *testing.T) {
 		{[]string{"bash", "-lc", "go test ./..."}, protocol.CmdUnknown, ""},
 		{[]string{"bash", "-lc", "cat a > b"}, protocol.CmdUnknown, ""},
 		{[]string{"git", "status"}, protocol.CmdUnknown, ""},
+		// operators inside quotes are part of an argument
+		{[]string{"bash", "-lc", `rg -n "backoff|Sleep" internal/fetch`}, protocol.CmdSearch, ""},
+		{[]string{"bash", "-lc", `grep -E 'a|b;c>d' x.go`}, protocol.CmdSearch, ""},
+		{[]string{"bash", "-lc", `rg "a|b" src | head -5`}, protocol.CmdSearch, ""},
+		{[]string{"bash", "-lc", `rg "$HOME" src`}, protocol.CmdUnknown, ""},
+		{[]string{"bash", "-lc", `rg "a" src | xargs rm`}, protocol.CmdUnknown, ""},
+		{[]string{"bash", "-lc", `rg a\|b src; rm x`}, protocol.CmdUnknown, ""},
 	}
 	for _, c := range cases {
 		got := parseCommand(c.cmd)

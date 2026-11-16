@@ -68,6 +68,7 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | `demo` / `fix` / `edit` | a full coding turn: exploration, plan, patch approval, command approval, tool call, summary |
 | `markdown` / `table` | tables, highlighted code, nested and task lists, quotes, links |
 | `math` / `latex` | inline and display TeX formulas rendered in Unicode |
+| `think` / `reasoning` | reasoning in three sections (titles shown in the status line), then an answer; the reasoning is one gray italic block in Ctrl+T, or in the scrollback with `-show-reasoning` |
 | `question` | a mid-turn question picker (choose, or type your own answer) |
 | `subagents` / `agents` | two helper agents: spawn, a worker's approval from its own thread, wait, close (watch them with Alt+←/→ or `/subagents`) |
 | `delegate` | a parent-owned `/root/reviewer` agent (activity rows, read-only view) |

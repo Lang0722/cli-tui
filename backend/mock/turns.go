@@ -95,6 +95,8 @@ func (t *turn) run(text string) {
 		ok = t.mathShowcase()
 	case containsAny(lower, "question", "ask me", "choose"):
 		ok = t.question()
+	case containsAny(lower, "think", "reason"):
+		ok = t.reasoningShowcase()
 	case containsAny(lower, "help", "what can you"):
 		ok = t.help()
 	case isGreeting(lower):
@@ -140,6 +142,7 @@ const tryList = "- **chat** about anything: I answer with markdown\n" +
 	"- say **markdown** or **table**: tables, code, lists, links\n" +
 	"- say **math** (or *latex*): inline and display formulas\n" +
 	"- say **question**: I ask you to pick an option (or type your own)\n" +
+	"- say **think** (or *reasoning*): reasoning in sections before the answer\n" +
 	"- `!ls` runs a shell command (\"You ran\"); `/model` opens a picker\n" +
 	"- **Esc Esc** to rewind to an earlier prompt, **Ctrl+T** for the transcript\n" +
 	"- say **demo** (or *fix*, *edit*): explore files, propose a patch, ask to run tests\n" +
@@ -326,6 +329,41 @@ func (t *turn) mathShowcase() bool {
 		return false
 	}
 	t.addTokens(1100)
+	return true
+}
+
+// reasoningShowcase streams reasoning in three sections, each opening
+// with a "**Title**" that becomes the status header, then answers. The
+// reasoning shows as one gray italic block in Ctrl+T (and in the
+// scrollback with -show-reasoning), without the first title.
+func (t *turn) reasoningShowcase() bool {
+	sections := []string{
+		"**Reading the question**\n\nThe user wants to see how **reasoning** is shown. " +
+			"It should read apart from the answer: gray and italic, with `code` keeping its color.",
+		"**Weighing the options**\n\nTwo things matter here:\n\n" +
+			"- the opening title is the status header, so the block doesn't repeat it\n" +
+			"- every section belongs to the same block, not one block per section",
+		"**Drafting the answer**\n\nKeep it short and point at where the reasoning is: " +
+			"the transcript (Ctrl+T), or the scrollback when started with `-show-reasoning`.",
+	}
+	for i, sec := range sections {
+		if i > 0 {
+			t.emit(protocol.AgentReasoningSectionBreak{})
+		}
+		if !t.stream(sec, true) || !t.sleep(700*time.Millisecond) {
+			return false
+		}
+	}
+	md := "## Reasoning demo\n\n" +
+		"I thought in three sections before answering. While I did, the status line showed each " +
+		"section's title in turn: *Reading the question*, *Weighing the options*, *Drafting the answer*.\n\n" +
+		"- Press **Ctrl+T** to see the reasoning: one gray italic block above this answer, " +
+		"without the first title (it was the status header)\n" +
+		"- Start with `agenttui -show-reasoning` to have it printed here in the scrollback too"
+	if !t.say(md) {
+		return false
+	}
+	t.addTokens(900)
 	return true
 }
 

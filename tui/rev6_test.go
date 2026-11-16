@@ -1,0 +1,132 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+
+	tea "charm.land/bubbletea/v2"
+
+	"agenttui/protocol"
+)
+
+// streamVsFull streams src in line-sized deltas and returns what reached
+// the scrollback and what a one-shot render of src gives.
+func streamVsFull(src string, width int) (got, want string) {
+	m := newTestModel()
+	m.width, m.height = width, 40
+	ev(m, protocol.TaskStarted{})
+	m.out.takeQueued()
+	for _, l := range strings.SplitAfter(src, "\n") {
+		if l != "" {
+			ev(m, protocol.AgentMessageDelta{Delta: l})
+		}
+	}
+	ev(m, protocol.AgentMessage{Message: src})
+	got = strings.Trim(sanitize(strings.Join(m.out.takeQueued(), "\n")), "\n")
+	ref := newTestModel()
+	ref.width = width
+	return got, sanitize(renderLines(ref.streamRows(src)))
+}
+
+// A code fence opened after a list or quote marker protects its math
+// while streaming exactly as in the finished answer.
+func TestMathInContainerFenceStreams(t *testing.T) {
+	for _, src := range []string{
+		"1. ```bash\n   $$x^2$$\n> ```",
+		"> ```tex\n> $$x^2$$\n> ```\n\nAfter $$y^2$$\n",
+		"- ```sh\n  echo $1 $2\n  ```\n- next $a$\n",
+	} {
+		got, want := streamVsFull(src, 60)
+		if got != want {
+			t.Errorf("%q\n--- streamed\n%s\n--- full\n%s", src, got, want)
+		}
+		if strings.Contains(src, "```bash") && !strings.Contains(got, "$$x^2$$") {
+			t.Errorf("math inside a fence was rendered: %q", got)
+		}
+	}
+}
+
+// A resize reflow prints the transcript without a trailing blank row, so
+// the next cell must print its own separator.
+func TestReflowKeepsSeparator(t *testing.T) {
+	m := newTestModel()
+	m.width, m.height = 60, 40
+	ev(m, protocol.TaskStarted{})
+	ev(m, protocol.AgentMessageDelta{Delta: "Para one.\n\nPara two.\n"})
+	ev(m, protocol.AgentMessage{Message: "Para one.\n\nPara two.\n"})
+	ev(m, protocol.TaskComplete{})
+	m.out.takeQueued()
+	m.Update(tea.WindowSizeMsg{Width: 50, Height: 40})
+	m.Update(reflowMsg{m.reflowGen})
+	m.out.hold(holdClear, false)
+	ev(m, protocol.Warning{Message: "after"})
+	if out := queuedPlain(m); !strings.Contains(out, "Para two.\n\n⚠ after") {
+		t.Errorf("no blank row before the cell after a reflow:\n%s", out)
+	}
+}
+
+// A background thread's answer doesn't print, so it must not mark the
+// foreground's separator row as printed.
+func TestBackgroundStreamKeepsSeparator(t *testing.T) {
+	m, _ := agentModel()
+	evIn(m, "", protocol.SessionConfigured{Model: "gpt-5", SessionID: "main-id"})
+	evIn(m, "", protocol.ThreadStarted{ThreadID: "r1", Nickname: "Robie", Role: "explorer"})
+	evIn(m, "", protocol.Warning{Message: "first"})
+	m.out.takeQueued()
+	evIn(m, "r1", protocol.TaskStarted{})
+	evIn(m, "r1", protocol.AgentMessageDelta{Delta: "sub para one\n\nsub para two\n"})
+	evIn(m, "r1", protocol.AgentMessage{Message: "sub para one\n\nsub para two\n"})
+	evIn(m, "", protocol.Warning{Message: "second"})
+	if out := queuedPlain(m); !strings.HasPrefix(out, "\n") {
+		t.Errorf("no blank row between foreground cells: %q", out)
+	}
+}
+
+// A stream of only whitespace shows nothing; it must not be taken for an
+// interrupted answer that the next answer then replaces.
+func TestWhitespaceStreamIsNotAnAnswer(t *testing.T) {
+	m := newTestModel()
+	m.width, m.height = 60, 40
+	ev(m, protocol.TaskStarted{})
+	ev(m, protocol.AgentMessageDelta{Delta: "\n"})
+	ev(m, protocol.ExecCommandBegin{CallID: "a", Command: []string{"make", "test"}})
+	ev(m, protocol.ExecCommandEnd{CallID: "a", AggregatedOutput: "x\n"})
+	ev(m, protocol.AgentMessage{Message: "Done."})
+	out := queuedPlain(m)
+	if i, j := strings.Index(out, "Ran make test"), strings.Index(out, "• Done."); i < 0 || j < i {
+		t.Errorf("answer not after the command:\n%s", out)
+	}
+	if m.pendingReflow != 0 {
+		t.Errorf("reflow scheduled: %v", m.pendingReflow)
+	}
+	// Whitespace, then a final that doesn't extend it.
+	m = newTestModel()
+	ev(m, protocol.TaskStarted{})
+	ev(m, protocol.AgentMessageDelta{Delta: "\n\n"})
+	ev(m, protocol.AgentMessage{Message: "Answer."})
+	if out := queuedPlain(m); !strings.Contains(out, "• Answer.") {
+		t.Errorf("final answer lost:\n%s", out)
+	}
+}
+
+// The final reasoning text repeats the streamed sections; it must not be
+// shown again after them.
+func TestReasoningFinalAfterSections(t *testing.T) {
+	m := newTestModel()
+	ev(m, protocol.TaskStarted{})
+	ev(m, protocol.AgentReasoningDelta{Delta: "**Inspecting**\n\nLook at the layout."})
+	ev(m, protocol.AgentReasoningSectionBreak{})
+	ev(m, protocol.AgentReasoningDelta{Delta: "**Planning**\n\nThen fix it."})
+	ev(m, protocol.AgentReasoning{Text: "**Inspecting**\n\nLook at the layout.\n\n**Planning**\n\nThen fix it."})
+	ev(m, protocol.AgentMessage{Message: "answer"})
+	var all []string
+	for _, c := range reasoningCells(m) {
+		for _, l := range c.Lines(80, m.st) {
+			all = append(all, l.Plain())
+		}
+	}
+	out := strings.Join(all, "\n")
+	if strings.Count(out, "Look at the layout.") != 1 || strings.Count(out, "Then fix it.") != 1 {
+		t.Errorf("reasoning sections repeated:\n%s", out)
+	}
+}

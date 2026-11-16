@@ -236,7 +236,7 @@ func (m *model) reflow(headerOnly bool) tea.Cmd {
 			add(c)
 		}
 	}
-	m.printedAny = len(lines) > 0
+	m.printedAny, m.sepPrinted = len(lines) > 0, false
 	// Queue the transcript now (so later commits stay after it) but hold
 	// output until the clear has reached the terminal.
 	m.out.reset()

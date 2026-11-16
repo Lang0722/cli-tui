@@ -638,12 +638,26 @@ func (m *model) finalizeStream(final string) {
 			// so the frame's bottom stays where it was instead of leaving a
 			// blank row under the footer.
 			m.printLines(append(rows[skip:len(rows):len(rows)], Line{}), false)
-			m.sepPrinted = true
+			m.sepPrinted = !m.bg // a background thread prints nothing
 		}
 	}
-	if final == "" {
+	switch {
+	case strings.TrimSpace(src) == "":
+		// Only whitespace streamed: nothing was shown, so there is no
+		// answer to keep or to correct later.
+		m.interrupted = nil
+		m.stream = streamState{}
+		if strings.TrimSpace(final) != "" {
+			m.finalizeStream(final)
+		}
+		if d := m.deferred; len(d) > 0 {
+			m.deferred = nil
+			m.commit(d...)
+		}
+		return
+	case final == "":
 		m.interrupted = &interruptedAnswer{len(m.committed), src}
-	} else {
+	default:
 		m.interrupted = nil // a completed answer ends the wait (as Codex)
 	}
 	m.committed = append(m.committed, agentCell{src})
@@ -662,7 +676,7 @@ func (m *model) finalizeStream(final string) {
 // one; it reports whether final was that answer's.
 func (m *model) correctInterrupted(final string) bool {
 	in := m.interrupted
-	if in == nil || strings.TrimSpace(final) == "" {
+	if in == nil || strings.TrimSpace(final) == "" || strings.TrimSpace(in.src) == "" {
 		return false
 	}
 	m.interrupted = nil
@@ -724,9 +738,11 @@ func (m *model) reasoningBody() string {
 }
 
 // finalizeReasoning records the reasoning block; full is its complete
-// text when the backend sends it (it replaces the streamed section).
+// text when the backend sends it.
 func (m *model) finalizeReasoning(full string) {
-	if full != "" {
+	// The full text repairs a section whose deltas were lost; once
+	// sections were streamed it would repeat them, so Codex ignores it.
+	if full != "" && len(m.reasonParts) == 0 {
 		m.reasoning.Reset()
 		m.reasoning.WriteString(full)
 	}

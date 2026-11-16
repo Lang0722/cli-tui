@@ -390,10 +390,14 @@ func restOfLineHasText(s string) bool {
 }
 
 var (
-	reMathFence   = regexp.MustCompile("^[ \t]*(```+|~~~+)")
-	reMathRefDef  = regexp.MustCompile(`^ {0,3}\[[^\]]+\]:[ \t]*\S`)
-	reMathHTMLTag = regexp.MustCompile(`^(?:</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>|<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*>|<!--[\s\S]*?-->)`)
-	reMathHTMLBlk = regexp.MustCompile(`^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)`)
+	// A fence may open after quote and list markers (Codex finds code
+	// blocks with the markdown parser, so a fence in a list item or a
+	// quote protects its math too); it closes after quote markers only.
+	reMathFence      = regexp.MustCompile("^(?:[ \t]*(?:>[ \t]?|[-+*][ \t]+|[0-9]{1,9}[.)][ \t]+))*[ \t]*(```+|~~~+)")
+	reMathFenceClose = regexp.MustCompile("^(?:[ \t]*>)*[ \t]*(```+|~~~+)[ \t]*$")
+	reMathRefDef     = regexp.MustCompile(`^ {0,3}\[[^\]]+\]:[ \t]*\S`)
+	reMathHTMLTag    = regexp.MustCompile(`^(?:</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>|<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*>|<!--[\s\S]*?-->)`)
+	reMathHTMLBlk    = regexp.MustCompile(`^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)`)
 )
 
 // mathProtected finds what Codex keeps away from math: code blocks, code
@@ -439,7 +443,7 @@ func mathBlocks(s string) (out, text []mathRange) {
 		next := lineEnd + 1
 		switch {
 		case inFence:
-			if m := reMathFence.FindStringSubmatch(line); m != nil && m[1][0] == fence[0] && len(m[1]) >= len(fence) && strings.TrimSpace(line) == m[1] {
+			if m := reMathFenceClose.FindStringSubmatch(line); m != nil && m[1][0] == fence[0] && len(m[1]) >= len(fence) {
 				inFence = false
 				out = append(out, mathRange{fenceStart, lineEnd})
 				textStart = next

@@ -233,7 +233,7 @@ func TestStreamingHoldsBackTables(t *testing.T) {
 
 func TestCodeHighlight(t *testing.T) {
 	st := newStyles()
-	lines := highlightLines("func main() {\n\t// hi\n}", lexerFor("go", ""), st.Code, st)
+	lines := highlightLines("func main() {\n\t// hi\n}", lexerFor("go", ""), false, st)
 	if len(lines) != 3 || lines[0].Plain() != "func main() {" {
 		t.Fatalf("lines: %q", plain(lines))
 	}

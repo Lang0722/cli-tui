@@ -25,6 +25,7 @@ type approval struct {
 	kind     approvalKind
 	callID   string
 	command  []string
+	prefix   []string // ExecApprovalRequest.ProposedPrefix
 	cwd      string
 	reason   string
 	changes  map[string]protocol.FileChange
@@ -35,6 +36,12 @@ type approval struct {
 	// threadLabel is set while the request is shown in another thread's
 	// view (Codex' cross-thread prompt: "Thread: …", "o to open thread").
 	threadLabel string
+
+	bodyCache      []Line // body rendered at bodyW/bodyCwd: a large patch
+	bodyW          int    // is costly to re-render on every frame
+	bodyCwd        string
+	bodyTint       bool
+	bodyCacheValid bool
 }
 
 // keyHint is the first configured key of an approval/list action ("y",
@@ -52,20 +59,29 @@ func (a *approval) keyHint(id string) string {
 
 func newExecApproval(ev protocol.ExecApprovalRequest, agent string) *approval {
 	cmd := displayCommand(ev.Command)
-	short := strings.SplitN(cmd, "\n", 2)[0]
-	if strw(short) > 50 {
-		short = takeWidth(short, 49) + "…"
-	}
 	opts := []approvalOption{{"Yes, proceed", "approve", protocol.DecisionApproved}}
-	if !strings.Contains(cmd, "\n") {
-		// Codex hides the prefix rule for multi-line commands.
-		opts = append(opts, approvalOption{"Yes, and don't ask again for commands that start with `" + short + "`", "approve_for_prefix", protocol.DecisionApprovedForSession})
+	var prefix []string
+	if p := displayCommand(ev.ProposedPrefix); len(ev.ProposedPrefix) > 0 && !strings.Contains(cmd, "\n") && !strings.Contains(p, "\n") {
+		// Codex offers the prefix rule only when the backend proposed one,
+		// and never for multi-line commands.
+		prefix = ev.ProposedPrefix
+		opts = append(opts, approvalOption{"Yes, and don't ask again for commands that start with `" + truncatePrefix(p) + "`", "approve_for_prefix", protocol.DecisionApprovedForPrefix})
+	} else {
+		opts = append(opts, approvalOption{"Yes, and don't ask again for this command in this session", "approve_for_session", protocol.DecisionApprovedForSession})
 	}
 	opts = append(opts, approvalOption{"No, and tell " + agent + " what to do differently", "decline", protocol.DecisionAbort})
 	return &approval{
 		kind: approveExec, callID: ev.CallID, command: ev.Command, cwd: ev.Cwd, reason: ev.Reason,
-		options: opts,
+		options: opts, prefix: prefix,
 	}
+}
+
+// truncatePrefix shortens a proposed prefix for the option label.
+func truncatePrefix(p string) string {
+	if strw(p) > 50 {
+		return takeWidth(p, 49) + "…"
+	}
+	return p
 }
 
 func newPatchApproval(ev protocol.ApplyPatchApprovalRequest, agent string) *approval {
@@ -81,7 +97,11 @@ func newPatchApproval(ev protocol.ApplyPatchApprovalRequest, agent string) *appr
 
 func (a *approval) op(d protocol.ReviewDecision) protocol.Op {
 	if a.kind == approveExec {
-		return protocol.ExecApproval{CallID: a.callID, Decision: d, ThreadID: a.thread}
+		op := protocol.ExecApproval{CallID: a.callID, Decision: d, ThreadID: a.thread}
+		if d == protocol.DecisionApprovedForPrefix {
+			op.Prefix = a.prefix
+		}
+		return op
 	}
 	return protocol.PatchApproval{CallID: a.callID, Decision: d, ThreadID: a.thread}
 }
@@ -118,11 +138,14 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 	optRows := len(a.options) + 3
 	bodyBudget := max(3, maxHeight-len(out)-optRows)
 
-	body := a.body(width, cwd, st)
+	if !a.bodyCacheValid || a.bodyW != width || a.bodyCwd != cwd || a.bodyTint != st.diffTint {
+		a.bodyCache, a.bodyW, a.bodyCwd, a.bodyTint, a.bodyCacheValid = a.body(width, cwd, st), width, cwd, st.diffTint, true
+	}
+	body := a.bodyCache
 	if len(body) > bodyBudget {
 		// Codex: "[… N lines] ⌃a view all" opens the full request in a pager.
 		extra := len(body) - bodyBudget + 1
-		body = append(body[:bodyBudget-1], L(P("    "), S("[… "+itoa(extra)+" lines] ", st.Dim), S(keyLabel(a.keyHint("approval.open_fullscreen")), st.Bold), S(" view all", st.Dim)))
+		body = append(body[:bodyBudget-1:bodyBudget-1], L(P("    "), S("[… "+itoa(extra)+" lines] ", st.Dim), S(keyLabel(a.keyHint("approval.open_fullscreen")), st.Bold), S(" view all", st.Dim)))
 	}
 	out = append(out, body...)
 	out = append(out, Line{}, Line{}) // Codex: two rows before the options
@@ -200,6 +223,8 @@ func decisionCell(a *approval, d protocol.ReviewDecision, agent string, st *Styl
 	switch d {
 	case protocol.DecisionApproved:
 		return textCell{bullet: S("✔", st.Green), body: L(P("You "), S("approved", st.Bold), P(" "+agent+" to "), S(what, st.Dim), P(" this time"))}
+	case protocol.DecisionApprovedForPrefix:
+		return textCell{bullet: S("✔", st.Green), body: L(P("You "), S("approved", st.Bold), P(" "+agent+" to always run commands that start with "), S(truncatePrefix(displayCommand(a.prefix)), st.Dim))}
 	case protocol.DecisionApprovedForSession:
 		return textCell{bullet: S("✔", st.Green), body: L(P("You "), S("approved", st.Bold), P(" "+agent+" to "), S(what, st.Dim), P(" for this session"))}
 	case protocol.DecisionDenied:

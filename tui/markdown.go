@@ -38,10 +38,20 @@ var (
 // complete (see tableHoldback), so rows for a prefix of the source stay
 // stable as more text arrives.
 func RenderMarkdown(src string, st *Styles, width int) []mdLine {
-	return renderBlocks(strings.Split(sanitize(src), "\n"), st, width)
+	return renderBlocks(strings.Split(sanitize(src), "\n"), st, width, nil)
 }
 
-func renderBlocks(lines []string, st *Styles, width int) []mdLine {
+// renderMarkdownSplit renders like RenderMarkdown and also returns the
+// last source line (> 0) that starts a block independently of everything
+// before it, or 0: rendering from that line on yields the same rows as
+// the tail of the whole render (after the separator row).
+func renderMarkdownSplit(src string, st *Styles, width int) ([]mdLine, int) {
+	clean := 0
+	out := renderBlocks(strings.Split(sanitize(src), "\n"), st, width, &clean)
+	return out, clean
+}
+
+func renderBlocks(lines []string, st *Styles, width int, clean *int) []mdLine {
 	var out []mdLine
 	last := ""            // kind of the previous block
 	sawBlank := false     // a blank source line since the previous block
@@ -59,6 +69,12 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 	for i := 0; i < len(lines); i++ {
 		raw := lines[i]
 		trimmed := strings.TrimSpace(raw)
+		// independent: this block doesn't depend on the parser state
+		independent := func() {
+			if clean != nil && i > 0 {
+				*clean = i
+			}
+		}
 
 		// Inside a list item a fence may be indented up to 3 columns past
 		// the item's content column (CommonMark); that indentation is
@@ -79,6 +95,9 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 			// (a backtick fence's info string can't contain backticks, so
 			// "```js``` is inline code" is a paragraph, not a fence)
 			marker, lang := m[1], m[2]
+			if extra == 0 {
+				independent()
+			}
 			var code []string
 			j := i + 1
 			for ; j < len(lines); j++ {
@@ -95,7 +114,7 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 				i = j
 				continue // empty (or just opened, while streaming) fence
 			}
-			for _, l := range highlightLines(strings.Join(code, "\n"), lexerFor(lang, ""), st.Code, st) {
+			for _, l := range highlightLines(strings.Join(code, "\n"), lexerFor(lang, ""), false, st) {
 				if codeLead != "" {
 					l = append(L(P(codeLead)), l...)
 				}
@@ -130,10 +149,11 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 				}
 				break
 			}
+			independent()
 			start("quote")
 			listIndents = listIndents[:0]
 			q := st.Green
-			for _, r := range renderBlocks(inner, st, max(1, width-2)) {
+			for _, r := range renderBlocks(inner, st, max(1, width-2), nil) {
 				line := append(L(S("> ", q)), r.Line...)
 				hang := append(L(S("> ", q)), r.Hang...)
 				out = append(out, mdLine{Line: line, Hang: hang, Fixed: r.Fixed, Keep: r.Keep || len(r.Line) == 0})
@@ -152,6 +172,7 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 			for ; j < len(lines) && strings.Contains(lines[j], "|") && strings.TrimSpace(lines[j]) != ""; j++ {
 				rows = append(rows, splitRow(lines[j]))
 			}
+			independent()
 			start("table")
 			listIndents = listIndents[:0]
 			out = append(out, renderTable(rows, aligns, width, st)...)
@@ -165,10 +186,12 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 		}
 		switch {
 		case reRule.MatchString(raw): // "* * *" is a rule, not a list item
+			independent()
 			start("rule")
 			listIndents = listIndents[:0]
 			out = append(out, mdLine{Line: L(S("———", st.Dim))})
 		case reHeading.MatchString(trimmed):
+			independent()
 			start("heading")
 			listIndents = listIndents[:0]
 			m := reHeading.FindStringSubmatch(trimmed)
@@ -180,6 +203,9 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 			l = append(l, inline(m[2], hs, st)...)
 			out = append(out, mdLine{Line: l})
 		case isList:
+			if last != "list" {
+				independent()
+			}
 			if last != "list" || sawBlank && len(listIndents) == 0 {
 				start("list")
 			}
@@ -234,6 +260,7 @@ func renderBlocks(lines []string, st *Styles, width int) []mdLine {
 			case last == "para" && !sawBlank:
 				// soft break inside the same paragraph
 			default:
+				independent()
 				start("para")
 				listIndents = listIndents[:0]
 			}
@@ -367,7 +394,7 @@ func renderTable(rows [][]string, aligns []byte, width int, st *Styles) []mdLine
 			content := cell(r, c)
 			if header {
 				for k := range content {
-					content[k].Style = content[k].Style.Inherit(st.AccentB)
+					content[k].Style = ptrStyle(content[k].Style.Inherit(st.AccentB))
 				}
 			}
 			cols[c] = Wrap(content, ws[c], nil, nil)

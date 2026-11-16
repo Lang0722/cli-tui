@@ -134,8 +134,9 @@ func (c reasoningCell) Lines(width int, st *Styles) []Line {
 	it := st.Dim.Italic(true)
 	md := RenderMarkdown(c.text, st, width-2)
 	for i := range md {
+		md[i].Line = append(Line(nil), md[i].Line...) // may be a shared highlight row
 		for j := range md[i].Line {
-			md[i].Line[j].Style = md[i].Line[j].Style.Inherit(it)
+			md[i].Line[j].Style = ptrStyle(md[i].Line[j].Style.Inherit(it))
 		}
 	}
 	return wrapMarkdown(md, width, L(S("• ", st.Dim)), L(P("  ")))
@@ -329,7 +330,7 @@ func (c *toolCell) render(width int, st *Styles, mode outputMode) []Line {
 	if res == "" {
 		return out
 	}
-	detail := outputLines(strings.Split(res, "\n"), width, st, c.isError, mode)
+	detail := outputLines(outLinesOf(strings.Split(res, "\n")), width, st, c.isError, mode)
 	if !inline && len(detail) > 0 {
 		detail[0] = append(L(P("    ")), detail[0][1:]...) // "    " instead of "  └ "
 	}
@@ -365,11 +366,23 @@ const (
 //
 //	preview: first 3 rows, then "+N lines (⌃t to view transcript)"
 //	middle:  head and tail rows around "… +N lines (⌃t to view transcript)"
-func outputLines(lines []string, width int, st *Styles, failed bool, mode outputMode) []Line {
-	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
-		lines = lines[:len(lines)-1]
+func outputLines(src outLines, width int, st *Styles, failed bool, mode outputMode) []Line {
+	// Lines are sanitized as they are used: a preview needs only a few.
+	line := func(i int) (string, bool) {
+		l, ok := src.at(i)
+		if !ok {
+			return "", false
+		}
+		return sanitize(l), true
 	}
-	if len(lines) == 0 {
+	n := src.total
+	for n > 0 {
+		if l, ok := line(n - 1); !ok || strings.TrimSpace(l) != "" {
+			break
+		}
+		n--
+	}
+	if n == 0 {
 		return []Line{L(S("  └ ", st.Dim), S("(no output)", st.Dim))}
 	}
 	body := max(1, width-4)
@@ -378,22 +391,24 @@ func outputLines(lines []string, width int, st *Styles, failed bool, mode output
 	switch mode {
 	case outputPreview:
 		omitted := 0
-		for i, l := range lines {
+		for i := 0; i < n; i++ {
 			remaining := previewRows - len(rows)
-			if remaining == 0 {
-				omitted += len(lines) - i
+			full, ok := line(i)
+			if remaining == 0 || !ok {
+				omitted += n - i
 				break
 			}
 			// Bound the input before wrapping (a single line can be huge).
+			l := full
 			if len(l) > maxPreviewBytes {
 				l = l[:maxPreviewBytes]
 			}
 			l = takeWidth(l, body*(remaining+1))
 			w := wrap(l)
-			if len(w) > remaining || len(l) < len(lines[i]) {
+			if len(w) > remaining || len(l) < len(full) {
 				omitted++ // this line is only partly shown
 				rows = append(rows, w[:min(len(w), remaining)]...)
-				omitted += len(lines) - i - 1
+				omitted += n - i - 1
 				break
 			}
 			rows = append(rows, w...)
@@ -402,41 +417,68 @@ func outputLines(lines []string, width int, st *Styles, failed bool, mode output
 			rows = append(rows, L(S(fmt.Sprintf("+%d %s%s", omitted, pluralWord(omitted, "line"), st.transcriptHint()), st.Dim)).Truncate(body))
 		}
 	case outputMiddle:
-		per := make([][]Line, len(lines))
-		total := 0
-		for i, l := range lines {
-			per[i] = wrap(l)
-			total += len(per[i])
-		}
-		if total <= userShellRows {
-			for _, w := range per {
-				rows = append(rows, w...)
+		wrapAt := func(i int) ([]Line, bool) {
+			l, ok := line(i)
+			if !ok {
+				return nil, false
 			}
+			return wrap(l), true
+		}
+		// Everything, if it fits.
+		var all []Line
+		fits := true
+		for i := 0; i < n && fits; i++ {
+			w, ok := wrapAt(i)
+			fits = ok && len(all)+len(w) <= userShellRows
+			all = append(all, w...)
+		}
+		if fits {
+			rows = all
 			break
 		}
 		avail := userShellRows - 1 // one row for the ellipsis
 		headBudget := avail / 2
 		tailBudget := avail - headBudget
-		head, hr := 0, 0
-		for head < len(per) && hr+len(per[head]) <= headBudget {
-			hr += len(per[head])
+		var headRows, tailRows []Line
+		head := 0
+		for head < n {
+			w, ok := wrapAt(head)
+			if !ok || len(headRows)+len(w) > headBudget {
+				break
+			}
+			headRows = append(headRows, w...)
 			head++
 		}
-		tail, tr := len(per), 0
-		for tail > head && tr+len(per[tail-1]) <= tailBudget {
-			tr += len(per[tail-1])
+		tail := n
+		var tailParts [][]Line
+		tr := 0
+		for tail > head {
+			w, ok := wrapAt(tail - 1)
+			if !ok || tr+len(w) > tailBudget {
+				break
+			}
+			tailParts = append(tailParts, w)
+			tr += len(w)
 			tail--
 		}
-		for _, w := range per[:head] {
-			rows = append(rows, w...)
+		for k := len(tailParts) - 1; k >= 0; k-- {
+			tailRows = append(tailRows, tailParts[k]...)
 		}
-		n := tail - head
-		rows = append(rows, L(S(fmt.Sprintf("… +%d %s%s", n, pluralWord(n, "line"), st.transcriptHint()), st.Dim)).Truncate(body))
-		for _, w := range per[tail:] {
-			rows = append(rows, w...)
-		}
+		rows = headRows
+		gap := tail - head
+		rows = append(rows, L(S(fmt.Sprintf("… +%d %s%s", gap, pluralWord(gap, "line"), st.transcriptHint()), st.Dim)).Truncate(body))
+		rows = append(rows, tailRows...)
 	default:
-		for _, l := range lines {
+		for i := 0; i < n; i++ {
+			l, ok := line(i)
+			if !ok {
+				// Dropped from the middle of a long output (like Codex'
+				// transcript marker).
+				gap := src.gap()
+				rows = append(rows, wrap(fmt.Sprintf("… +%d %s", gap, pluralWord(gap, "line")))...)
+				i = src.total - len(src.tail) - 1
+				continue
+			}
 			rows = append(rows, wrap(l)...)
 		}
 	}

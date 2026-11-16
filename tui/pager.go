@@ -37,6 +37,8 @@ type pager struct {
 	query   string // last accepted (or in-progress) query
 	matches []int  // line indexes containing query
 	cur     int
+	lower   []string // lowercased plain text of lines (find)
+	found   pagerFound
 }
 
 func newTranscriptPager(source func() []Cell, live func(int) []Line, st *Styles) *pager {
@@ -57,12 +59,25 @@ func detailLines(c Cell, width int, st *Styles) []Line {
 	return c.Lines(width, st)
 }
 
-func (p *pager) content(width int) []Line {
+// pagerLines is the pager's content: rendered committed lines plus the
+// live tail, without copying the (possibly huge) committed part per frame.
+type pagerLines struct{ base, tail []Line }
+
+func (c pagerLines) len() int { return len(c.base) + len(c.tail) }
+func (c pagerLines) at(i int) Line {
+	if i < len(c.base) {
+		return c.base[i]
+	}
+	return c.tail[i-len(c.base)]
+}
+
+func (p *pager) content(width int) pagerLines {
 	if p.source == nil {
-		return p.static
+		return pagerLines{base: p.static}
 	}
 	if width != p.width {
 		p.width, p.cells, p.lines, p.cellStart = width, 0, nil, nil
+		p.lower, p.found = nil, pagerFound{}
 	}
 	cells := p.source()
 	for ; p.cells < len(cells); p.cells++ {
@@ -73,13 +88,43 @@ func (p *pager) content(width int) []Line {
 		p.lines = append(p.lines, detailLines(cells[p.cells], width, p.st)...)
 	}
 	p.cellStart = append(p.cellStart[:p.cells], len(p.lines))
-	all := p.lines
+	c := pagerLines{base: p.lines}
 	if p.live != nil {
 		if tail := p.live(width); len(tail) > 0 {
-			all = append(append(append([]Line{}, all...), Line{}), tail...)
+			c.tail = append([]Line{{}}, tail...)
 		}
 	}
-	return all
+	return c
+}
+
+// pagerFound caches find matches in the committed lines.
+type pagerFound struct {
+	query   string
+	scanned int   // committed lines searched
+	matches []int // their matching line indexes
+}
+
+// findMatches returns the indexes of lines containing q (lowercase).
+func (p *pager) findMatches(c pagerLines, q string) []int {
+	lower := func(l Line) string { return strings.ToLower(l.Plain()) }
+	if p.found.query != q {
+		p.found = pagerFound{query: q}
+	}
+	for ; len(p.lower) < len(c.base); p.lower = append(p.lower, lower(c.base[len(p.lower)])) {
+	}
+	f := &p.found
+	for ; f.scanned < len(c.base); f.scanned++ {
+		if strings.Contains(p.lower[f.scanned], q) {
+			f.matches = append(f.matches, f.scanned)
+		}
+	}
+	out := append(p.matches[:0], f.matches...)
+	for i, l := range c.tail {
+		if strings.Contains(lower(l), q) {
+			out = append(out, len(c.base)+i)
+		}
+	}
+	return out
 }
 
 // handleKey returns true when the pager should close.
@@ -180,18 +225,13 @@ func (p *pager) render(width, height int) string {
 	lines := p.content(width)
 	q := strings.ToLower(p.query)
 	if q != "" {
-		p.matches = p.matches[:0]
-		for i, l := range lines {
-			if strings.Contains(strings.ToLower(l.Plain()), q) {
-				p.matches = append(p.matches, i)
-			}
-		}
+		p.matches = p.findMatches(lines, q)
 		if p.cur >= len(p.matches) {
 			p.cur = 0
 		}
 	}
 	body := max(1, height-4)
-	maxOff := max(0, len(lines)-body)
+	maxOff := max(0, lines.len()-body)
 	if p.follow {
 		p.offset = maxOff
 	}
@@ -210,8 +250,8 @@ func (p *pager) render(width, height int) string {
 		head += "/ "
 	}
 	out := []Line{L(S(head, st.Dim))}
-	for i := p.offset; i < min(len(lines), p.offset+body); i++ {
-		l := lines[i]
+	for i := p.offset; i < min(lines.len(), p.offset+body); i++ {
+		l := lines.at(i)
 		if q != "" {
 			l = highlightQuery(l, q, st)
 		}
@@ -285,7 +325,7 @@ func highlightQuery(l Line, q string, st *Styles) Line {
 				if b > seg {
 					style := sp.Style
 					if segMark {
-						style = style.Reverse(true)
+						style = ptrStyle(style.Reverse(true))
 					}
 					out = append(out, Span{plain[seg:b], style})
 				}

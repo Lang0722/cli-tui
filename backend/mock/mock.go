@@ -40,6 +40,7 @@ type Backend struct {
 	answers   map[string]chan protocol.SelectionResponse
 	model     string
 	effort    string
+	access    int // index into accessModes
 	turn      atomic.Int64
 	pending   []protocol.UserInput // input received while a turn was running
 	saveErr   bool                 // a save failure was already reported
@@ -70,6 +71,7 @@ func New(dir string) (*Backend, error) {
 		answers:   map[string]chan protocol.SelectionResponse{},
 		model:     modelName,
 		effort:    effort,
+		access:    1,
 		opWake:    make(chan struct{}, 1),
 	}
 	if list, err := b.store.list(); err == nil && len(list) == 0 {
@@ -79,6 +81,7 @@ func New(dir string) (*Backend, error) {
 	}
 	go b.opLoop()
 	b.emit(b.configured(nil))
+	b.notice(protocol.SlashCommands{Commands: mockCommands})
 	return b, nil
 }
 
@@ -110,9 +113,11 @@ func ResetDemo(dir string) error {
 func (b *Backend) configured(f *sessionFile) protocol.SessionConfigured {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	mode := accessModes[b.access]
 	sc := protocol.SessionConfigured{
 		Model: b.model, ReasoningEffort: b.effort, Cwd: b.cwd,
 		Version: version, AgentName: agentName,
+		Permissions: mode.permissions, ApprovalMode: mode.approval,
 	}
 	if f != nil {
 		sc.SessionID, sc.Title = f.Meta.ID, f.Meta.Title
@@ -434,20 +439,41 @@ func (b *Backend) slash(op protocol.SlashCommand) {
 		go b.pickModel()
 	case "approvals":
 		go func() {
+			b.mu.Lock()
+			cur := b.access
+			b.mu.Unlock()
+			var items []protocol.SelectionItem
+			for i, m := range accessModes {
+				items = append(items, protocol.SelectionItem{Name: m.name, Description: m.desc, Current: i == cur})
+			}
 			r, ok := b.ask(context.Background(), protocol.SelectionRequest{
-				Title: "Select Approval Mode", Subtitle: "The mock backend always asks; this only demonstrates the picker.",
-				Items: []protocol.SelectionItem{
-					{Name: "Read Only", Description: "ask before every command and edit"},
-					{Name: "Auto", Description: "run safe commands, ask for edits", Current: true},
-					{Name: "Full Access", Description: "never ask"},
-				}})
-			if ok && r.Index >= 0 {
-				b.notice(protocol.BackgroundEvent{Message: "Approval mode set (mock): nothing changes"})
+				Title: "Select Approval Mode", Subtitle: "The mock backend always asks; this only demonstrates the picker.", Items: items})
+			if ok && r.Index >= 0 && r.Index < len(accessModes) {
+				b.mu.Lock()
+				b.access = r.Index
+				b.mu.Unlock()
+				m := accessModes[r.Index]
+				b.notice(protocol.SessionUpdated{Permissions: m.permissions, ApprovalMode: m.approval})
 			}
 		}()
+	case "standup":
+		b.notice(protocol.BackgroundEvent{Message: "(mock) /standup is a command the backend advertised with slash_commands"})
 	default:
 		b.notice(protocol.Warning{Message: "/" + op.Name + " is not implemented by the mock backend"})
 	}
+}
+
+// accessModes are the mock /approvals choices.
+var accessModes = []struct{ name, desc, permissions, approval string }{
+	{"Read Only", "ask before every command and edit", "read-only", "on-request"},
+	{"Auto", "run safe commands, ask for edits", "workspace-write", "on-request"},
+	{"Full Access", "never ask", "danger-full-access", "never"},
+}
+
+// mockCommands are advertised with protocol.SlashCommands to show how a
+// backend adds its own commands to the "/" popup.
+var mockCommands = []protocol.CommandInfo{
+	{Name: "standup", Description: "(mock) a command the backend advertised", AvailableDuringTask: true},
 }
 
 // ask sends a SelectionRequest and waits for the answer.
@@ -499,7 +525,7 @@ func (b *Backend) pickModel() {
 	b.mu.Lock()
 	b.model, b.effort = model, efforts[r.Index]
 	b.mu.Unlock()
-	b.notice(protocol.BackgroundEvent{Message: "Model changed to " + model + " " + efforts[r.Index]})
+	b.notice(protocol.SessionUpdated{Model: model, ReasoningEffort: efforts[r.Index]})
 }
 
 func (b *Backend) answer(id string, d protocol.ReviewDecision) {

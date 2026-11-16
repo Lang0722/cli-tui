@@ -21,32 +21,35 @@ type Command struct {
 	Local bool
 	// Alias commands (like /exit for /quit) are hidden until typed.
 	Alias bool
+	// DuringTask lets the command run while a turn is in progress (the
+	// rest are refused until it ends, as in Codex).
+	DuringTask bool
 }
 
 // DefaultCommands mirrors the common Codex slash commands. Pass your own
 // list via Options.Commands to change it.
 var DefaultCommands = []Command{
-	{Name: "model", Description: "choose what model and reasoning effort to use"},
-	{Name: "approvals", Description: "choose what the agent can do without approval"},
+	{Name: "model", Description: "choose what model and reasoning effort to use", DuringTask: true},
+	{Name: "approvals", Description: "choose what the agent can do without approval", DuringTask: true},
 	{Name: "new", Description: "start a new chat during a conversation"},
 	{Name: "init", Description: "create an AGENTS.md file with instructions for the agent"},
 	{Name: "compact", Description: "summarize conversation to prevent hitting the context limit"},
 	{Name: "review", Description: "review my current changes and find issues"},
-	{Name: "diff", Description: "show git diff (including untracked files)", Local: true},
-	{Name: "mention", Description: "mention a file", Local: true},
-	{Name: "status", Description: "show current session configuration and token usage", Local: true},
-	{Name: "transcript", Description: "open the full transcript pager", Local: true},
+	{Name: "diff", Description: "show git diff (including untracked files)", Local: true, DuringTask: true},
+	{Name: "mention", Description: "mention a file", Local: true, DuringTask: true},
+	{Name: "status", Description: "show current session configuration and token usage", Local: true, DuringTask: true},
+	{Name: "transcript", Description: "open the full transcript pager", Local: true, DuringTask: true},
 	{Name: "resume", Description: "resume a saved conversation", Local: true},
-	{Name: "copy", Description: "copy the last response to the clipboard", Local: true},
+	{Name: "copy", Description: "copy the last response to the clipboard", Local: true, DuringTask: true},
 	{Name: "export", Description: "export the conversation as markdown", Local: true},
 	{Name: "clear", Description: "clear the terminal and start a new chat", Local: true},
-	{Name: "pwd", Description: "show the current working directory", Local: true},
-	{Name: "statusline", Description: "configure which items appear in the status line", Local: true},
-	{Name: "title", Description: "configure which items appear in the terminal title", Local: true},
+	{Name: "pwd", Description: "show the current working directory", Local: true, DuringTask: true},
+	{Name: "statusline", Description: "configure which items appear in the status line", Local: true, DuringTask: true},
+	{Name: "title", Description: "configure which items appear in the terminal title", Local: true, DuringTask: true},
 	{Name: "keymap", Description: "remap TUI shortcuts", Local: true},
-	{Name: "subagents", Description: "switch between this session's subagents", Local: true},
-	{Name: "quit", Description: "exit the app", Local: true},
-	{Name: "exit", Description: "exit the app", Local: true, Alias: true},
+	{Name: "subagents", Description: "switch between this session's subagents", Local: true, DuringTask: true},
+	{Name: "quit", Description: "exit the app", Local: true, DuringTask: true},
+	{Name: "exit", Description: "exit the app", Local: true, Alias: true, DuringTask: true},
 }
 
 const popupRows = 8
@@ -185,7 +188,11 @@ func fuzzy(s, q string) int {
 	if q == "" {
 		return 0
 	}
-	ls, lq := strings.ToLower(s), []rune(strings.ToLower(q))
+	return fuzzyLower(s, strings.ToLower(s), []rune(strings.ToLower(q)))
+}
+
+// fuzzyLower is fuzzy with s and q already lowercased (ls, lq).
+func fuzzyLower(s, ls string, lq []rune) int {
 	if i := strings.Index(ls, string(lq)); i >= 0 {
 		score := 1000 - len(s)
 		base := strings.LastIndex(ls, "/") + 1
@@ -222,8 +229,14 @@ func (p *filePopup) filter(files []string) {
 		score int
 	}
 	var res []scored
-	for _, f := range files {
-		if sc := fuzzy(f, p.query); sc >= 0 {
+	lower := lowerFiles(files)
+	lq := []rune(strings.ToLower(p.query))
+	for i, f := range files {
+		sc := 0
+		if len(lq) > 0 {
+			sc = fuzzyLower(f, lower[i], lq)
+		}
+		if sc >= 0 {
 			res = append(res, scored{f, sc})
 		}
 	}
@@ -235,6 +248,23 @@ func (p *filePopup) filter(files []string) {
 	if p.selected >= len(p.matches) {
 		p.selected = 0
 	}
+}
+
+// lowerFiles caches the lowercased file index (the popup filters it on
+// every keystroke; repositories can list hundreds of thousands of files).
+var lowerCache struct {
+	files, lower []string
+}
+
+func lowerFiles(files []string) []string {
+	c := &lowerCache
+	if len(files) == 0 || len(c.files) != len(files) || &c.files[0] != &files[0] {
+		c.files, c.lower = files, make([]string, len(files))
+		for i, f := range files {
+			c.lower[i] = strings.ToLower(f)
+		}
+	}
+	return c.lower
 }
 
 func (p *filePopup) move(d int) {

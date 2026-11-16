@@ -243,7 +243,7 @@ func diffLine(r diffRow, num, indent string, numW int, lexer chroma.Lexer, width
 	}
 	switch {
 	case st.diffTint:
-		body = highlightLines(r.text, lexer, st.Plain, st)[0]
+		body = highlightLines(r.text, lexer, true, st)[0]
 	case r.kind == '+':
 		body = L(S(r.text, st.Green))
 	case r.kind == '-':
@@ -282,5 +282,5 @@ func (c patchFailedCell) Lines(width int, st *Styles) []Line {
 		msg = "(error details unavailable)"
 	}
 	out := []Line{L(S("✘ ", st.RedB), S("Failed to apply patch", st.Red))}
-	return append(out, outputLines(strings.Split(msg, "\n"), width, st, true, outputPreview)...)
+	return append(out, outputLines(outLinesOf(strings.Split(msg, "\n")), width, st, true, outputPreview)...)
 }

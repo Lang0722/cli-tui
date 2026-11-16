@@ -16,6 +16,9 @@ import (
 // Solarized, ...) is respected; RGB is used only for tinted backgrounds that
 // are derived from the terminal's real background (queried via OSC 11).
 type Styles struct {
+	hlCache map[hlKey][]Line // highlightLines results
+	hlBytes int
+
 	Plain   lipgloss.Style
 	Dim     lipgloss.Style
 	Bold    lipgloss.Style
@@ -186,7 +189,7 @@ func (s *Styles) Shimmer(text string) Line {
 				st = s.Bold
 			}
 		}
-		out = append(out, Span{string(r), st})
+		out = append(out, S(string(r), st))
 	}
 	return out
 }

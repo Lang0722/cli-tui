@@ -244,8 +244,8 @@ func (m *model) reprint() tea.Cmd {
 	cmd := m.reflow(false)
 	m.stream.active = streaming
 	if streaming && m.stream.emitted > 0 {
-		rows := m.streamRows(m.stream.src.String())
-		m.printLines(rows[:min(m.stream.emitted, len(rows))], true)
+		m.rewrapStream()
+		m.printLines(m.stream.printed, true)
 	}
 	return cmd
 }

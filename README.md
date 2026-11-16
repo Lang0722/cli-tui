@@ -134,11 +134,11 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 |---|---|
 | `user_input{text,images?}` | Enter, or a queued message when the turn ends. Images come from Ctrl+V / Alt+V or a pasted image path. |
 | `interrupt` | Esc or Ctrl+C while running; reply with `turn_aborted` |
-| `exec_approval` / `patch_approval{call_id,decision}` | answers an approval. `decision` is one of `approved`, `approved_for_session`, `denied`, `abort`. |
+| `exec_approval` / `patch_approval{call_id,decision}` | answers an approval. `decision` is one of `approved`, `approved_for_session`, `approved_for_prefix` (exec only, with `prefix`: the request's `proposed_prefix`), `denied`, `abort`. |
 | `shell_command{command}` | `!cmd` shell mode; run it and report it with `exec_command_*` and `source:"user_shell"` |
 | `selection_response{id,index,text?}` | answers a `selection_request`; `index` -1 means cancelled or answered with `text` |
 | `rewind{user_message_index}` | Esc Esc then Enter: drop that user message (0-based) and everything after it |
-| `slash_command{name,args}` | backend slash commands (`/new`, `/model`, `/compact`, `/init`, `/review`, …) |
+| `slash_command{name,args}` | backend slash commands: the built-in `/new`, `/model`, `/approvals`, `/compact`, `/init`, `/review`, and any the backend advertised with `slash_commands` |
 | `list_sessions` / `resume_session{id}` | resume picker / chosen session (an empty id means the most recent). If the session can't be loaded, send an `error`. |
 | `shutdown` | UI exit |
 
@@ -153,12 +153,14 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 
 | event | renders as |
 |---|---|
-| `session_configured` | the header box. Set `resumed:true` when answering a resume, and `title` to name the conversation. `initial_messages` replays a saved conversation: a list of event `msg` objects, e.g. `{"type":"user_message","message":"hi","images":["/tmp/a.png"]}` then `{"type":"agent_message","message":"…"}`, exec, patch, plan and tool events. |
+| `session_configured` | the header box. Set `resumed:true` when answering a resume, and `title` to name the conversation. Optional `permissions` (e.g. `workspace-write`) and `approval_mode` (e.g. `on-request`) show in `/status` and the status line. `initial_messages` replays a saved conversation: a list of event `msg` objects, e.g. `{"type":"user_message","message":"hi","images":["/tmp/a.png"]}` then `{"type":"agent_message","message":"…"}`, exec, patch, plan and tool events. |
+| `session_updated{model?,reasoning_effort?,cwd?,permissions?,approval_mode?}` | a mid-session settings change (after `/model`, `/approvals`, …): prints `Model changed to …` / `Permissions updated to …` and updates the header, `/status` and the status line. Omitted fields keep their value. |
+| `slash_commands{commands:[{name,description,available_during_task}]}` | adds backend commands to the `/` popup (each advertisement replaces the last). Names that clash with a built-in are ignored. |
 | `session_title{title}` | renames the conversation (status line and window title `thread-name`) |
 | `agent_message_delta` / `agent_message` | `• …` markdown streamed into scrollback line by line. Tables are held back until complete; dropped deltas are repaired from the final message. |
 | `agent_reasoning_delta` / `agent_reasoning` | the latest `**title**` becomes the status header; the text goes to the Ctrl+T transcript |
 | `exec_command_begin` / `output_delta` / `end` | `• Running` → `• Ran cmd`, with the first and last 5 output lines around `… +N lines (⌃t to view transcript)`. Reads, lists and searches merge into `• Explored`, with `(exit N)` on failures. |
-| `exec_approval_request` / `apply_patch_approval_request` | numbered approval modal; Ctrl+A shows the full command or diff |
+| `exec_approval_request` / `apply_patch_approval_request` | numbered approval modal; Ctrl+A shows the full command or diff. An exec request may carry `proposed_prefix` (e.g. `["go","test"]`) to offer "don't ask again for commands that start with `go test`"; without it the option is "don't ask again for this command in this session". |
 | `patch_apply_begin` / `end` | `• Edited path (+a -d)` with a line-numbered, tinted, syntax-highlighted diff; `✘ Failed to apply patch` on failure |
 | `tool_call_begin` / `end` | `• Calling` / `• Called server.tool(args)` / `• Failed` |
 | `plan_update` | `• Updated Plan · 1/3 complete` checklist |
@@ -200,8 +202,14 @@ the overlay shows ⇧enter or ⌃j accordingly.
 
 Local slash commands: `/status`, `/diff` (opens a pager), `/transcript`,
 `/resume`, `/copy`, `/export [file]`, `/clear`, `/pwd`, `/mention`,
-`/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. All other commands are forwarded
-to the backend.
+`/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. The other built-in
+commands, and the ones the backend advertises, are sent as `slash_command`.
+An unknown `/name` is not sent: like Codex it prints
+`Unrecognized command '/name'` and keeps the draft (paths such as
+`/usr/bin/x` and text starting with a space are sent as prompts).
+While a task runs, `/model`, `/approvals`, `/diff`, `/status`, `/copy`,
+`/pwd`, `/mention`, `/transcript`, `/statusline`, `/title`, `/subagents` and
+`/quit` still work; the rest wait for the turn to end.
 
 ## Subagents
 
@@ -270,7 +278,7 @@ are joined with ` | `. Items:
 `hostname` `git-branch` `branch-changes` `run-state` `context-remaining`
 `context-used` `context-window-size` `used-tokens` `total-input-tokens`
 `total-output-tokens` `app-version` `thread-id` `thread-name` `thread-title`
-`task-progress`; the title adds `app-name` and `activity` (a spinner while
+`task-progress` `permissions` `approval-mode`; the title adds `app-name` and `activity` (a spinner while
 working, a blinking "Action Required" while input is needed). The defaults
 are `model-with-reasoning, current-dir, thread-name` and
 `activity, thread-name, project-name`.
@@ -304,6 +312,31 @@ exactly what your terminal sends for a key. Contexts are `global`, `chat`,
   approval or question rings the bell and sends OSC 777 (desktop notifications
   in Fedora and Ubuntu builds). The window title shows a spinner while
   working, and a blinking `[ ! ] Action Required` while input is needed.
+
+## Performance
+
+Bubble Tea redraws after every event, so the per-event and per-frame paths
+are kept incremental. `go test ./tui -run X -bench .` (Update + View per
+event, 4 vCPU):
+
+| scenario | before | now |
+|---|---|---|
+| stream a 25 KB answer in 4-byte deltas | 108 s | 0.26 s |
+| 8 MB of live command output in 4 KB chunks | 291 s | 0.12 s |
+| resume a 300-turn session (16.5k lines) | 1.4 s | 0.11 s |
+| one Ctrl+T pager frame over that session | 14 ms | 0.1 ms |
+| idle frame while a turn runs | 11 ms | 0.03 ms |
+
+What makes this work:
+
+- **Streaming.** Only the markdown after the last finished block is
+  re-rendered. A randomized test checks the output is identical to a full
+  render.
+- **Event batching.** Events are applied in batches of up to 512 per frame.
+- **Live command output** follows Codex: a 1 MiB budget, then the first and
+  last 50 lines, with very long lines shortened in the middle.
+- **Caches** for highlighted code, styled spans, the pager's search text and
+  the approval body.
 
 ## Parity with Codex
 

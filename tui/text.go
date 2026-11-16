@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"image/color"
+	"reflect"
 	"strings"
+	"sync"
+	"unsafe"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -13,14 +17,22 @@ import (
 // widths are always computed on plain text.
 type Span struct {
 	Text  string
-	Style lipgloss.Style
+	Style *lipgloss.Style
 }
 
 // Line is one terminal row worth of spans (before wrapping it may be longer).
 type Line []Span
 
-func S(text string, st lipgloss.Style) Span { return Span{Text: text, Style: st} }
-func P(text string) Span                    { return Span{Text: text, Style: lipgloss.NewStyle()} }
+// Spans hold their style by pointer: a lipgloss.Style is ~660 bytes, and
+// rows are copied constantly while wrapping and prefixing. Styles are
+// never modified through the pointer (lipgloss methods return copies).
+func S(text string, st lipgloss.Style) Span { return Span{Text: text, Style: &st} }
+func P(text string) Span                    { return Span{Text: text, Style: plainStyle} }
+
+// ptrStyle boxes a derived style for a Span.
+func ptrStyle(s lipgloss.Style) *lipgloss.Style { return &s }
+
+var plainStyle = func() *lipgloss.Style { s := lipgloss.NewStyle(); return &s }()
 
 func L(spans ...Span) Line { return Line(spans) }
 
@@ -52,19 +64,143 @@ func (l Line) Render() string {
 		if s.Text == "" {
 			continue
 		}
+		if s.Style == nil {
+			b.WriteString(s.Text)
+			continue
+		}
+		if pre, post, ok := sgrFor(s.Style); ok && !strings.ContainsAny(s.Text, "\t\n") {
+			b.WriteString(pre)
+			b.WriteString(s.Text)
+			b.WriteString(post)
+			continue
+		}
 		b.WriteString(s.Style.Render(s.Text))
 	}
 	return b.String()
+}
+
+// lipgloss' Style.Render handles padding, borders, widths and per-rune
+// styling of spaces, and its cost dominated every frame. Spans only use
+// colors and attributes, so the escape sequences around a span depend on
+// the style alone: they are rendered once per style and reused.
+type sgrKey struct {
+	props, attrs     int64
+	fg, bg           color.Color
+	link, linkParams string
+}
+
+type sgrPair struct{ pre, post string }
+
+var (
+	sgrMu    sync.Mutex
+	sgrCache = map[sgrKey]sgrPair{}
+)
+
+const sgrProbe = "\uE000"
+
+// lipgloss' public getters cost ~60 ns each, too much per span, so the
+// cache key is read from the style's own fields (lipgloss is vendored, so
+// the layout is fixed; sgrInit verifies it and disables the shortcut if
+// it doesn't hold). props is the set of properties a style has; any
+// beyond colors, bold/italic/faint/reverse/blink and a hyperlink means
+// layout or per-rune styling, which goes through lipgloss.
+var sgrLayout = sgrInit()
+
+type sgrFields struct {
+	ok                                 bool
+	props, attrs, fg, bg, link, params uintptr
+	value                              uintptr
+	allowed                            int64
+}
+
+func sgrInit() sgrFields {
+	t := reflect.TypeOf(lipgloss.Style{})
+	var f sgrFields
+	for name, off := range map[string]*uintptr{"props": &f.props, "attrs": &f.attrs, "fgColor": &f.fg, "bgColor": &f.bg, "link": &f.link, "linkParams": &f.params, "value": &f.value} {
+		sf, ok := t.FieldByName(name)
+		if !ok {
+			return sgrFields{}
+		}
+		want := reflect.Int64
+		switch name {
+		case "fgColor", "bgColor":
+			want = reflect.Interface
+		case "link", "linkParams", "value":
+			want = reflect.String
+		}
+		if sf.Type.Kind() != want {
+			return sgrFields{}
+		}
+		*off = sf.Offset
+	}
+	c := color.RGBA{1, 2, 3, 255}
+	all := lipgloss.NewStyle().Bold(true).Italic(true).Faint(true).Reverse(true).Blink(true).Foreground(c).Background(c).Hyperlink("u", "p")
+	f.ok = true
+	f.allowed = f.key(&all).props
+	// Self-check against the public getters.
+	probe := lipgloss.NewStyle().Foreground(c).Bold(true).Hyperlink("u", "p")
+	k := f.key(&probe)
+	if k.fg != probe.GetForeground() || k.bg != nil && k.bg != probe.GetBackground() || k.link != "u" || k.linkParams != "p" ||
+		k.props&^f.allowed != 0 || f.key(&all).props == 0 || f.allowedFor(lipgloss.NewStyle().Underline(true)) || f.allowedFor(lipgloss.NewStyle().PaddingLeft(1)) {
+		return sgrFields{}
+	}
+	return f
+}
+
+func (f sgrFields) key(st *lipgloss.Style) sgrKey {
+	p := unsafe.Pointer(st)
+	return sgrKey{
+		props: *(*int64)(unsafe.Add(p, f.props)), attrs: *(*int64)(unsafe.Add(p, f.attrs)),
+		fg: *(*color.Color)(unsafe.Add(p, f.fg)), bg: *(*color.Color)(unsafe.Add(p, f.bg)),
+		link: *(*string)(unsafe.Add(p, f.link)), linkParams: *(*string)(unsafe.Add(p, f.params)),
+	}
+}
+
+func (f sgrFields) allowedFor(st lipgloss.Style) bool {
+	return f.key(&st).props&^f.allowed == 0
+}
+
+// sgrFor returns the sequences lipgloss puts around text in style st, or
+// ok=false for styles this shortcut can't reproduce.
+func sgrFor(st *lipgloss.Style) (pre, post string, ok bool) {
+	f := sgrLayout
+	if !f.ok || *(*string)(unsafe.Add(unsafe.Pointer(st), f.value)) != "" {
+		return "", "", false
+	}
+	k := f.key(st)
+	if k.props&^f.allowed != 0 || !comparableColor(k.fg) || !comparableColor(k.bg) {
+		return "", "", false
+	}
+	sgrMu.Lock()
+	defer sgrMu.Unlock()
+	p, hit := sgrCache[k]
+	if !hit {
+		r := st.Render(sgrProbe)
+		i := strings.Index(r, sgrProbe)
+		if i < 0 || ansi.Strip(r) != sgrProbe {
+			return "", "", false // the style adds visible text
+		}
+		p = sgrPair{r[:i], r[i+len(sgrProbe):]}
+		if len(sgrCache) > 4096 {
+			clear(sgrCache)
+		}
+		sgrCache[k] = p
+	}
+	return p.pre, p.post, true
+}
+
+func comparableColor(c color.Color) bool {
+	return c == nil || reflect.TypeOf(c).Comparable()
 }
 
 // Fill pads the line to width using style st (used for background bands).
 func (l Line) Fill(width int, st lipgloss.Style) Line {
 	out := make(Line, 0, len(l)+1)
 	for _, s := range l {
-		out = append(out, Span{s.Text, s.Style.Inherit(st)})
+		out = append(out, S(s.Text, s.Style.Inherit(st)))
 	}
 	if pad := width - l.Width(); pad > 0 {
-		out = append(out, Span{strings.Repeat(" ", pad), st})
+		out = append(out, S(strings.Repeat(" ", pad), st))
 	}
 	return out
 }
@@ -93,10 +229,49 @@ func (l Line) Truncate(width int) Line {
 	return out
 }
 
-func strw(s string) int { return ansi.StringWidth(s) }
+func strw(s string) int {
+	if printableASCII(s) {
+		return len(s)
+	}
+	return ansi.StringWidth(s)
+}
+
+// printableASCII reports whether s is only ' '..'~': one cell per byte,
+// so widths need no grapheme segmentation (the common case, and uniseg
+// dominated wrapping costs).
+func printableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
 
 // takeWidth returns the longest prefix of s with display width <= w.
 func takeWidth(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	// ASCII prefix: one cell per byte. Stop one byte early so a combining
+	// mark after it still joins its base character below.
+	i := 0
+	for i < len(s) && i < w && s[i] >= 0x20 && s[i] <= 0x7e {
+		i++
+	}
+	if i == len(s) {
+		return s
+	}
+	if i == w && s[i] >= 0x20 && s[i] <= 0x7e {
+		return s[:i]
+	}
+	if i > 0 {
+		i--
+	}
+	return s[:i] + takeWidthSlow(s[i:], w-i)
+}
+
+func takeWidthSlow(s string, w int) string {
 	g := uniseg.NewGraphemes(s)
 	n := 0
 	var b strings.Builder
@@ -125,7 +300,7 @@ func splitWidth(s string, w int) (string, string) {
 
 type token struct {
 	text  string
-	style lipgloss.Style
+	style *lipgloss.Style
 	space bool
 }
 

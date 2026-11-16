@@ -14,7 +14,7 @@ type execCall struct {
 	id      string
 	command []string
 	parsed  []protocol.ParsedCommand
-	output  strings.Builder
+	output  liveOutput
 	done    bool
 	exit    int
 	started time.Time
@@ -210,12 +210,9 @@ func commandLines(x *execCall, width int, st *Styles, detail bool) []Line {
 	}
 	out := cmdLines
 
-	lines := strings.Split(sanitize(x.output.String()), "\n")
-	if !x.done {
-		lines = strings.Split(strings.TrimRight(sanitize(x.output.String()), "\n"), "\n")
-		if len(lines) == 1 && lines[0] == "" {
-			return out
-		}
+	lines := x.output.view()
+	if !x.done && lines.total == 0 {
+		return out
 	}
 	mode := outputPreview
 	if x.user {

@@ -56,9 +56,45 @@ func lexerFor(lang, filename string) chroma.Lexer {
 	return chroma.Coalesce(l)
 }
 
+// hlKey identifies a highlighted block: tokenizing is the costliest part
+// of rendering, and a streaming answer or an approval re-renders the same
+// blocks on every frame.
+type hlKey struct {
+	code, lexer string
+	plainBase   bool // base is st.Plain (diffs), else st.Code
+}
+
+const maxHighlightCache = 8 << 20 // bytes of source kept
+
 // highlightLines tokenizes code and returns one styled line per source
-// line, using base for unhighlighted text. Falls back to plain lines.
-func highlightLines(code string, lexer chroma.Lexer, base lipgloss.Style, st *Styles) []Line {
+// line, using base (st.Code, or st.Plain when plainBase) for
+// unhighlighted text. Falls back to plain lines. Results are cached and
+// shared: callers must not modify the returned lines in place.
+func highlightLines(code string, lexer chroma.Lexer, plainBase bool, st *Styles) []Line {
+	base := st.Code
+	if plainBase {
+		base = st.Plain
+	}
+	if lexer == nil {
+		return tokenizeLines(code, nil, base, st)
+	}
+	k := hlKey{code, lexer.Config().Name, plainBase}
+	if out, ok := st.hlCache[k]; ok {
+		return out
+	}
+	out := tokenizeLines(code, lexer, base, st)
+	for i, l := range out {
+		out[i] = l[:len(l):len(l)] // appends copy instead of sharing
+	}
+	if st.hlCache == nil || st.hlBytes+len(code) > maxHighlightCache {
+		st.hlCache, st.hlBytes = map[hlKey][]Line{}, 0
+	}
+	st.hlCache[k] = out
+	st.hlBytes += len(code)
+	return out
+}
+
+func tokenizeLines(code string, lexer chroma.Lexer, base lipgloss.Style, st *Styles) []Line {
 	src := strings.Split(code, "\n")
 	plain := func() []Line {
 		out := make([]Line, len(src))

@@ -221,3 +221,20 @@ func TestTurnEndKeepsOtherThreadsApprovals(t *testing.T) {
 		t.Fatalf("b1's approval kept after its own turn ended")
 	}
 }
+
+// Interrupting a turn puts queued follow-ups back in the composer, with
+// their images.
+func TestAbortRestoresQueuedImages(t *testing.T) {
+	m, _ := agentModel()
+	evIn(m, "", protocol.TaskStarted{})
+	m.queued = []pendingInput{{text: "look at this", images: []string{"/tmp/a.png"}}, {text: "and this"}}
+	m.composer.Set("draft")
+	evIn(m, "", protocol.TurnAborted{})
+	if got := m.composer.String(); got != "look at this [Image #1] \nand this\ndraft" {
+		t.Fatalf("composer %q", got)
+	}
+	_, images := m.composer.SubmitWithImages()
+	if len(images) != 1 || images[0] != "/tmp/a.png" {
+		t.Fatalf("images %v", images)
+	}
+}

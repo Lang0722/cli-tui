@@ -275,7 +275,7 @@ func (t *turn) toolDemo(text string) bool {
 	t.emit(protocol.PatchApplyEnd{CallID: "p1", Success: true})
 
 	testCmd := []string{"bash", "-lc", "go test ./..."}
-	t.emit(protocol.ExecApprovalRequest{CallID: "c5", Command: testCmd, Reason: "Run the test suite to verify the change"})
+	t.emit(protocol.ExecApprovalRequest{CallID: "c5", Command: testCmd, Reason: "Run the test suite to verify the change", ProposedPrefix: []string{"go", "test"}})
 	d, ok = t.b.waitApproval(t.ctx, "c5")
 	if !ok || d == protocol.DecisionAbort {
 		return false

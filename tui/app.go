@@ -84,6 +84,9 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	m := newModel(ctx, opts)
+	if testHookModel != nil {
+		testHookModel(m)
+	}
 	p := tea.NewProgram(m, tea.WithContext(ctx))
 	go m.out.run(p.Println)
 	_, err := p.Run()
@@ -95,10 +98,17 @@ func Run(ctx context.Context, opts Options) error {
 	return err
 }
 
+// testHookModel lets an end-to-end test observe the running model.
+var testHookModel func(*model)
+
 var errBackendClosed = errors.New("the backend exited (its event stream closed)")
 
 type (
-	backendMsg  struct{ ev protocol.Event }
+	backendMsg   struct{ ev protocol.Event }
+	backendBatch struct {
+		evs  []protocol.Event
+		done bool // the stream closed after these
+	}
 	backendDone struct{}
 	tickMsg     struct{}
 	filesMsg    []string
@@ -128,6 +138,16 @@ type streamState struct {
 	emitted    int // wrapped rows already printed to scrollback
 	emittedSrc int // source bytes those rows were rendered from
 	active     bool
+	width      int    // width the printed rows were wrapped at
+	base       int    // source offset incremental rendering starts at
+	baseRows   int    // rows rendered from src[:base] (all printed)
+	printed    []Line // the emitted rows
+	tailCache  tailCache
+}
+
+type tailCache struct {
+	n, width, base, emitted int
+	rows                    []Line
 }
 
 type model struct {
@@ -149,6 +169,7 @@ type model struct {
 	// session
 	agent, model, effort, cwd, version string
 	sessionID                          string
+	permissions, approvalMode          string
 
 	// resume
 	picker         *resumePicker
@@ -193,6 +214,8 @@ type model struct {
 	closed   bool
 	quitting bool
 	userQuit bool
+
+	backendCmds []Command // advertised with protocol.SlashCommands
 
 	selections     []*selectionView
 	freeformID     string // answering a selection with typed text
@@ -263,7 +286,7 @@ func (m *model) liveTranscript(width int) []Line {
 		}
 		out = append(out, reasoningCell{m.reasoning.String()}.Lines(width, m.st)...)
 	}
-	if tail := m.streamRows(m.stream.src.String()); m.stream.active && len(tail) > 0 {
+	if tail := m.streamAll(); m.stream.active && len(tail) > 0 {
 		if len(out) > 0 {
 			out = append(out, Line{})
 		}
@@ -332,6 +355,9 @@ func (m *model) Init() tea.Cmd {
 	return tea.Batch(append(cmds, m.ensureTick())...)
 }
 
+// waitEvent delivers the next backend events. Whatever else is already
+// queued comes along (up to maxEventBatch), so a fast stream is handled in
+// one Update and drawn once instead of once per event.
 func (m *model) waitEvent() tea.Cmd {
 	ch := m.opts.Backend.Events()
 	return func() tea.Msg {
@@ -339,9 +365,25 @@ func (m *model) waitEvent() tea.Cmd {
 		if !ok {
 			return backendDone{}
 		}
-		return backendMsg{ev}
+		b := backendBatch{evs: []protocol.Event{ev}}
+		for len(b.evs) < maxEventBatch {
+			select {
+			case ev, ok := <-ch:
+				if !ok {
+					b.done = true
+					return b
+				}
+				b.evs = append(b.evs, ev)
+				continue
+			default:
+			}
+			break
+		}
+		return b
 	}
 }
+
+const maxEventBatch = 512
 
 func (m *model) submit(op protocol.Op) {
 	if err := m.opts.Backend.Submit(m.ctx, op); err != nil {
@@ -409,14 +451,38 @@ func (m *model) flushActive(force bool) {
 
 // --- streaming agent text ------------------------------------------------
 
-func (m *model) streamRows(src string) []Line {
-	return wrapMarkdown(RenderMarkdown(src, m.st, m.width-2), m.width, L(S("• ", m.st.Plain)), L(P("  ")))
+// Streaming renders incrementally. Rows printed to scrollback are final,
+// so instead of re-rendering the whole answer on every delta (quadratic in
+// its length, and syntax highlighting makes each pass costly) only the
+// source after stream.base is rendered: base is a top-level block boundary
+// whose split was checked to render exactly like the whole.
+
+// streamRows renders the whole source as one answer cell.
+func (m *model) streamRows(src string) []Line { return m.segmentRows(src, true) }
+
+// segmentRows renders part of an answer; first gives it the "• " bullet.
+func (m *model) segmentRows(src string, first bool) []Line {
+	return m.wrapSegment(RenderMarkdown(src, m.st, m.width-2), first)
+}
+
+func (m *model) wrapSegment(md []mdLine, first bool) []Line {
+	lead := L(P("  "))
+	if first {
+		lead = L(S("• ", m.st.Plain))
+	}
+	return wrapMarkdown(md, m.width, lead, L(P("  ")))
+}
+
+// streamSegment renders the source after base.
+func (m *model) streamSegment(src string) []Line {
+	return m.segmentRows(src[m.stream.base:], m.stream.base == 0)
 }
 
 func (m *model) streamDelta(d string) {
 	if !m.stream.active {
 		m.flushActive(true)
 		m.stream.active = true
+		m.stream.width = m.width
 	}
 	m.stream.src.WriteString(d)
 	src := m.stream.src.String()
@@ -429,23 +495,74 @@ func (m *model) streamDelta(d string) {
 	if i <= m.stream.emittedSrc {
 		return
 	}
-	rows := m.streamRows(src[:i])
-	if len(rows) > m.stream.emitted {
-		m.printLines(rows[m.stream.emitted:], m.stream.emitted == 0)
-		m.stream.emitted = len(rows)
+	md, split := renderMarkdownSplit(src[m.stream.base:i], m.st, m.width-2)
+	rows := m.wrapSegment(md, m.stream.base == 0)
+	if n := m.stream.baseRows + len(rows); n > m.stream.emitted {
+		fresh := rows[m.stream.emitted-m.stream.baseRows:]
+		m.printLines(fresh, m.stream.emitted == 0)
+		m.stream.printed = append(m.stream.printed, fresh...)
+		m.stream.emitted = n
 	}
 	m.stream.emittedSrc = i
+	if split > 0 {
+		m.advanceStreamBase(src, i, split, rows)
+	}
 }
 
+// advanceStreamBase moves base to the last block boundary in the emitted
+// source src[base:end] (as the renderer reports it) once rendering from
+// there reproduces the tail of the segment's rows.
+func (m *model) advanceStreamBase(src string, end int, line int, rows []Line) {
+	k := m.stream.base
+	for n := 0; n < line; n++ {
+		k += strings.IndexByte(src[k:end], '\n') + 1
+	}
+	tail := m.segmentRows(src[k:end], false)
+	if len(tail) == 0 || len(tail) >= len(rows) || renderLines(tail) != renderLines(rows[len(rows)-len(tail):]) {
+		return // e.g. a fence just opened: wait for its first rendered row
+	}
+	m.stream.baseRows += len(rows) - len(tail)
+	m.stream.base = k
+}
+
+// streamTail is the not-yet-printed part of the answer (the live rows
+// below the scrollback), cached per source length and width.
 func (m *model) streamTail() []Line {
 	if !m.stream.active {
 		return nil
 	}
-	rows := m.streamRows(m.stream.src.String())
-	if len(rows) > m.stream.emitted {
-		return rows[m.stream.emitted:]
+	src := m.stream.src.String()
+	if c := &m.stream.tailCache; c.n != len(src) || c.width != m.width || c.base != m.stream.base || c.emitted != m.stream.emitted {
+		rows := m.streamSegment(src)
+		c.rows = nil
+		if skip := m.stream.emitted - m.stream.baseRows; len(rows) > skip {
+			c.rows = rows[skip:]
+		}
+		c.n, c.width, c.base, c.emitted = len(src), m.width, m.stream.base, m.stream.emitted
 	}
-	return nil
+	return m.stream.tailCache.rows
+}
+
+// streamAll is every row of the answer so far (printed and live).
+func (m *model) streamAll() []Line {
+	tail := m.streamTail()
+	return append(m.stream.printed[:len(m.stream.printed):len(m.stream.printed)], tail...)
+}
+
+// rewrapStream re-renders the printed part of a streaming answer at the
+// current width (after a resize), restarting incremental rendering.
+func (m *model) rewrapStream() {
+	if !m.stream.active || m.stream.width == m.width {
+		return
+	}
+	m.stream.width = m.width
+	m.stream.base, m.stream.baseRows = 0, 0
+	m.stream.printed = nil
+	if m.stream.emitted > 0 {
+		m.stream.printed = m.streamRows(m.stream.src.String()[:m.stream.emittedSrc])
+	}
+	m.stream.emitted = len(m.stream.printed)
+	m.stream.tailCache = tailCache{}
 }
 
 func (m *model) finalizeStream(final string) {
@@ -463,9 +580,9 @@ func (m *model) finalizeStream(final string) {
 	if final != "" && final != src && strings.HasPrefix(final, src[:m.stream.emittedSrc]) {
 		src = final
 	}
-	rows := m.streamRows(src)
-	if len(rows) > m.stream.emitted {
-		m.printLines(rows[m.stream.emitted:], m.stream.emitted == 0)
+	rows := m.streamSegment(src)
+	if skip := m.stream.emitted - m.stream.baseRows; len(rows) > skip {
+		m.printLines(rows[skip:], m.stream.emitted == 0)
 	}
 	m.committed = append(m.committed, agentCell{src})
 	m.turnHasAgent = true
@@ -515,12 +632,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		widthChanged := max(msg.Width, 20) != m.width
 		m.width, m.height = max(msg.Width, 20), max(msg.Height, 8)
 
-		if m.stream.active && m.stream.emitted > 0 {
-			// Rows already in scrollback were wrapped at the old width;
-			// re-count them at the new width so streaming resumes exactly
-			// after the printed source instead of skipping or repeating.
-			m.stream.emitted = len(m.streamRows(m.stream.src.String()[:m.stream.emittedSrc]))
-		}
+		// Rows already in scrollback were wrapped at the old width;
+		// re-count them at the new width so streaming resumes exactly
+		// after the printed source instead of skipping or repeating.
+		m.rewrapStream()
 		if widthChanged && m.printedAny && !m.opts.NoReflow {
 			return m, m.scheduleReflow()
 		}
@@ -551,14 +666,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.focused = false
 		return m, nil
 	case backendMsg:
-		cmd := m.routeEvent(msg.ev)
-		var reflow tea.Cmd
-		if m.pendingReflow != reflowNone && !m.stream.active {
-			mode := m.pendingReflow
-			m.pendingReflow = reflowNone
-			reflow = m.reflow(mode == reflowHeader)
+		return m, tea.Batch(m.backendEvent(msg.ev), m.waitEvent(), m.ensureTick())
+	case backendBatch:
+		cmds := make([]tea.Cmd, 0, len(msg.evs)+2)
+		for _, ev := range msg.evs {
+			cmds = append(cmds, m.backendEvent(ev))
 		}
-		return m, tea.Batch(cmd, reflow, m.waitEvent(), m.ensureTick())
+		if msg.done {
+			_, cmd := m.Update(backendDone{})
+			return m, tea.Batch(append(cmds, cmd)...)
+		}
+		return m, tea.Batch(append(cmds, m.waitEvent(), m.ensureTick())...)
 	case backendDone:
 		m.closed = true
 		m.finalizeStream("")
@@ -620,6 +738,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) backendEvent(ev protocol.Event) tea.Cmd {
+	cmd := m.routeEvent(ev)
+	if m.pendingReflow != reflowNone && !m.stream.active {
+		mode := m.pendingReflow
+		m.pendingReflow = reflowNone
+		return tea.Batch(cmd, m.reflow(mode == reflowHeader))
+	}
+	return cmd
+}
+
 func (m *model) needsTick() bool {
 	if m.running || m.awaitingList || m.awaitingResume || m.needsAction() || time.Now().Before(m.hintUntil) {
 		return true
@@ -667,6 +795,10 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		return fetchGitInfo(m.cwd)
 	case protocol.SessionTitle:
 		m.sessionTitle = e.Title
+	case protocol.SessionUpdated:
+		return m.onSessionUpdated(e)
+	case protocol.SlashCommands:
+		m.setBackendCommands(e.Commands)
 	case protocol.CollabToolCall:
 		if c := m.collabRow(e); c != nil {
 			// Codex flushes the answer stream before a collab row.
@@ -744,7 +876,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.active = append(m.active, &execCell{calls: []*execCall{call}})
 	case protocol.ExecCommandOutputDelta:
 		if c := m.execByID[e.CallID]; c != nil {
-			c.output.WriteString(e.Chunk)
+			c.output.push(e.Chunk)
 		}
 	case protocol.ExecCommandEnd:
 		c := m.execByID[e.CallID]
@@ -756,13 +888,10 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		c.done, c.exit = true, e.ExitCode
 		c.dur = time.Duration(e.DurationMs) * time.Millisecond
 		if out := e.AggregatedOutput; out != "" {
-			c.output.Reset()
-			c.output.WriteString(out)
+			c.output.set(out)
 		} else if c.output.Len() == 0 {
-			c.output.WriteString(e.Stdout)
-			if e.Stderr != "" {
-				c.output.WriteString(e.Stderr)
-			}
+			c.output.push(e.Stdout)
+			c.output.push(e.Stderr)
 		}
 		m.flushActive(false)
 	case protocol.ToolCallBegin:
@@ -884,16 +1013,22 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 	m.turnHasAgent = false
 	m.statusDetail = ""
 	if aborted && len(m.queued) > 0 {
-		// Restore queued input into the composer for editing.
-		var texts []string
-		for _, q := range m.queued {
-			texts = append(texts, q.text)
+		// Restore queued input (with its images) into the composer for
+		// editing, ahead of what was being typed.
+		draft := m.composer.String()
+		m.composer.Set("")
+		for i, q := range m.queued {
+			if i > 0 {
+				m.composer.insert("\n")
+			}
+			m.composer.insert(expandTabs(q.text))
+			for _, p := range q.images {
+				m.composer.AttachImage(p)
+			}
 		}
-		restored := strings.Join(texts, "\n")
-		if !m.composer.Empty() {
-			restored += "\n" + m.composer.String()
+		if draft != "" {
+			m.composer.insert("\n" + draft)
 		}
-		m.composer.Set(restored)
 		m.queued = nil
 	} else if len(m.queued) > 0 {
 		next := m.queued[0]
@@ -1300,6 +1435,12 @@ func (m *model) submitComposer() tea.Cmd {
 			m.composer.Submit()
 			return m.runCommand(name, args)
 		}
+		// Codex refuses unknown commands (keeping the draft) instead of
+		// sending them as a message; "/usr/bin/x" and " /x" are text.
+		if raw := m.composer.String(); name != "" && !strings.Contains(name, "/") && !strings.HasPrefix(raw, " ") && !m.composer.shell && m.freeformID == "" {
+			m.commit(infoCell(m.st, "Unrecognized command '/"+name+"'. Type \"/\" for a list of supported commands."))
+			return nil
+		}
 	}
 	if m.parentOwned() && m.freeformID == "" {
 		// Codex keeps the draft and refuses it; local commands still run.
@@ -1396,37 +1537,58 @@ func splitCommand(text string) (string, string) {
 	return name, strings.TrimSpace(args)
 }
 
-func (m *model) lookupCommand(name string) bool {
-	for _, c := range m.opts.Commands {
-		if c.Name == name {
-			return true
+// commands is the built-in list plus what the backend advertised.
+func (m *model) commands() []Command {
+	if len(m.backendCmds) == 0 {
+		return m.opts.Commands
+	}
+	return append(m.opts.Commands[:len(m.opts.Commands):len(m.opts.Commands)], m.backendCmds...)
+}
+
+func (m *model) command(name string) *Command {
+	cs := m.commands()
+	for i := range cs {
+		if cs[i].Name == name {
+			return &cs[i]
 		}
 	}
-	return false
+	return nil
+}
+
+func (m *model) lookupCommand(name string) bool { return m.command(name) != nil }
+
+// setBackendCommands installs commands advertised by the backend.
+func (m *model) setBackendCommands(cmds []protocol.CommandInfo) {
+	m.backendCmds = nil
+	seen := map[string]bool{}
+	for _, c := range m.opts.Commands {
+		seen[c.Name] = true
+	}
+	for _, c := range cmds {
+		name := strings.TrimPrefix(strings.TrimSpace(c.Name), "/")
+		if name == "" || strings.ContainsAny(name, " \t\n/") || seen[name] {
+			continue
+		}
+		seen[name] = true
+		m.backendCmds = append(m.backendCmds, Command{Name: name, Description: sanitizeLine(c.Description), DuringTask: c.AvailableDuringTask})
+	}
 }
 
 // commandBlocked reports (and flashes) commands that cannot run now:
-// backend commands and /resume are refused while a turn is running.
+// those not marked DuringTask are refused while a turn is running.
 func (m *model) commandBlocked(name string) bool {
 	if !m.running {
 		return false
 	}
-	for _, c := range m.opts.Commands {
-		if c.Name == name && (!c.Local || name == "resume" || name == "clear") {
-			m.commit(errorCell(m.st, "'/"+name+"' is disabled while a task is in progress."))
-			return true
-		}
+	if c := m.command(name); c != nil && !c.DuringTask {
+		m.commit(errorCell(m.st, "'/"+name+"' is disabled while a task is in progress."))
+		return true
 	}
 	return false
 }
 
 func (m *model) runCommand(name, args string) tea.Cmd {
-	var cmd *Command
-	for i := range m.opts.Commands {
-		if m.opts.Commands[i].Name == name {
-			cmd = &m.opts.Commands[i]
-		}
-	}
+	cmd := m.command(name)
 	if cmd == nil {
 		return nil
 	}
@@ -1492,7 +1654,19 @@ func (m *model) statusCell() Cell {
 		L(S("• ", st.Plain), S(m.agent+" status", st.Bold)),
 		row("Model:", strings.TrimSpace(m.model+" "+m.effort)),
 		row("Directory:", tildePath(m.cwd)),
-		row("Tokens used:", fmt.Sprintf("%d", m.tokensUsed)),
+	}
+	if m.permissions != "" {
+		lines = append(lines, row("Permissions:", m.permissions))
+	}
+	if m.approvalMode != "" {
+		lines = append(lines, row("Approval:", m.approvalMode))
+	}
+	if m.sessionID != "" {
+		lines = append(lines, row("Session:", m.sessionID))
+	}
+	lines = append(lines, row("Tokens used:", fmt.Sprintf("%d", m.tokensUsed)))
+	if m.inputTokens > 0 || m.outputTokens > 0 {
+		lines = append(lines, row("", fmt.Sprintf("%s in · %s out", compactCount(m.inputTokens), compactCount(m.outputTokens))))
 	}
 	if m.contextWindow > 0 {
 		lines = append(lines, row("Context:", fmt.Sprintf("%d%% left of %d", m.contextLeft(), m.contextWindow)))
@@ -1520,7 +1694,7 @@ func (m *model) refreshPopups() tea.Cmd {
 		first := strings.SplitN(text, " ", 2)[0]
 		if !strings.Contains(first, "\n") && c.cursor <= len([]rune(first)) && !strings.Contains(text, " ") {
 			if c.slash == nil {
-				c.slash = &slashPopup{all: m.opts.Commands}
+				c.slash = &slashPopup{all: m.commands()}
 			}
 			c.slash.filter(strings.TrimPrefix(first, "/"))
 			c.files = nil

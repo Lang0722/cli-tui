@@ -30,7 +30,7 @@ func init() {
 		PatchApplyBegin{}, PatchApplyEnd{}, ToolCallBegin{}, ToolCallEnd{},
 		PlanUpdate{}, TokenCount{}, BackgroundEvent{}, Warning{}, Error{},
 		StreamError{}, ShutdownComplete{}, SessionList{}, SessionTitle{}, UserMessage{}, SelectionRequest{},
-		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{},
+		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{},
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}

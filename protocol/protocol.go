@@ -55,6 +55,9 @@ type ExecApproval struct {
 	CallID   string         `json:"call_id"`
 	Decision ReviewDecision `json:"decision"`
 	ThreadID string         `json:"thread_id,omitempty"` // thread that asked
+	// Prefix is the request's ProposedPrefix, echoed back with
+	// DecisionApprovedForPrefix.
+	Prefix []string `json:"prefix,omitempty"`
 }
 
 // PatchApproval answers an ApplyPatchApprovalRequest.
@@ -93,7 +96,10 @@ type ReviewDecision string
 const (
 	DecisionApproved           ReviewDecision = "approved"
 	DecisionApprovedForSession ReviewDecision = "approved_for_session"
-	DecisionDenied             ReviewDecision = "denied"
+	// DecisionApprovedForPrefix approves this command and every later one
+	// that starts with ExecApproval.Prefix (Codex' exec-policy amendment).
+	DecisionApprovedForPrefix ReviewDecision = "approved_for_prefix"
+	DecisionDenied            ReviewDecision = "denied"
 	// DecisionAbort means "no, and tell the agent what to do differently":
 	// the backend should stop the turn and wait for new user input.
 	DecisionAbort ReviewDecision = "abort"
@@ -138,6 +144,11 @@ type SessionConfigured struct {
 	// Resumed must be true when this answers a ResumeSession, even if the
 	// session has no messages yet; it ends the UI's "loading" state.
 	Resumed bool `json:"resumed,omitempty"`
+	// Permissions and ApprovalMode are short labels for what the agent may
+	// do ("workspace-write", "on-request"); shown by the status line items
+	// "permissions" and "approval-mode" and in /status.
+	Permissions  string `json:"permissions,omitempty"`
+	ApprovalMode string `json:"approval_mode,omitempty"`
 }
 
 // TaskStarted marks the beginning of a turn.
@@ -236,6 +247,10 @@ type ExecApprovalRequest struct {
 	Command []string `json:"command"`
 	Cwd     string   `json:"cwd,omitempty"`
 	Reason  string   `json:"reason,omitempty"`
+	// ProposedPrefix, when set, adds "don't ask again for commands that
+	// start with ..." to the prompt; choosing it answers
+	// DecisionApprovedForPrefix with this prefix.
+	ProposedPrefix []string `json:"proposed_prefix,omitempty"`
 }
 
 // FileChangeKind enumerates patch operations.

@@ -63,6 +63,8 @@ var surfaceItems = []surfaceItem{
 	{id: "git-branch", desc: "Current Git branch (omitted when unavailable)", accent: accentBranch, inTitle: true, titleMax: 32},
 	{id: "branch-changes", desc: "Committed branch changes against the default branch (omitted when unavailable)", accent: accentBranch},
 	{id: "run-state", aliases: []string{"status"}, desc: "Compact session run-state text (Ready, Working, Thinking)", accent: accentState, inTitle: true},
+	{id: "permissions", desc: "What the agent may do without asking (omitted when the backend doesn't say)", accent: accentState},
+	{id: "approval-mode", aliases: []string{"approval"}, desc: "Command approval mode (omitted when the backend doesn't say)", accent: accentState},
 	{id: "context-remaining", desc: "Percentage of context window remaining (omitted when unknown)", accent: accentUsage, inTitle: true, titleMax: 32},
 	{id: "context-used", aliases: []string{"context-usage"}, desc: "Percentage of context window used (omitted when unknown)", accent: accentUsage, inTitle: true, titleMax: 32},
 	{id: "app-version", aliases: []string{"codex-version", "version"}, desc: "Agent application version", accent: accentMetadata, inTitle: true, titleMax: 32},
@@ -300,6 +302,10 @@ func (m *model) itemValue(id string, title bool) string {
 		return compactCount(m.outputTokens) + " out"
 	case "thread-id":
 		return m.sessionID
+	case "permissions":
+		return m.permissions
+	case "approval-mode":
+		return m.approvalMode
 	case "thread-name":
 		return m.sessionTitle
 	case "thread-title":
@@ -651,6 +657,10 @@ func surfacePlaceholder(id string) string {
 		return "my-machine"
 	case "thread-id":
 		return "550e8400-e29b-41d4"
+	case "permissions":
+		return "workspace-write"
+	case "approval-mode":
+		return "on-request"
 	case "thread-name", "thread-title":
 		return "Session name"
 	case "task-progress":

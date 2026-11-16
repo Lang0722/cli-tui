@@ -42,3 +42,39 @@ func TestBeOpsRoundTrip(t *testing.T) {
 		t.Logf("%s -> %#v err=%v", l, e, err)
 	}
 }
+
+func TestSessionEventsRoundTrip(t *testing.T) {
+	for _, line := range []string{
+		`{"id":"1","msg":{"type":"session_updated","model":"m","reasoning_effort":"high","cwd":"/x","permissions":"read-only","approval_mode":"never"}}`,
+		`{"id":"1","msg":{"type":"slash_commands","commands":[{"name":"standup","description":"d","available_during_task":true}]}}`,
+		`{"id":"1","msg":{"type":"session_configured","model":"m","cwd":"/","permissions":"workspace-write","approval_mode":"on-request"}}`,
+	} {
+		e, err := UnmarshalEvent([]byte(line))
+		if err != nil {
+			t.Fatalf("%s: %v", line, err)
+		}
+		switch v := e.Msg.(type) {
+		case SessionUpdated:
+			if v.Model != "m" || v.ReasoningEffort != "high" || v.Cwd != "/x" || v.Permissions != "read-only" || v.ApprovalMode != "never" {
+				t.Errorf("%#v", v)
+			}
+		case SlashCommands:
+			if len(v.Commands) != 1 || v.Commands[0].Name != "standup" || !v.Commands[0].AvailableDuringTask {
+				t.Errorf("%#v", v)
+			}
+		case SessionConfigured:
+			if v.Permissions != "workspace-write" || v.ApprovalMode != "on-request" {
+				t.Errorf("%#v", v)
+			}
+		default:
+			t.Errorf("%s decoded as %T", line, e.Msg)
+		}
+		b, err := MarshalEvent(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e2, err := UnmarshalEvent(b); err != nil || e2.Msg == nil {
+			t.Errorf("re-decode %s: %v", b, err)
+		}
+	}
+}

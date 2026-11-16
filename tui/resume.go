@@ -258,6 +258,7 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) {
 		m.agent = e.AgentName
 	}
 	m.model, m.effort, m.version, m.sessionID = e.Model, e.ReasoningEffort, e.Version, e.SessionID
+	m.permissions, m.approvalMode = sanitizeLine(e.Permissions), sanitizeLine(e.ApprovalMode)
 	if e.Cwd != "" {
 		m.cwd = e.Cwd
 	}
@@ -286,6 +287,39 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) {
 	m.replay(e.InitialMessages)
 	m.commit(textCell{bullet: S("↻", m.st.Accent), body: L(S("Resumed session ", m.st.Dim), S(e.SessionID, m.st.Plain),
 		S(fmt.Sprintf(" · %d events · continue below", len(e.InitialMessages)), m.st.Dim))})
+}
+
+// onSessionUpdated applies settings changed mid-session. Like Codex, a
+// model or permission change is noted in the transcript.
+func (m *model) onSessionUpdated(e protocol.SessionUpdated) tea.Cmd {
+	if m.replaying {
+		return nil
+	}
+	model, effort := m.model, m.effort
+	if e.Model != "" {
+		model = e.Model
+	}
+	if e.ReasoningEffort != "" {
+		effort = e.ReasoningEffort
+	}
+	if model != m.model || effort != m.effort {
+		m.model, m.effort = model, effort
+		m.commit(infoCell(m.st, sanitizeLine(strings.TrimSpace("Model changed to "+model+" "+effort))))
+	}
+	if p := sanitizeLine(e.Permissions); p != "" && p != m.permissions {
+		m.permissions = p
+		m.commit(infoCell(m.st, "Permissions updated to "+p))
+	}
+	if a := sanitizeLine(e.ApprovalMode); a != "" {
+		m.approvalMode = a
+	}
+	if e.Cwd != "" && e.Cwd != m.cwd {
+		m.cwd = e.Cwd
+		m.files = nil // the @ index belongs to the old directory
+		m.git = gitInfo{}
+		return fetchGitInfo(m.cwd)
+	}
+	return nil
 }
 
 // replay renders saved history through the normal event handlers, with

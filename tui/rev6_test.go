@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -128,5 +129,79 @@ func TestReasoningFinalAfterSections(t *testing.T) {
 	out := strings.Join(all, "\n")
 	if strings.Count(out, "Look at the layout.") != 1 || strings.Count(out, "Then fix it.") != 1 {
 		t.Errorf("reasoning sections repeated:\n%s", out)
+	}
+}
+
+// Streaming a code block extends the last highlight instead of
+// re-tokenizing it whole; for ordinary code the rows must match a full
+// highlight at every prefix, and a late change to earlier lines (a
+// comment closed after them) must fall back to a full pass.
+func TestHighlightExtendsStreamingBlock(t *testing.T) {
+	st := newStyles()
+	lexer := lexerFor("go", "")
+	var b strings.Builder
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&b, "\tctx, cancel := context.WithTimeout(r.Context(), %d*time.Second) // c%d\n", i, i)
+	}
+	code := b.String()
+	full := func(s string) string {
+		return renderLines(tokenizeLines(s, lexer, false, newStyles()))
+	}
+	extended := 0
+	for n := 1; n <= len(code); n += 31 {
+		done := st.extendHighlights()
+		got := highlightLines(code[:n], lexer, false, st)
+		done()
+		if st.hlCache[hlKey{code[:n], lexer.Config().Name, false}] == nil {
+			extended++
+		}
+		if renderLines(got) != full(code[:n]) {
+			t.Fatalf("prefix %d differs from a full highlight", n)
+		}
+	}
+	if extended < 100 {
+		t.Errorf("only %d prefixes were extended", extended)
+	}
+
+	// A block comment closed late recolors the lines it spans. While
+	// streaming those rows were printed already (as with a full pass on
+	// every delta), but a committed answer is highlighted whole.
+	st = newStyles()
+	open := "x := 1\n/* note\n" + strings.Repeat("y := 2 + 3\n", 20)
+	done := st.extendHighlights()
+	highlightLines(open, lexer, false, st)
+	done()
+	closed := open + "*/\nz := 4\n"
+	if got := highlightLines(closed, lexer, false, st); renderLines(got) != full(closed) {
+		t.Errorf("a committed block wasn't highlighted whole")
+	}
+}
+
+// Adjacent deltas of one stream merge; other events, other threads and
+// other kinds of delta keep them apart and keep their order.
+func TestCoalesceDeltas(t *testing.T) {
+	d := func(th, s string) protocol.Event {
+		return protocol.Event{Thread: th, Msg: protocol.AgentMessageDelta{Delta: s}}
+	}
+	r := func(s string) protocol.Event { return protocol.Event{Msg: protocol.AgentReasoningDelta{Delta: s}} }
+	in := []protocol.Event{r("a"), r("b"), d("", "1"), d("", "2"), d("t", "x"), d("", "3"),
+		{Msg: protocol.ExecCommandBegin{CallID: "c"}}, d("", "4"), d("", "5")}
+	var got []string
+	for _, e := range coalesceDeltas(in) {
+		switch x := e.Msg.(type) {
+		case protocol.AgentMessageDelta:
+			got = append(got, e.Thread+":"+x.Delta)
+		case protocol.AgentReasoningDelta:
+			got = append(got, "r:"+x.Delta)
+		default:
+			got = append(got, "exec")
+		}
+	}
+	want := "r:ab :12 t:x :3 exec :45"
+	if strings.Join(got, " ") != want {
+		t.Errorf("got %q, want %q", strings.Join(got, " "), want)
+	}
+	if one := []protocol.Event{d("", "x")}; &coalesceDeltas(one)[0] != &one[0] {
+		t.Errorf("a batch with nothing to merge is copied")
 	}
 }

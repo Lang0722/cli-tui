@@ -181,10 +181,11 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 				v = "Deleted"
 			}
 		}
-		out = append(out, append(L(bullet, P(" "), S(v+" ", st.Bold)), fileLabel(files[0])...))
+		// Long paths wrap under the verb rather than overflow the row.
+		out = append(out, Wrap(fileLabel(files[0]), width, L(bullet, P(" "), S(v+" ", st.Bold)), L(P("  ")))...)
 	} else {
 		head := L(bullet, P(" "), S(verb+" ", st.Bold), S(fmt.Sprintf("%d files ", len(files)), st.Plain))
-		out = append(out, append(head, counts(st, tadd, tdel)...))
+		out = append(out, Wrap(counts(st, tadd, tdel), width, head, L(P("  ")))...)
 	}
 
 	budget := maxRows
@@ -198,7 +199,7 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 			if i > 0 {
 				out = append(out, Line{})
 			}
-			out = append(out, append(L(S("  └ ", st.Dim)), fileLabel(f)...))
+			out = append(out, Wrap(fileLabel(f), width, L(S("  └ ", st.Dim)), L(P("    ")))...)
 			indent = "    "
 		}
 		lexer := lexerFor("", f.path)
@@ -281,6 +282,6 @@ func (c patchFailedCell) Lines(width int, st *Styles) []Line {
 	if msg == "" {
 		msg = "(error details unavailable)"
 	}
-	out := []Line{L(S("✘ ", st.RedB), S("Failed to apply patch", st.Red))}
+	out := Wrap(L(S("Failed to apply patch", st.Red)), width, L(S("✘ ", st.RedB)), L(P("  ")))
 	return append(out, outputLines(outLinesOf(strings.Split(msg, "\n")), width, st, true, outputPreview)...)
 }

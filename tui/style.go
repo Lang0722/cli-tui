@@ -17,8 +17,11 @@ import (
 // Solarized, ...) is respected; RGB is used only for tinted backgrounds that
 // are derived from the terminal's real background (queried via OSC 11).
 type Styles struct {
-	hlCache map[hlKey][]Line // highlightLines results
-	hlBytes int
+	hlCache  map[hlKey][]Line // highlightLines results
+	hlBytes  int
+	hlLast   hlLast                         // the last block tokenized (to extend)
+	hlExtend bool                           // a streaming answer is rendering
+	hlStyles map[hlStyleKey]*lipgloss.Style // shared per token type
 
 	Plain   lipgloss.Style
 	Dim     lipgloss.Style

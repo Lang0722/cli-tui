@@ -383,6 +383,7 @@ event, 4 vCPU):
 | scenario | before | now |
 |---|---|---|
 | stream a 25 KB answer in 4-byte deltas | 108 s | 0.26 s |
+| one delta into a 20 KB code block that is still open | 51 ms | 3 ms |
 | 8 MB of live command output in 4 KB chunks | 291 s | 0.12 s |
 | resume a 300-turn session (16.5k lines) | 1.4 s | 0.11 s |
 | one Ctrl+T pager frame over that session | 14 ms | 0.1 ms |
@@ -392,12 +393,17 @@ What makes this work:
 
 - **Streaming.** Only the markdown after the last finished block is
   re-rendered. A randomized test checks the output is identical to a full
-  render.
-- **Event batching.** Events are applied in batches of up to 512 per frame.
+  render. A code block that is still open is highlighted from a few lines
+  before its end, reusing the rows above once the lexer is seen to
+  resynchronise there; a finished answer is highlighted whole.
+- **Event batching.** Events are applied in batches of up to 512 per frame,
+  and adjacent text deltas in a batch are merged, so the answer is rendered
+  once per frame.
 - **Live command output** follows Codex: a 1 MiB budget, then the first and
   last 50 lines, with very long lines shortened in the middle.
-- **Caches** for highlighted code, styled spans, the pager's search text and
-  the approval body.
+- **Caches** for highlighted code (bounded by the size of what it holds;
+  tokens of one type share a style), styled spans, the pager's search text
+  and the approval body.
 
 ## Parity with Codex
 
@@ -436,9 +442,10 @@ snapshots.
     Quotes and code blocks can sit inside an item. Empty items and items
     whose text starts on the next line are supported. Ordered markers are
     light blue; quotes are green throughout.
-  - HTML entities are decoded. HTML blocks and indented code are shown
-    verbatim. A `md`/`markdown` fence that holds a table is rendered as
-    markdown.
+  - HTML entities ending in `;` are decoded, as in CommonMark (so
+    `?a=1&region=2` stays as written). HTML blocks and indented code are
+    shown verbatim; an indented `# x` or `- x` is code. A `md`/`markdown`
+    fence that holds a table is rendered as markdown.
   - Local file links show their label plus the target in code style,
     relative to the session directory, with `#L12C3` shown as `:12:3`.
   - TeX math, as in Codex: `$…$` and `\(…\)` inline, standalone `$$…$$`

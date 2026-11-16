@@ -53,14 +53,15 @@ func (c headerCell) Lines(width int, st *Styles) []Line {
 		out = append(out, row)
 	}
 	out = append(out, L(S("╰"+strings.Repeat("─", inner+2)+"╯", st.Dim)))
-	out = append(out, Line{},
-		L(S("  To get started, describe a task or try one of these commands:", st.Dim)),
-		Line{},
-		L(P("  "), S("/init", st.Plain), S(" - create an AGENTS.md file with instructions", st.Dim)),
-		L(P("  "), S("/status", st.Plain), S(" - show current session configuration", st.Dim)),
-		L(P("  "), S("/diff", st.Plain), S(" - show git diff (including untracked files)", st.Dim)),
-		L(P("  "), S("?", st.Plain), S(" - keyboard shortcuts", st.Dim)),
-	)
+	out = append(out, Line{})
+	// The help rows wrap on narrow terminals (Codex wraps history rows).
+	help := func(l Line) { out = append(out, Wrap(l, width, L(P("  ")), L(P("  ")))...) }
+	help(L(S("To get started, describe a task or try one of these commands:", st.Dim)))
+	out = append(out, Line{})
+	help(L(S("/init", st.Plain), S(" - create an AGENTS.md file with instructions", st.Dim)))
+	help(L(S("/status", st.Plain), S(" - show current session configuration", st.Dim)))
+	help(L(S("/diff", st.Plain), S(" - show git diff (including untracked files)", st.Dim)))
+	help(L(S("?", st.Plain), S(" - keyboard shortcuts", st.Dim)))
 	return out
 }
 

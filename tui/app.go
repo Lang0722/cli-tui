@@ -410,6 +410,71 @@ func (m *model) waitEvent() tea.Cmd {
 
 const maxEventBatch = 512
 
+// coalesceDeltas merges adjacent text deltas of one stream, so a batch
+// renders the answer once rather than once per delta. (Rendering depends
+// only on the accumulated text, not on how it was split.)
+func coalesceDeltas(evs []protocol.Event) []protocol.Event {
+	var out []protocol.Event
+	var b strings.Builder
+	for i := 0; i < len(evs); i++ {
+		ev := evs[i]
+		j := i + 1
+		for j < len(evs) && sameDeltaStream(ev, evs[j]) {
+			j++
+		}
+		if j == i+1 {
+			if out != nil {
+				out = append(out, ev)
+			}
+			continue
+		}
+		if out == nil {
+			out = append(make([]protocol.Event, 0, len(evs)), evs[:i]...)
+		}
+		b.Reset()
+		for _, e := range evs[i:j] {
+			b.WriteString(deltaText(e.Msg))
+		}
+		switch ev.Msg.(type) {
+		case protocol.AgentMessageDelta:
+			ev.Msg = protocol.AgentMessageDelta{Delta: b.String()}
+		case protocol.AgentReasoningDelta:
+			ev.Msg = protocol.AgentReasoningDelta{Delta: b.String()}
+		}
+		out = append(out, ev)
+		i = j - 1
+	}
+	if out == nil {
+		return evs
+	}
+	return out
+}
+
+func sameDeltaStream(a, b protocol.Event) bool {
+	if a.Thread != b.Thread || a.ID != b.ID {
+		return false
+	}
+	switch a.Msg.(type) {
+	case protocol.AgentMessageDelta:
+		_, ok := b.Msg.(protocol.AgentMessageDelta)
+		return ok
+	case protocol.AgentReasoningDelta:
+		_, ok := b.Msg.(protocol.AgentReasoningDelta)
+		return ok
+	}
+	return false
+}
+
+func deltaText(m protocol.EventMsg) string {
+	switch d := m.(type) {
+	case protocol.AgentMessageDelta:
+		return d.Delta
+	case protocol.AgentReasoningDelta:
+		return d.Delta
+	}
+	return ""
+}
+
 func (m *model) submit(op protocol.Op) {
 	if err := m.opts.Backend.Submit(m.ctx, op); err != nil {
 		m.commit(errorCell(m.st, "failed to send to backend: "+err.Error()))
@@ -506,6 +571,7 @@ func (m *model) readyRows(md []mdLine, rows []Line, hold int) []Line {
 
 // streamSegment renders the source after base.
 func (m *model) streamSegment(src string) []Line {
+	defer m.st.extendHighlights()()
 	return m.segmentRows(src[m.stream.base:], m.stream.base == 0)
 }
 
@@ -526,7 +592,9 @@ func (m *model) streamDelta(d string) {
 	if i <= m.stream.emittedSrc {
 		return
 	}
+	done := m.st.extendHighlights()
 	md, split, hold := renderMarkdownSplit(src[m.stream.base:i], m.st, m.width-2)
+	done()
 	rows := m.wrapSegment(md, m.stream.base == 0)
 	// A trailing paragraph stays in the live tail: a setext underline on
 	// the next line would make it a heading.
@@ -807,8 +875,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case backendMsg:
 		return m, tea.Batch(m.backendEvent(msg.ev), m.waitEvent(), m.ensureTick())
 	case backendBatch:
-		cmds := make([]tea.Cmd, 0, len(msg.evs)+2)
-		for _, ev := range msg.evs {
+		evs := coalesceDeltas(msg.evs)
+		cmds := make([]tea.Cmd, 0, len(evs)+2)
+		for _, ev := range evs {
 			cmds = append(cmds, m.backendEvent(ev))
 		}
 		if msg.done {
@@ -928,7 +997,23 @@ func (m *model) notify(title, body string) tea.Cmd {
 	if !m.opts.Notify || m.focused {
 		return nil
 	}
-	return tea.Raw("\a\x1b]777;notify;" + title + ";" + strings.ReplaceAll(body, ";", ",") + "\x07")
+	// Both parts sit inside an OSC: a control character (BEL ends it)
+	// would let backend text run as terminal commands.
+	osc := func(s string) string { return strings.ReplaceAll(sanitizeLine(s), ";", ",") }
+	return tea.Raw("\a\x1b]777;notify;" + osc(title) + ";" + osc(body) + "\x07")
+}
+
+// sanitizeSelection strips terminal controls from a backend's selection
+// request: its texts are drawn and, once answered, printed to scrollback.
+func sanitizeSelection(r protocol.SelectionRequest) protocol.SelectionRequest {
+	r.Title, r.Subtitle = sanitizeLine(r.Title), sanitize(r.Subtitle)
+	items := make([]protocol.SelectionItem, len(r.Items))
+	for i, it := range r.Items {
+		it.Name, it.Description = sanitizeLine(it.Name), sanitizeLine(it.Description)
+		items[i] = it
+	}
+	r.Items = items
+	return r
 }
 
 func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
@@ -980,7 +1065,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		}
 		m.finalizeStream("")
 		m.flushActive(true)
-		m.selections = append(m.selections, &selectionView{req: e, thread: m.thread})
+		m.selections = append(m.selections, &selectionView{req: sanitizeSelection(e), thread: m.thread})
 		return m.notify(m.agent, e.Title)
 	case protocol.UserMessage:
 		// Live input is drawn when submitted; only history is rendered here.
@@ -1803,6 +1888,7 @@ func (m *model) setBackendCommands(cmds []protocol.CommandInfo) {
 	}
 	for _, c := range cmds {
 		name := strings.TrimPrefix(strings.TrimSpace(c.Name), "/")
+		name = sanitizeLine(name)
 		if name == "" || strings.ContainsAny(name, " \t\n/") || seen[name] {
 			continue
 		}

@@ -86,6 +86,30 @@ func BenchmarkStreamMathAnswer(b *testing.B)  { benchStream(b, mathAnswer(120)) 
 func BenchmarkStreamShellAnswer(b *testing.B) { benchStream(b, shellAnswer(260)) }
 
 // 8 MB of command output in 4 KB chunks while the command runs.
+// One delta into a 20 KB code block that is still open: the block is
+// highlighted from near its end, not from its start, on every delta.
+func BenchmarkCodeBlockDelta(b *testing.B) {
+	m := newTestModel()
+	m.width, m.height = 120, 40
+	ev(m, protocol.SessionConfigured{Model: "gpt-5"})
+	ev(m, protocol.TaskStarted{})
+	line := "\tctx, cancel := context.WithTimeout(r.Context(), 5*time.Second) // comment\n"
+	step(m, protocol.AgentMessageDelta{Delta: "Here is the code:\n\n```go\n" + strings.Repeat(line, 20000/len(line))})
+	m.out.takeQueued()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		d := "x"
+		if i%8 == 7 {
+			d = "\n\tx := 1"
+		}
+		step(m, protocol.AgentMessageDelta{Delta: d})
+		if i%64 == 0 {
+			m.out.takeQueued()
+		}
+	}
+}
+
 func BenchmarkExecLiveOutput(b *testing.B) {
 	chunk := strings.Repeat("compiling package example/internal/server ... ok\n", 100)[:4096]
 	const total = 8 << 20

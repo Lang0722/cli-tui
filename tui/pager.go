@@ -73,7 +73,19 @@ func (c pagerLines) at(i int) Line {
 
 func (p *pager) content(width int) pagerLines {
 	if p.source == nil {
-		return pagerLines{base: p.static}
+		// A static page wraps long lines (Codex static overlay).
+		if width != p.width || p.lines == nil {
+			p.width, p.lines = width, make([]Line, 0, len(p.static))
+			p.lower, p.found = nil, pagerFound{}
+			for _, l := range p.static {
+				if l.Width() <= width {
+					p.lines = append(p.lines, l)
+					continue
+				}
+				p.lines = append(p.lines, WrapChars(l, width, Line{}, Line{})...)
+			}
+		}
+		return pagerLines{base: p.lines}
 	}
 	if width != p.width {
 		p.width, p.cells, p.lines, p.cellStart = width, 0, nil, nil
@@ -249,7 +261,7 @@ func (p *pager) render(width, height int) string {
 	for strw(head)+2 <= width {
 		head += "/ "
 	}
-	out := []Line{L(S(head, st.Dim))}
+	out := []Line{L(S(head, st.Dim)).Truncate(width)}
 	for i := p.offset; i < min(lines.len(), p.offset+body); i++ {
 		l := lines.at(i)
 		if q != "" {
@@ -276,8 +288,8 @@ func (p *pager) render(width, height int) string {
 		return renderLines(out)
 	}
 	if p.finding {
-		out = append(out, L(P(" "), d("Find: "), S(p.query, st.Accent)),
-			L(P(" "), k("enter"), d(" accept · "), k("esc"), d(" cancel")))
+		out = append(out, L(P(" "), d("Find: "), S(p.query, st.Accent)).Truncate(width),
+			L(P(" "), k("enter"), d(" accept · "), k("esc"), d(" cancel")).Truncate(width))
 	} else {
 		second := L(P(" "))
 		if c := st.key("pager.close"); c != "" {
@@ -319,7 +331,10 @@ func highlightQuery(l Line, q string, st *Styles) Line {
 	for _, sp := range l {
 		start := pos
 		pos += len(sp.Text)
-		seg, segMark := start, marks[start] && start < pos
+		if start == pos {
+			continue // an empty span (start may be past the end)
+		}
+		seg, segMark := start, marks[start]
 		for b := start; b <= pos; b++ {
 			if b == pos || marks[b] != segMark {
 				if b > seg {

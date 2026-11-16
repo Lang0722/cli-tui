@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"charm.land/lipgloss/v2"
 )
@@ -27,7 +28,8 @@ var (
 	reTask     = regexp.MustCompile(`^\[([ xX])\](?:\s+(.*))?$`)
 	reFence    = regexp.MustCompile("^ {0,3}(```+|~~~+)\\s*([\\w+#.-]*)")
 	reRule     = regexp.MustCompile(`^\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$`)
-	reURL      = regexp.MustCompile(`https?://[^\s<>()\[\]\x{E000}-\x{E006}]+[^\s<>()\[\].,;:!?'"*_~\x{E000}-\x{E006}]`) // math markers (math.go) end a URL
+	reURL      = regexp.MustCompile(`https?://[^\s<>\[\]\x{E000}-\x{E006}]+[^\s<>\[\].,;:!?'"*_~\x{E000}-\x{E006}]`) // math markers (math.go) end a URL; see urlLen for ")"
+	reEntity   = regexp.MustCompile(`^&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});`)
 	reTableSep = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$`)
 	reQuote    = regexp.MustCompile(`^\s*((?:>\s?)+)(.*)$`)
 	// CommonMark HTML block starts: kinds 1-6 (any line opening with one
@@ -180,6 +182,24 @@ func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 		}
 		return -1
 	}
+	// inItem adds rows of a block (heading, rule, table) that is indented
+	// into list item k: the list goes on, and the rows sit under the
+	// item's text.
+	inItem := func(k int, rows []mdLine) {
+		levels = levels[:k+1]
+		if sawBlank {
+			blankRow()
+		}
+		lead := L(P(strings.Repeat(" ", levels[k].hang)))
+		for _, r := range rows {
+			if len(r.Line) > 0 || r.Fixed {
+				r.Line = append(append(Line{}, lead...), r.Line...)
+				r.Hang = append(append(Line{}, lead...), r.Hang...)
+			}
+			out = append(out, r)
+		}
+		last, sawBlank, itemPara = "list", false, false
+	}
 	// multiline reports whether the rows from r on take more than one
 	// terminal row once wrapped.
 	multiline := func(r int) bool {
@@ -287,6 +307,20 @@ func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 			sawBlank = true
 			continue
 		}
+		if ind >= 4 && last != "list" && (last != "para" || sawBlank) {
+			// Indented code comes before every other block: "    # x",
+			// "    - x" and "    > x" are code (CommonMark), drawn
+			// verbatim like Codex.
+			if last != "icode" {
+				independent()
+				start("icode")
+			} else if sawBlank {
+				out = append(out, mdLine{Keep: true})
+			}
+			sawBlank = false
+			out = append(out, mdLine{Line: L(P("    "), P(restoreMathSource(raw[4:])))})
+			continue
+		}
 
 		// Blockquote: consecutive ">" lines plus lazy continuation lines,
 		// rendered recursively and prefixed with "> " (Codex nests "> > ").
@@ -360,6 +394,11 @@ func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 			for ; j < len(lines) && strings.Contains(lines[j], "|") && strings.TrimSpace(lines[j]) != "" && !strings.HasPrefix(strings.TrimSpace(lines[j]), mathDispOpen); j++ {
 				rows = append(rows, splitRow(lines[j]))
 			}
+			if k := itemFor(ind); k >= 0 && ind > 0 {
+				inItem(k, renderTable(rows, aligns, max(1, width-levels[k].hang), st))
+				i = j - 1
+				continue
+			}
 			independent()
 			start("table")
 			out = append(out, renderTable(rows, aligns, width, st)...)
@@ -386,6 +425,11 @@ func renderBlocks(lines []string, st *Styles, width int, sp *mdSplit) []mdLine {
 			for _, t := range text {
 				out = append(out, mdLine{Line: inline(t, hs, st)})
 			}
+		case reRule.MatchString(raw) && ind > 0 && itemFor(ind) >= 0 && sawBlank:
+			inItem(itemFor(ind), []mdLine{{Line: L(S("———", st.Dim))}})
+		case reHeading.MatchString(trimmed) && ind > 0 && itemFor(ind) >= 0:
+			level, text := parseHeading(trimmed)
+			inItem(itemFor(ind), []mdLine{{Line: inline(text, headingStyle(level, st), st)}})
 		case reRule.MatchString(raw): // "* * *" is a rule, not a list item
 			independent()
 			start("rule")
@@ -628,12 +672,19 @@ func splitRow(line string) []string {
 	line = strings.TrimSuffix(line, "|")
 	var cells []string
 	var cur strings.Builder
+	inMath := false
 	for i := 0; i < len(line); i++ {
 		switch {
+		case strings.HasPrefix(line[i:], mathLitOpen) || strings.HasPrefix(line[i:], mathDispOpen):
+			inMath = true // a formula's "|" (P(A|B)) doesn't split cells
+			cur.WriteByte(line[i])
+		case strings.HasPrefix(line[i:], mathLitClose) || strings.HasPrefix(line[i:], mathDispClose):
+			inMath = false
+			cur.WriteByte(line[i])
 		case line[i] == '\\' && i+1 < len(line) && line[i+1] == '|':
 			cur.WriteByte('|')
 			i++
-		case line[i] == '|':
+		case line[i] == '|' && !inMath:
 			cells = append(cells, strings.TrimSpace(cur.String()))
 			cur.Reset()
 		default:
@@ -665,10 +716,8 @@ func parseAligns(sep string) []byte {
 // at least 3 wide), GFM alignment. When the columns can't fit without
 // breaking words, rows become key/value records instead.
 func renderTable(rows [][]string, aligns []byte, width int, st *Styles) []mdLine {
-	ncol := 0
-	for _, r := range rows {
-		ncol = max(ncol, len(r))
-	}
+	// The header row sets the columns: GFM drops a row's extra cells.
+	ncol := len(rows[0])
 	cell := func(r []string, c int) Line {
 		if c < len(r) {
 			return inline(r[c], st.Plain, st)
@@ -777,16 +826,20 @@ func renderTable(rows [][]string, aligns []byte, width int, st *Styles) []mdLine
 // renderRecords shows each row as "key  value" lines separated by "─"
 // rules; when even that is too narrow, values go under their keys.
 func renderRecords(rows [][]string, ncol, width int, st *Styles) []mdLine {
+	// Keys are the header cells' text without their markup (Codex
+	// header.plain_text()).
+	keys := make([]string, len(rows[0]))
 	keyW := 0
-	for c := 0; c < ncol && c < len(rows[0]); c++ {
-		keyW = max(keyW, strw(rows[0][c]))
+	for c, h := range rows[0] {
+		keys[c] = inline(h, st.Plain, st).Plain()
+		keyW = max(keyW, strw(keys[c]))
 	}
 	stacked := keyW+3+12 > width
 	keyW = min(keyW, max(4, width/3))
 	var out []mdLine
 	if len(rows) == 1 {
 		// header-only table: list the column names
-		for _, key := range rows[0] {
+		for _, key := range keys {
 			for _, row := range Wrap(L(S(key, st.AccentB)), width, L(P(" ")), L(P(" "))) {
 				out = append(out, mdLine{Line: row, Fixed: true})
 			}
@@ -799,8 +852,8 @@ func renderRecords(rows [][]string, ncol, width int, st *Styles) []mdLine {
 		}
 		for c := 0; c < ncol; c++ {
 			key := ""
-			if c < len(rows[0]) {
-				key = rows[0][c]
+			if c < len(keys) {
+				key = keys[c]
 			}
 			var val Line
 			if c < len(r) {
@@ -1009,12 +1062,10 @@ func inline(s string, base lipgloss.Style, st *Styles) Line {
 			i++
 		case c == '&':
 			// An HTML entity (&amp; &copy; &#169;) stands for its character.
-			if end := strings.IndexByte(s[i:min(len(s), i+33)], ';'); end > 1 {
-				if d := html.UnescapeString(s[i : i+end+1]); d != s[i:i+end+1] {
-					buf.WriteString(d)
-					i += end + 1
-					continue
-				}
+			if d, n := entityAt(s[i:]); n > 0 {
+				buf.WriteString(d)
+				i += n
+				continue
 			}
 			buf.WriteByte(c)
 			i++
@@ -1038,7 +1089,19 @@ func decodeEntities(s string) string {
 	if strings.IndexByte(s, '&') < 0 {
 		return s
 	}
-	return html.UnescapeString(s)
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '&' {
+			if d, n := entityAt(s[i:]); n > 0 {
+				b.WriteString(d)
+				i += n
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // bareURLAt returns the length of a bare http(s) URL at the start of s.
@@ -1047,9 +1110,35 @@ func bareURLAt(s string) int {
 		return 0
 	}
 	if loc := reURL.FindStringIndex(s); loc != nil && loc[0] == 0 {
-		return loc[1]
+		return urlLen(s[:loc[1]])
 	}
 	return 0
+}
+
+// urlLen is how much of a matched URL is the URL: a ")" closes it only
+// when the URL has no "(" left for it (Codex trailing_url_end), so
+// ".../Go_(language)" keeps its parenthesis and "(see https://x.com)"
+// doesn't.
+func urlLen(u string) int {
+	for strings.HasSuffix(u, ")") && strings.Count(u, "(") < strings.Count(u, ")") {
+		u = strings.TrimRight(u[:len(u)-1], ".,;:!?'\"*_~")
+	}
+	return len(u)
+}
+
+// entityAt decodes the HTML entity at the start of s (&amp; &copy;
+// &#169;), returning its text and length. Only the form ending in ";"
+// counts, as in CommonMark: "?a=1&region=2" stays as written.
+func entityAt(s string) (string, int) {
+	m := reEntity.FindString(s)
+	if m == "" {
+		return "", 0
+	}
+	d := html.UnescapeString(m)
+	if d == m || utf8.RuneCountInString(d) > 2 {
+		return "", 0 // unknown name (or a legacy prefix of one, "&ltx;")
+	}
+	return d, len(m)
 }
 
 // strongDelim reports whether the two-character delimiter run ("**" or
@@ -1164,9 +1253,12 @@ func linkify(text string, style lipgloss.Style, st *Styles) Line {
 		if loc[0] > last {
 			out = append(out, S(text[last:loc[0]], style))
 		}
-		u := text[loc[0]:loc[1]]
+		if loc[0] < last {
+			continue
+		}
+		u := text[loc[0] : loc[0]+urlLen(text[loc[0]:loc[1]])]
 		out = append(out, S(u, st.Link.Inherit(style).Hyperlink(u)))
-		last = loc[1]
+		last = loc[0] + len(u)
 	}
 	if last < len(text) {
 		out = append(out, S(text[last:], style))

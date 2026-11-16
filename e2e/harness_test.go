@@ -50,6 +50,7 @@ type term struct {
 	socket string
 	home   string // HOME / XDG dirs / sessions live here
 	cwd    string
+	status string // file the exit code is written to
 }
 
 const (
@@ -99,7 +100,11 @@ func start(t *testing.T, o opts) *term {
 		"XDG_STATE_HOME=" + filepath.Join(s.home, ".local", "state"),
 		"PATH=" + os.Getenv("PATH"), "LANG=C.UTF-8", "TERM_PROGRAM=", "VISUAL=", "EDITOR=",
 	}
-	cmd := "env -i " + shellJoin(env) + " " + shellJoin(append([]string{binary}, args...))
+	// sh records the exit code: tmux sometimes misses the child's exit here
+	// and never reaps it (a zombie), leaving #{pane_dead_status} empty.
+	s.status = filepath.Join(t.TempDir(), "exit-status")
+	wrap := `"$0" "$@"; echo $? > ` + shellJoin([]string{s.status})
+	cmd := "env -i " + shellJoin(env) + " sh -c " + shellJoin([]string{wrap}) + " " + shellJoin(append([]string{binary}, args...))
 	s.tmux("-f", "/dev/null", "new-session", "-d", "-x", fmt.Sprint(termW), "-y", fmt.Sprint(termH), "-c", s.cwd, cmd)
 	s.tmux("set-option", "-g", "remain-on-exit", "on")
 	s.tmux("set-option", "-g", "history-limit", "50000")
@@ -278,16 +283,16 @@ func (s *term) exited() bool {
 	return strings.TrimSpace(string(out)) == "1"
 }
 
-// exitStatus is agenttui's exit code once it has exited. tmux can mark
-// the pane dead a moment before it records the status, so wait for it.
+// exitStatus is agenttui's exit code once it has exited.
 func (s *term) exitStatus() string {
-	var st string
-	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(20 * time.Millisecond) {
-		out, _ := exec.Command("tmux", "-L", s.socket, "display-message", "-p", "-t", "0", "#{pane_dead_status}").Output()
-		if st = strings.TrimSpace(string(out)); st != "" || time.Now().After(deadline) {
-			return st
-		}
-	}
+	s.t.Helper()
+	var st []byte
+	s.poll("the exit status", func() bool {
+		b, err := os.ReadFile(s.status)
+		st = b
+		return err == nil && len(b) > 0
+	})
+	return strings.TrimSpace(string(st))
 }
 
 func (s *term) waitExit() {

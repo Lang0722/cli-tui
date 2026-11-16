@@ -266,7 +266,7 @@ func (b *Backend) handle(op protocol.Op) {
 		b.active = t
 		b.mu.Unlock()
 		b.emitIn(sess, protocol.UserMessage{Message: op.Text, Images: op.Images})
-		t.images = op.Images
+		t.images, t.skills = op.Images, op.Skills
 		go t.run(op.Text)
 	case protocol.ShellCommand:
 		go b.runShell(op.Command)
@@ -330,6 +330,12 @@ func (b *Backend) handle(op protocol.Op) {
 		sc := b.configured(f)
 		sc.Resumed = true
 		b.notice(sc)
+	case protocol.ListSkills:
+		b.notice(protocol.SkillsList{Skills: b.skillList()})
+	case protocol.SetSkillEnabled:
+		if err := b.setSkillEnabled(op.Path, op.Enabled); err != nil {
+			b.notice(protocol.Error{Message: "Failed to update skill config for " + op.Path + ": " + err.Error()})
+		}
 	case protocol.SlashCommand:
 		b.slash(op)
 	case protocol.Shutdown:

@@ -23,6 +23,9 @@ type selectionView struct {
 	thread   string // the thread that asked
 	selected int
 	query    string
+	// local handles a TUI-owned list (e.g. /skills) instead of answering
+	// the backend.
+	local func(item int) tea.Cmd
 }
 
 const freeformLabel = "Type your own answer"
@@ -177,6 +180,9 @@ func (m *model) handleSelectionKey(k tea.KeyPressMsg, key string) tea.Cmd {
 	switch act {
 	case selChoose:
 		m.selections = m.selections[1:]
+		if v.local != nil {
+			return v.local(idx)
+		}
 		if idx < 0 {
 			m.freeformID, m.freeformThread = v.req.ID, v.thread
 			m.freeformTitle = v.req.Title
@@ -186,6 +192,9 @@ func (m *model) handleSelectionKey(k tea.KeyPressMsg, key string) tea.Cmd {
 		m.commit(textCell{bullet: S("•", m.st.Dim), body: L(S(v.req.Title+": ", m.st.Dim), S(v.req.Items[idx].Name, m.st.Plain))})
 	case selCancel:
 		m.selections = m.selections[1:]
+		if v.local != nil {
+			return nil
+		}
 		m.submit(protocol.SelectionResponse{ID: v.req.ID, Index: -1, ThreadID: v.thread})
 	}
 	return nil
@@ -244,7 +253,7 @@ type restoreViewportMsg struct{}
 // overlayShown reports whether the bottom pane shows an overlay in place of
 // (or above) the composer.
 func (m *model) overlayShown() bool {
-	return len(m.approvals) > 0 || len(m.selections) > 0 || m.surface != nil || m.agents.picker != nil ||
+	return len(m.approvals) > 0 || len(m.selections) > 0 || m.surface != nil || m.skills.view != nil || m.agents.picker != nil ||
 		m.keymapUI != nil || m.shortcuts
 }
 

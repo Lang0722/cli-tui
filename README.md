@@ -72,13 +72,16 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | `delegate` | a parent-owned `/root/reviewer` agent (activity rows, read-only view) |
 | `error` | an error event |
 | `!ls -la` | a real shell command you run ("You ran") |
+| `$` | the skill popup; pick one (e.g. `$repo-scout map the code`) and the agent reads its `SKILL.md` and follows it |
 | `/model`, `/approvals` | backend-driven pickers |
 
 Then try Ctrl+T (transcript), Esc Esc (rewind to an earlier prompt), Ctrl+R
-(history search), `/export`, and quitting followed by `./agenttui resume -last`.
+(history search), `/skills` (enable or disable the demo skills), `/export`,
+and quitting followed by `./agenttui resume -last`.
 Sessions live in `$XDG_DATA_HOME/agenttui/mock-sessions` (by default
 `~/.local/share/agenttui/mock-sessions`). Use `-sessions DIR` to change that,
-and `-reset-demo` to restore the demo history.
+and `-reset-demo` to restore the demo history. The demo skills are
+`SKILL.md` files in its `skills/` subdirectory.
 
 ## Run
 
@@ -132,7 +135,7 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 
 | op | sent when |
 |---|---|
-| `user_input{text,images?}` | Enter, or a queued message when the turn ends. Images come from Ctrl+V / Alt+V or a pasted image path. |
+| `user_input{text,images?,skills?}` | Enter, or a queued message when the turn ends. Images come from Ctrl+V / Alt+V or a pasted image path. `skills` lists the enabled skills mentioned as `$name` in the text: `[{name,path}]`. |
 | `interrupt` | Esc or Ctrl+C while running; reply with `turn_aborted` |
 | `exec_approval` / `patch_approval{call_id,decision}` | answers an approval. `decision` is one of `approved`, `approved_for_session`, `approved_for_prefix` (exec only, with `prefix`: the request's `proposed_prefix`), `denied`, `abort`. |
 | `shell_command{command}` | `!cmd` shell mode; run it and report it with `exec_command_*` and `source:"user_shell"` |
@@ -140,6 +143,8 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 | `rewind{user_message_index}` | Esc Esc then Enter: drop that user message (0-based) and everything after it |
 | `slash_command{name,args}` | backend slash commands: the built-in `/new`, `/model`, `/approvals`, `/compact`, `/init`, `/review`, and any the backend advertised with `slash_commands` |
 | `list_sessions` / `resume_session{id}` | resume picker / chosen session (an empty id means the most recent). If the session can't be loaded, send an `error`. |
+| `list_skills{cwd,force_reload?}` | after each `session_configured` and directory change, and with `force_reload` when the Enable/Disable Skills view closes; reply with `skills_list` |
+| `set_skill_enabled{path,enabled}` | a skill toggled in `/skills`; persist it (report failures with `error`) |
 | `shutdown` | UI exit |
 
 `user_input`, `interrupt`, `shell_command`, the approvals and
@@ -169,6 +174,7 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `sub_agent_activity{kind,agent_thread_id,agent_path}` | ``• Started `/root/reviewer` `` (also `Interacted with`, `Interrupted`, `Completed`) |
 | `selection_request{id,title,items,allow_freeform}` | a picker in place of the composer (digits, j/k, search when there are more than 9 items) |
 | `session_list` | the resume picker |
+| `skills_list{skills:[{name,display_name?,description?,short_description?,path,enabled,scope?}],errors?:[{path,message}]}` | the skills catalog for `$` mentions and `/skills` (disabled skills included; `plugin:skill` names show as `skill (plugin)`). New `errors` print `⚠ Skipped loading N skill(s) due to invalid SKILL.md files.` and one `⚠ path: message` line each. Reads of a listed `SKILL.md` show as `Read SKILL.md (name skill)`. Can also be sent unprompted. |
 | `token_count` | `N% context left` (or `NK used`) |
 | `error` / `warning` / `background_event` | `■` red, `⚠`, dim `•` |
 | `stream_error` | a transient detail line under the status row |
@@ -202,14 +208,28 @@ the overlay shows ⇧enter or ⌃j accordingly.
 
 Local slash commands: `/status`, `/diff` (opens a pager), `/transcript`,
 `/resume`, `/copy`, `/export [file]`, `/clear`, `/pwd`, `/mention`,
-`/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. The other built-in
+`/skills`, `/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. The other built-in
 commands, and the ones the backend advertises, are sent as `slash_command`.
 An unknown `/name` is not sent: like Codex it prints
 `Unrecognized command '/name'` and keeps the draft (paths such as
 `/usr/bin/x` and text starting with a space are sent as prompts).
 While a task runs, `/model`, `/approvals`, `/diff`, `/status`, `/copy`,
-`/pwd`, `/mention`, `/transcript`, `/statusline`, `/title`, `/subagents` and
-`/quit` still work; the rest wait for the turn to end.
+`/pwd`, `/mention`, `/skills`, `/transcript`, `/statusline`, `/title`,
+`/subagents` and `/quit` still work; the rest wait for the turn to end.
+
+## Skills
+
+As in Codex, typing `$` opens a popup of the enabled skills from the
+backend's `skills_list` (`› Repo Scout  [Skill] Summarize the repo layout`).
+It filters as you type, ranking exact and prefix matches and your most used
+skills first. Enter or Tab inserts `$name `, which is highlighted in the
+composer, and the mentioned skills are sent with the prompt in
+`user_input.skills`. Shell variables such as `$HOME` don't open it.
+
+`/skills` offers **List skills** (types `$`) and **Enable/Disable Skills**: a
+searchable `[x]` list where space or Enter toggles a skill
+(`set_skill_enabled`) and Esc closes it with a summary such as
+`Enabled 1 skill, disabled 1 skill`.
 
 ## Subagents
 
@@ -371,6 +391,8 @@ snapshots.
   - Slash and `@` popups.
   - Approval modal with its variants' options and "view all".
   - Generic pickers and questions, resume picker.
+  - Skills: the `$` popup, `/skills` and Enable/Disable Skills, `SKILL.md`
+    read labels and load warnings.
 - **Transcript and history:** Ctrl+T transcript with find; Esc Esc
   backtrack and rewind; resize reflow.
 - **Rendering:**
@@ -389,7 +411,7 @@ snapshots.
 **Not ported**
 
 - **Codex-specific:** login and onboarding, model catalog and rate-limit
-  cards, MCP inventory and elicitation forms, plugins, apps and skills, voice
+  cards, MCP inventory and elicitation forms, plugins and apps, voice
   and realtime, agents command center and side conversations, worktrees,
   goals, pets, hooks, Daybreak, update prompts. Generic equivalents are the
   backend-driven `selection_request` and slash-command forwarding.
@@ -426,6 +448,7 @@ go test ./...
     `/statusline` and `/export`;
   - the Ctrl+T pager and find, Esc Esc rewind and `@` file mentions;
   - resume (picker and `-last`), resize reflow and subagents;
+  - skills: the `$` popup, mentions and Enable/Disable Skills;
   - layout: the composer stays on the last row after turns, approvals,
     `/resume` inside a session and closing `/keymap`;
   - the stdio backend (`examples/echo_agent.py`).
@@ -436,12 +459,12 @@ go test ./...
 ## Layout
 
 ```
-protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, wire.go)
+protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, wire.go)
 config/          settings file (TOML)
-backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, real "!" commands
+backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, real "!" commands
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
-                 approval, interaction, pager, printer, resume, surfaces, keymap, agents)
+                 approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills)
 cmd/agenttui     entry point
 e2e/             end-to-end tests: the real binary in tmux, driven by keystrokes
 examples/        echo_agent.py reference backend

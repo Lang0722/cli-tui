@@ -193,6 +193,7 @@ type model struct {
 	statusColors   bool
 	titleItems     []string
 	surface        *surfacePicker
+	skills         skillsState // catalog, "$" popup ranking, /skills view
 	sessionTitle   string
 	git            gitInfo
 	configWarnings []string // shown once the first session is configured
@@ -748,7 +749,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.PasteMsg:
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
+		if v := m.skills.view; v != nil && m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 {
+			// Codex: a paste goes into the skills search (one line).
+			if q := strings.Join(strings.Fields(msg.Content), " "); q != "" {
+				v.query += q
+				v.filter()
+			}
+			return m, nil
+		}
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -816,6 +825,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 			break
 		}
 		clear := m.onSessionConfigured(e)
+		m.requestSkills(false) // Codex lists skills for the session's directory
 		m.sessionTitle = e.Title
 		m.planDone, m.planTotal = 0, 0
 		m.inputTokens, m.outputTokens = 0, 0
@@ -830,6 +840,8 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		return m.onSessionUpdated(e)
 	case protocol.SlashCommands:
 		m.setBackendCommands(e.Commands)
+	case protocol.SkillsList:
+		m.onSkillsList(e)
 	case protocol.CollabToolCall:
 		if c := m.collabRow(e); c != nil {
 			// Codex flushes the answer stream before a collab row.
@@ -895,6 +907,11 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		if len(parsed) == 0 {
 			parsed = parseCommand(e.Command)
 		}
+		cwd := e.Cwd
+		if cwd == "" {
+			cwd = m.cwd
+		}
+		parsed = m.skills.annotateSkillReads(parsed, cwd)
 		call := &execCall{id: e.CallID, command: e.Command, parsed: parsed, started: time.Now(), user: e.Source == "user_shell"}
 		m.execByID[e.CallID] = call
 		if n := len(m.active); n > 0 && call.isExploring() {
@@ -1119,7 +1136,7 @@ func (m *model) sendUser(text string) { m.sendInput(pendingInput{text: text}) }
 
 func (m *model) sendInput(in pendingInput) {
 	m.commit(userCell{text: in.text, images: in.images, steer: m.running})
-	m.submit(protocol.UserInput{Text: in.text, Images: in.images, ThreadID: m.thread})
+	m.submit(protocol.UserInput{Text: in.text, Images: in.images, ThreadID: m.thread, Skills: m.skills.mentionedSkills(in.text)})
 }
 
 func (m *model) flash(s string) {
@@ -1138,7 +1155,7 @@ func (m *model) keyContexts() []string {
 		return []string{"pager"}
 	case len(m.approvals) > 0:
 		return []string{"approval", "list", "global"}
-	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.agents.picker != nil:
+	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.skills.view != nil, m.agents.picker != nil:
 		return []string{"list"}
 	case m.awaitingList || m.awaitingResume:
 		return nil
@@ -1209,6 +1226,9 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	}
 	if m.surface != nil {
 		return m.handleSurfaceKey(k, act)
+	}
+	if m.skills.view != nil {
+		return m.handleSkillsToggleKey(k, act)
 	}
 	if m.agents.picker != nil {
 		return m.handleAgentPickerKey(k, act)
@@ -1318,7 +1338,7 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	// esc by default) or, when idle, Esc Esc backtrack (fixed).
 	if key == "esc" || act == "chat.interrupt_turn" {
 		switch {
-		case key == "esc" && (m.composer.slash != nil || m.composer.files != nil):
+		case key == "esc" && (m.composer.slash != nil || m.composer.files != nil || m.composer.skills != nil):
 			m.closePopups()
 			return nil
 		case key == "esc" && m.freeformID != "" && m.composer.Empty():
@@ -1395,6 +1415,27 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 				m.closePopups()
 				return m.runCommand(c.Name, args)
 			}
+		}
+	}
+	if p := m.composer.skills; p != nil {
+		switch {
+		case key == "up" || key == "ctrl+p":
+			p.move(-1)
+			return nil
+		case key == "down" || key == "ctrl+n":
+			p.move(1)
+			return nil
+		case key == "tab" || key == "enter" || act == "composer.submit":
+			// Codex inserts the selection; Enter never submits from here.
+			if sk, ok := p.current(); ok {
+				m.composer.replaceRange(p.start, p.end, "$"+sk.Name+" ")
+				if m.skills.use == nil {
+					m.skills.use = map[string]int{}
+				}
+				m.skills.use[sk.Path]++
+			}
+			m.closePopups()
+			return nil
 		}
 	}
 	if p := m.composer.files; p != nil {
@@ -1667,6 +1708,8 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		m.out.hold(holdClear, true)
 		m.submit(protocol.SlashCommand{Name: "new"})
 		return clearTerminal(m.out)
+	case "skills":
+		m.skillsMenu()
 	case "pwd":
 		m.commit(infoCell(m.st, "Current working directory: "+tildePath(m.cwd)))
 	case "statusline":
@@ -1722,7 +1765,7 @@ func (m *model) contextLeft() int64 {
 }
 
 func (m *model) closePopups() {
-	m.composer.slash, m.composer.files = nil, nil
+	m.composer.slash, m.composer.files, m.composer.skills = nil, nil, nil
 }
 
 // refreshPopups opens/updates the "/" and "@" popups from composer state.
@@ -1736,12 +1779,24 @@ func (m *model) refreshPopups() tea.Cmd {
 				c.slash = &slashPopup{all: m.commands()}
 			}
 			c.slash.filter(strings.TrimPrefix(first, "/"))
-			c.files = nil
+			c.files, c.skills = nil, nil
 			return nil
 		}
 	}
 	c.slash = nil
 	tok, s, e := c.currentToken()
+	if strings.HasPrefix(tok, "$") && m.skillTokenOK(tok[1:]) {
+		c.files = nil
+		if c.skills == nil {
+			c.skills = &skillPopup{}
+		}
+		p := c.skills
+		p.items, p.use = m.skills.enabled(), m.skills.use
+		p.query, p.start, p.end = tok[1:], s, e
+		p.filter()
+		return nil
+	}
+	c.skills = nil
 	if strings.HasPrefix(tok, "@") {
 		opening := c.files == nil
 		if opening {
@@ -1844,6 +1899,8 @@ func (m *model) View() tea.View {
 		bottom = append(bottom, m.selections[0].Lines(w, m.height-len(bottom)-2, st)...)
 	} else if m.surface != nil {
 		bottom = append(bottom, m.surface.Lines(w, m.surfacePreview(), st)...)
+	} else if m.skills.view != nil {
+		bottom = append(bottom, m.skills.view.Lines(w, st)...)
 	} else if m.agents.picker != nil {
 		bottom = append(bottom, m.agentPickerLines(w)...)
 	} else if m.keymapUI != nil {
@@ -1873,6 +1930,8 @@ func (m *model) View() tea.View {
 			below = m.composer.slash.Lines(w, st)
 		case m.composer.files != nil:
 			below = m.composer.files.Lines(w, st, m.filesBusy)
+		case m.composer.skills != nil:
+			below = m.composer.skills.Lines(w, st)
 		default:
 			// Codex: the status line sits above the hint row, and the
 			// context indicator moves into it (as an item).

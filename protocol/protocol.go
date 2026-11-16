@@ -34,6 +34,9 @@ type UserInput struct {
 	Images []string `json:"images,omitempty"`
 	// ThreadID targets a subagent thread the user is watching ("" = main).
 	ThreadID string `json:"thread_id,omitempty"`
+	// Skills are the enabled skills mentioned as "$name" in Text (see
+	// skills.go), so the backend can load them for this turn.
+	Skills []SkillRef `json:"skills,omitempty"`
 }
 
 // ShellCommand is a command the user typed in "!" shell mode. The backend
@@ -208,7 +211,7 @@ type ParsedCommand struct {
 	Kind  ParsedCommandKind `json:"type"`
 	Cmd   string            `json:"cmd"`
 	Name  string            `json:"name,omitempty"`  // file name for read
-	Path  string            `json:"path,omitempty"`  // dir for list/search
+	Path  string            `json:"path,omitempty"`  // file for read, dir for list/search
 	Query string            `json:"query,omitempty"` // search query
 }
 

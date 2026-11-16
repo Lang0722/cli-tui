@@ -354,7 +354,7 @@ func parseCommand(cmd []string) []protocol.ParsedCommand {
 			ps = ps[1:]
 		}
 		if len(ps) == 1 {
-			pc.Kind, pc.Name = protocol.CmdRead, filepath.Base(ps[0])
+			pc.Kind, pc.Name, pc.Path = protocol.CmdRead, filepath.Base(ps[0]), ps[0]
 			return []protocol.ParsedCommand{pc}
 		}
 	case "ls", "tree", "fd", "find":

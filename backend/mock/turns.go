@@ -17,6 +17,7 @@ type turn struct {
 	ctx    context.Context
 	done   chan struct{}
 	images []string
+	skills []protocol.SkillRef // skills mentioned in the prompt
 }
 
 func (t *turn) emit(m protocol.EventMsg) { t.b.emitIn(t.sess, m) }
@@ -76,6 +77,8 @@ func (t *turn) run(text string) {
 	lower := strings.ToLower(text)
 	var ok bool
 	switch {
+	case len(t.skills) > 0:
+		ok = t.skillDemo(text)
 	case strings.Contains(lower, "error"):
 		if ok = t.sleep(400 * time.Millisecond); ok {
 			t.emit(protocol.Error{Message: "stream disconnected before completion: mock error requested"})

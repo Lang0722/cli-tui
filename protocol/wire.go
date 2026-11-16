@@ -30,11 +30,11 @@ func init() {
 		PatchApplyBegin{}, PatchApplyEnd{}, ToolCallBegin{}, ToolCallEnd{},
 		PlanUpdate{}, TokenCount{}, BackgroundEvent{}, Warning{}, Error{},
 		StreamError{}, ShutdownComplete{}, SessionList{}, SessionTitle{}, UserMessage{}, SelectionRequest{},
-		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{},
+		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{}, SkillsList{},
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}
-	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}} {
+	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}, ListSkills{}, SetSkillEnabled{}} {
 		opTypes[o.opType()] = reflect.TypeOf(o)
 	}
 }

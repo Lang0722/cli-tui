@@ -28,8 +28,11 @@ type composer struct {
 	shell      bool              // "!" shell-command mode
 
 	// popups
-	slash *slashPopup
-	files *filePopup
+	slash  *slashPopup
+	files  *filePopup
+	skills *skillPopup
+
+	skillNames map[string]bool // enabled skills, highlighted as "$name"
 }
 
 func newComposer() *composer {
@@ -491,7 +494,7 @@ func (c *composer) styleWords(text string, st *Styles) Line {
 	var out Line
 	for _, w := range strings.SplitAfter(text, " ") {
 		t := strings.TrimSpace(w)
-		if strings.HasPrefix(t, "@") && len(t) > 1 {
+		if strings.HasPrefix(t, "@") && len(t) > 1 || strings.HasPrefix(t, "$") && c.skillNames[strings.TrimRight(t[1:], ":")] {
 			out = append(out, S(w, st.Accent))
 		} else {
 			out = append(out, P(w))

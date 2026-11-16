@@ -337,6 +337,7 @@ func (m *model) onSessionUpdated(e protocol.SessionUpdated) tea.Cmd {
 		m.cwd = e.Cwd
 		m.files = nil // the @ index belongs to the old directory
 		m.git = gitInfo{}
+		m.requestSkills(false) // skills depend on the directory, as in Codex
 		return fetchGitInfo(m.cwd)
 	}
 	return nil

@@ -278,10 +278,16 @@ func (s *term) exited() bool {
 	return strings.TrimSpace(string(out)) == "1"
 }
 
-// exitStatus is agenttui's exit code once it has exited.
+// exitStatus is agenttui's exit code once it has exited. tmux can mark
+// the pane dead a moment before it records the status, so wait for it.
 func (s *term) exitStatus() string {
-	out, _ := exec.Command("tmux", "-L", s.socket, "display-message", "-p", "-t", "0", "#{pane_dead_status}").Output()
-	return strings.TrimSpace(string(out))
+	var st string
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		out, _ := exec.Command("tmux", "-L", s.socket, "display-message", "-p", "-t", "0", "#{pane_dead_status}").Output()
+		if st = strings.TrimSpace(string(out)); st != "" || time.Now().After(deadline) {
+			return st
+		}
+	}
 }
 
 func (s *term) waitExit() {

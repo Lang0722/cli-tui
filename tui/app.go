@@ -147,6 +147,11 @@ type streamState struct {
 	tailCache  tailCache
 }
 
+type interruptedAnswer struct {
+	idx int    // its agentCell in committed
+	src string // the text it was printed from
+}
+
 type tailCache struct {
 	n, width, base, emitted int
 	rows                    []Line
@@ -239,6 +244,10 @@ type convo struct {
 	sessionStart  int // index in committed of the current session's header
 	lastHeader    *headerCell
 	pendingReflow reflowMode
+	// interrupted is the answer another cell cut off before its final text
+	// arrived (Codex last_flushed_agent_message): that late final corrects
+	// the cell where the answer first appeared instead of adding a copy.
+	interrupted *interruptedAnswer
 
 	// turn
 	running      bool
@@ -593,12 +602,21 @@ func (m *model) rewrapStream() {
 
 func (m *model) finalizeStream(final string) {
 	if !m.stream.active {
+		if m.correctInterrupted(final) {
+			return
+		}
 		if strings.TrimSpace(final) != "" {
 			m.flushActive(true)
 			m.commit(agentCell{final})
 			m.turnHasAgent = true
 			m.statusHidden = true
 		}
+		return
+	}
+	if final != "" && m.interrupted != nil && sameAnswer(final, m.interrupted.src) {
+		// The late final of the answer cut off earlier: this stream is the
+		// next answer, which it must not replace.
+		m.interrupted = nil
 		return
 	}
 	src := m.stream.src.String()
@@ -620,6 +638,11 @@ func (m *model) finalizeStream(final string) {
 			m.sepPrinted = true
 		}
 	}
+	if final == "" {
+		m.interrupted = &interruptedAnswer{len(m.committed), src}
+	} else {
+		m.interrupted = nil // a completed answer ends the wait (as Codex)
+	}
 	m.committed = append(m.committed, agentCell{src})
 	m.turnHasAgent = true
 	m.statusHidden = true // Codex: committed answer replaces the status row
@@ -628,6 +651,40 @@ func (m *model) finalizeStream(final string) {
 		m.deferred = nil
 		m.commit(d...)
 	}
+}
+
+// correctInterrupted handles the final text of an answer whose stream
+// was cut off by another cell (a command, a tool call) before it
+// arrived. Codex corrects the cell it flushed rather than adding a second
+// one; it reports whether final was that answer's.
+func (m *model) correctInterrupted(final string) bool {
+	in := m.interrupted
+	if in == nil || strings.TrimSpace(final) == "" {
+		return false
+	}
+	m.interrupted = nil
+	if sameAnswer(final, in.src) {
+		return true // already shown
+	}
+	if !strings.HasPrefix(strings.TrimSpace(final), strings.TrimSpace(in.src)) {
+		return false // another answer
+	}
+	// Deltas were dropped: show the full text where the answer appeared.
+	if in.idx < len(m.committed) {
+		if c, ok := m.committed[in.idx].(agentCell); ok && c.md == in.src {
+			m.committed[in.idx] = agentCell{final}
+			if !m.replaying && !m.opts.NoReflow {
+				m.pendingReflow = reflowFull
+			}
+		}
+	}
+	return true
+}
+
+// sameAnswer reports whether a final message is the text that streamed
+// (a stream may lack the final's trailing newline).
+func sameAnswer(final, streamed string) bool {
+	return strings.TrimSpace(final) == strings.TrimSpace(streamed)
 }
 
 // --- reasoning -----------------------------------------------------------
@@ -919,6 +976,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 			break
 		}
 		m.turnHasAgent = false
+		m.interrupted = nil
 		m.running, m.turnStart = true, time.Now()
 		m.statusHeader, m.statusDetail, m.hadTools = "Working", "", false
 		if e.ContextWindow > 0 {
@@ -1088,6 +1146,8 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 	} else {
 		if m.stream.active {
 			m.finalizeStream(last) // also repairs dropped deltas
+		} else if m.interrupted != nil {
+			m.correctInterrupted(last)
 		} else if last != "" && !m.turnHasAgent {
 			m.finalizeStream(last)
 		}
@@ -1105,6 +1165,7 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 	}
 	m.running = false
 	m.turnHasAgent = false
+	m.interrupted = nil
 	m.statusDetail = ""
 	if aborted && len(m.queued) > 0 {
 		// Restore queued input (with its images) into the composer for

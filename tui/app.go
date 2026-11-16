@@ -333,6 +333,7 @@ func newModel(ctx context.Context, opts Options) *model {
 		composer: newComposer(),
 		focused:  true,
 	}
+	m.st.Cwd = cwd
 	m.agents.init(m.convo)
 	m.applySurfaceConfig(opts.Config.TUI)
 	if km, err := newKeymap(opts.Config.TUI.Keymap); err == nil {

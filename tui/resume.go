@@ -268,6 +268,7 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 	m.permissions, m.approvalMode = sanitizeLine(e.Permissions), sanitizeLine(e.ApprovalMode)
 	if e.Cwd != "" {
 		m.cwd = e.Cwd
+		m.st.Cwd = e.Cwd
 	}
 	m.tokensUsed = 0
 	m.dropTurnPrompts() // pickers/approvals of the previous session are stale
@@ -335,6 +336,7 @@ func (m *model) onSessionUpdated(e protocol.SessionUpdated) tea.Cmd {
 	}
 	if e.Cwd != "" && e.Cwd != m.cwd {
 		m.cwd = e.Cwd
+		m.st.Cwd = e.Cwd
 		m.files = nil // the @ index belongs to the old directory
 		m.git = gitInfo{}
 		m.requestSkills(false) // skills depend on the directory, as in Codex

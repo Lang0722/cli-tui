@@ -338,7 +338,10 @@ exactly what your terminal sends for a key. Contexts are `global`, `chat`,
   The prompt bands, the shimmer and the diff tints are blended from the real
   background, read via OSC 11.
 - **Links** are OSC 8 hyperlinks showing only their label (Ctrl+click opens
-  them).
+  them). As in Codex, that applies to web links in terminals known to
+  support OSC 8 (VTE/gnome-terminal, kitty, iTerm2, WezTerm, Ghostty,
+  Alacritty, Konsole, Windows Terminal, VS Code). Elsewhere, and under
+  tmux, screen or zellij, links read `label (url)`.
 - **Keys VTE can't tell apart.** VTE has neither the kitty keyboard protocol
   nor xterm's modifyOtherKeys, so some combinations arrive as the bytes of
   others:
@@ -416,6 +419,17 @@ snapshots.
     `#` marks and use Codex's per-level styles (h1 bold underlined, h2 bold,
     h3 bold italic, h4–h6 italic); setext (`===` / `---` underlined)
     headings, closing `#`s and headings in list items are supported.
+  - Lists follow CommonMark and Codex: items nest by content column, ordered
+    lists count from their first number, and a blank row follows an item
+    that took more than one row. A different marker starts a new list.
+    Quotes and code blocks can sit inside an item. Empty items and items
+    whose text starts on the next line are supported. Ordered markers are
+    light blue; quotes are green throughout.
+  - HTML entities are decoded. HTML blocks and indented code are shown
+    verbatim. A `md`/`markdown` fence that holds a table is rendered as
+    markdown.
+  - Local file links show their label plus the target in code style,
+    relative to the session directory, with `#L12C3` shown as `:12:3`.
   - TeX math, as in Codex: `$…$` and `\(…\)` inline, standalone `$$…$$`
     and `\[…\]` display formulas, laid out in Unicode (scripts, fractions,
     roots, `\mathbb`, accents, `\sum`/`\int` limits, `aligned` and
@@ -444,7 +458,11 @@ snapshots.
   - The fullscreen "owned transcript" mode, with mouse selection and semantic
     copy.
   - Vim mode.
-  - Mermaid and TeX-math rendering.
+  - Mermaid diagrams, reference-style links (`[text][ref]`), Codex file
+    citations and follow-up directives.
+  - Emphasis and links that span a soft line break (`**a\nb**`), which
+    stay literal.
+  - Table column sizing differs from Codex's in some narrow layouts.
   - Smooth line-by-line commit animation. Lines appear as soon as they
     complete, which is equivalent to Codex's catch-up mode.
   - Raw mode (`/raw`); the warnings view (F2).

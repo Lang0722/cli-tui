@@ -4,6 +4,7 @@ import (
 	"image/color"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"charm.land/lipgloss/v2"
@@ -33,11 +34,16 @@ type Styles struct {
 	Yellow  lipgloss.Style
 	Code    lipgloss.Style
 	Link    lipgloss.Style
+	ListNum lipgloss.Style // ordered list markers (Codex: light blue)
 
 	// LinkLabelOnly shows markdown links as their label with an OSC 8
 	// hyperlink (VTE/gnome-terminal, kitty, iTerm2, WezTerm, ...). Off for
 	// terminals without OSC 8, which get "label (url)" like Codex does.
 	LinkLabelOnly bool
+
+	// Cwd is the session's working directory: local file links under it
+	// show relative paths.
+	Cwd string
 
 	// UserBg is the band behind submitted/editable prompts. Zero when the
 	// terminal background is unknown.
@@ -71,9 +77,10 @@ func newStyles() *Styles {
 		Yellow:        n.Foreground(lipgloss.Yellow),
 		Code:          n.Foreground(lipgloss.Cyan),
 		Link:          n.Foreground(lipgloss.Cyan).Underline(true),
+		ListNum:       n.Foreground(lipgloss.BrightBlue),
 		UserBg:        n,
 		HistoryBg:     n,
-		LinkLabelOnly: osc8Supported(),
+		LinkLabelOnly: linkLabelOnly(),
 		fg:            [3]uint8{204, 204, 204},
 		bg:            [3]uint8{0, 0, 0},
 	}
@@ -202,13 +209,38 @@ func spinnerFrame() string {
 	return spinnerFrames[i]
 }
 
-// osc8Supported mirrors Codex' terminal_hyperlinks list.
-func osc8Supported() bool {
-	switch os.Getenv("TERM_PROGRAM") {
-	case "Apple_Terminal", "WarpTerminal":
+// osc8Supported reports whether web links may show just their label (an
+// OSC 8 hyperlink), like Codex markdown_render/web_links.rs: only in
+// terminals known to click them, and never through a multiplexer, which
+// may not pass the links on.
+func osc8Supported() bool { return osc8For(os.Getenv) }
+
+// linkLabelOnly is the default of Styles.LinkLabelOnly (tests pin it).
+var linkLabelOnly = osc8Supported
+
+func osc8For(env func(string) string) bool {
+	term := env("TERM")
+	if env("TMUX") != "" || env("TMUX_PANE") != "" || env("ZELLIJ") != "" || env("ZELLIJ_SESSION_NAME") != "" ||
+		env("STY") != "" || term == "dumb" || strings.HasPrefix(term, "screen") || strings.HasPrefix(term, "tmux") {
 		return false
 	}
-	return os.Getenv("TERM") != "dumb"
+	switch env("TERM_PROGRAM") {
+	case "Apple_Terminal", "WarpTerminal":
+		return false
+	case "ghostty", "iTerm.app", "WezTerm", "vscode", "rex":
+		return true
+	}
+	for _, k := range []string{"KITTY_WINDOW_ID", "WEZTERM_EXECUTABLE", "WEZTERM_VERSION", "ALACRITTY_WINDOW_ID",
+		"ALACRITTY_SOCKET", "WT_SESSION", "KONSOLE_VERSION", "VTE_VERSION", "GNOME_TERMINAL_SCREEN"} {
+		if env(k) != "" {
+			return true
+		}
+	}
+	switch term {
+	case "xterm-kitty", "xterm-ghostty", "alacritty", "wezterm":
+		return true
+	}
+	return false // unknown terminal: keep destinations visible
 }
 
 // key is the hint label of a keymap action, "" when it is unbound.

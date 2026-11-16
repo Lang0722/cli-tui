@@ -10,6 +10,7 @@ package tui
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -41,8 +42,42 @@ type renderedMath struct {
 }
 
 // renderMath lays out a TeX formula (without its $ delimiters). ok is false
-// for unsupported input, which the caller then shows verbatim.
+// for unsupported input, which the caller then shows verbatim. Results are
+// memoized: a streaming answer re-renders its live tail on every frame.
 func renderMath(src string, mode mathMode) (renderedMath, bool) {
+	k := mathMemoKey{src, mode}
+	mathMemo.Lock()
+	r, hit := mathMemo.m[k]
+	mathMemo.Unlock()
+	if hit {
+		return r.math, r.ok
+	}
+	m, ok := renderMathUncached(src, mode)
+	mathMemo.Lock()
+	if mathMemo.m == nil || len(mathMemo.m) >= 1024 {
+		mathMemo.m = map[mathMemoKey]mathMemoVal{}
+	}
+	mathMemo.m[k] = mathMemoVal{m, ok}
+	mathMemo.Unlock()
+	return m, ok
+}
+
+type mathMemoKey struct {
+	src  string
+	mode mathMode
+}
+
+type mathMemoVal struct {
+	math renderedMath
+	ok   bool
+}
+
+var mathMemo struct {
+	sync.Mutex
+	m map[mathMemoKey]mathMemoVal
+}
+
+func renderMathUncached(src string, mode mathMode) (renderedMath, bool) {
 	if !utf8.ValidString(src) {
 		return renderedMath{}, false
 	}

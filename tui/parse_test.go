@@ -198,7 +198,9 @@ func TestMarkdownBlocks(t *testing.T) {
 	st := newStyles()
 	src := "- one\n  - nested\n- [ ] todo\n- [x] done\n1. first\n\n---\n\n> > deep"
 	got := plainMD(RenderMarkdown(src, st, 80))
-	want := []string{"• one", "    • nested", "☐ todo", "☑ done", "1. first", "", "———", "", "> > deep"}
+	// Codex: a blank row after an item that took several rows, and
+	// between top-level lists of different kinds.
+	want := []string{"• one", "    • nested", "", "☐ todo", "☑ done", "", "1. first", "", "———", "", "> > deep"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("blocks:\n got %q\nwant %q", got, want)
 	}

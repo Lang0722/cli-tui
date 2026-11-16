@@ -49,6 +49,42 @@ func BenchmarkStreamAnswer(b *testing.B) {
 	}
 }
 
+// mathAnswer is ~25 KB of prose with inline and display formulas.
+func mathAnswer(paras int) string {
+	var b strings.Builder
+	for i := 0; i < paras; i++ {
+		fmt.Fprintf(&b, "## Step %d\n\nWith $\\alpha_%d^2 + \\beta$ and \\(\\sqrt{x^2+y^2}\\) the bound costs $5 per run, see $HOME/notes.\n\n", i, i)
+		b.WriteString("$$\nx=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}\n$$\n\n\\[\n\\sum_{i=1}^{N} x_i \\le \\int_0^1 f(x)\\,dx\n\\]\n\n")
+	}
+	return b.String()
+}
+
+// shellAnswer is prose full of lone dollars that never pair (shell
+// variables, prices, "echo $$"): the worst case for the math scanner,
+// whose closer search looks up to 4 KB ahead from each one.
+func shellAnswer(paras int) string {
+	var b strings.Builder
+	for i := 0; i < paras; i++ {
+		fmt.Fprintf(&b, "Run echo $$ then export PATH=$HOME/bin:$PATH and pay $%d or $%d.50 for $USER on $HOSTNAME.\n\n", i, i+1)
+	}
+	return b.String()
+}
+
+func benchStream(b *testing.B, src string) {
+	b.SetBytes(int64(len(src)))
+	for i := 0; i < b.N; i++ {
+		m := perfModel()
+		for j := 0; j < len(src); j += 4 {
+			step(m, protocol.AgentMessageDelta{Delta: src[j:min(j+4, len(src))]})
+		}
+		step(m, protocol.AgentMessage{Message: src})
+		m.out.takeQueued()
+	}
+}
+
+func BenchmarkStreamMathAnswer(b *testing.B)  { benchStream(b, mathAnswer(120)) }
+func BenchmarkStreamShellAnswer(b *testing.B) { benchStream(b, shellAnswer(260)) }
+
 // 8 MB of command output in 4 KB chunks while the command runs.
 func BenchmarkExecLiveOutput(b *testing.B) {
 	chunk := strings.Repeat("compiling package example/internal/server ... ok\n", 100)[:4096]

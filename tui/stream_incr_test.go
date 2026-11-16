@@ -27,7 +27,33 @@ var mathPool = []string{
 	"$$A=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$$", "## Heading $\\gamma$", "\\begin{aligned}x&=1\\\\y&=2\\end{aligned}",
 }
 
+// listPool exercises list items (empty, renumbered, nested by content
+// column), blocks inside them, HTML, md fences and entities.
+var listPool = []string{
+	"", "", "-", "1.", "2.", "- a", "1. one", "1. one", "3) three", "* star", "   text under the item", "  text",
+	"   > quoted in item", "  > quoted", "> top quote", "> ---", "   ```", "   ```md", "```md", "```", "| A | B |",
+	"|---|---|", "| 1 | 2 |", "    - deep", "  - two-space child", " - one-space sibling", "<details>", "<b>x</b> y",
+	"&amp; &copy; &#169;", "[](https://example.com)", "[f](./src/main.rs#L3C2)", "**https://example.com/x**",
+	"- [ ] task", "1. [x] done", "A long list item that wraps across the terminal width when it is rendered at sixty columns wide.",
+	"Paragraph", "    indented code", "---",
+}
+
 func randomMarkdown(r *rand.Rand) string { return randomFrom(r, mdPool) }
+
+// Lists and the blocks inside them stream like the rest.
+func TestStreamIncrementalListsMatchFull(t *testing.T) {
+	r := rand.New(rand.NewSource(3))
+	mixed := append(append([]string{}, listPool...), mdPool...)
+	var docs []string
+	for i := 0; i < 400; i++ {
+		pool := listPool
+		if i%3 == 0 {
+			pool = mixed
+		}
+		docs = append(docs, randomFrom(r, pool))
+	}
+	checkStreamIncremental(t, r, docs)
+}
 
 func randomFrom(r *rand.Rand, pool []string) string {
 	n := 5 + r.Intn(60)

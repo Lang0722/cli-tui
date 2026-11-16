@@ -1001,7 +1001,10 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 			m.finalizeStream(last)
 		}
 		m.flushActive(true)
-		m.dropTurnPrompts()
+		// A picker still open when the turn completes did not block it (e.g.
+		// the effort step of /model used during the turn), so it stays;
+		// approvals always belong to the turn.
+		m.dropTurnApprovals()
 		if m.replaying {
 			return nil
 		}
@@ -1048,14 +1051,7 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 // dropTurnPrompts closes approvals, pickers and typed answers that belong
 // to a turn that has ended.
 func (m *model) dropTurnPrompts() {
-	// Only this thread's turn ended; other threads' requests stay.
-	var keepA []*approval
-	for _, a := range m.approvals {
-		if a.thread != m.thread {
-			keepA = append(keepA, a)
-		}
-	}
-	m.approvals = keepA
+	m.dropTurnApprovals()
 	var keepS []*selectionView
 	for _, v := range m.selections {
 		if v.thread != m.thread {
@@ -1066,6 +1062,18 @@ func (m *model) dropTurnPrompts() {
 	if m.freeformThread == m.thread {
 		m.freeformID = ""
 	}
+}
+
+// dropTurnApprovals closes this thread's approvals; other threads'
+// requests stay.
+func (m *model) dropTurnApprovals() {
+	var keepA []*approval
+	for _, a := range m.approvals {
+		if a.thread != m.thread {
+			keepA = append(keepA, a)
+		}
+	}
+	m.approvals = keepA
 }
 
 func (m *model) lastCommittedIsAgent() bool {

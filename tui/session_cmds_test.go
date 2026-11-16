@@ -7,7 +7,6 @@ import (
 	"agenttui/protocol"
 )
 
-
 func TestUnknownCommandIsNotSent(t *testing.T) {
 	m, be := agentModel()
 	m.composer.Set("/frobnicate now")
@@ -156,5 +155,26 @@ func TestExecApprovalPrefixOnlyWhenProposed(t *testing.T) {
 	ml := newExecApproval(protocol.ExecApprovalRequest{CallID: "c", Command: []string{"bash", "-lc", "go test\necho hi"}, ProposedPrefix: []string{"go"}}, "codex")
 	if _, ok := ml.byAction("approve_for_prefix"); ok {
 		t.Errorf("prefix rule on a multi-line command")
+	}
+}
+
+// A picker opened during a turn (the effort step of /model) survives the
+// turn completing; an aborted turn closes it.
+func TestPickerSurvivesTurnComplete(t *testing.T) {
+	m, _ := agentModel()
+	ev(m, protocol.TaskStarted{})
+	ev(m, protocol.SelectionRequest{ID: "effort", Title: "Select Reasoning Level", Items: []protocol.SelectionItem{{Name: "low"}, {Name: "high"}}})
+	ev(m, protocol.ExecApprovalRequest{CallID: "c", Command: []string{"ls"}})
+	ev(m, protocol.TaskComplete{})
+	if len(m.selections) != 1 || m.selections[0].req.ID != "effort" {
+		t.Fatalf("picker dropped when the turn completed: %d", len(m.selections))
+	}
+	if len(m.approvals) != 0 {
+		t.Errorf("approval of a finished turn kept")
+	}
+	ev(m, protocol.TaskStarted{})
+	ev(m, protocol.TurnAborted{})
+	if len(m.selections) != 0 {
+		t.Errorf("picker kept after an aborted turn")
 	}
 }

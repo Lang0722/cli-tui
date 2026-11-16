@@ -393,6 +393,32 @@ snapshots.
   - Paste-burst detection for terminals without bracketed paste. VTE has
     bracketed paste.
 
+## Testing
+
+```bash
+go test ./...
+```
+
+- **Unit and model tests** (`tui/`, `protocol/`, `backend/`) feed events and
+  keys straight into the UI model. They include randomized markdown
+  streaming checks and benchmarks (`go test ./tui -run X -bench .`).
+- **End-to-end tests** (`e2e/`) build the real binary, run it in tmux (a
+  real terminal emulator) with an isolated `$HOME`, type keys like a user
+  and read the screen and scrollback back. They cover:
+  - startup, quitting and the shortcut overlay;
+  - chat turns, history and Ctrl+R, multi-line prompts, queueing and Esc
+    interrupt;
+  - `!` shell commands, approvals (approve, prefix rule, decline) and
+    question pickers;
+  - slash commands, `/approvals` and `/model` (also during a turn),
+    `/statusline` and `/export`;
+  - the Ctrl+T pager and find, Esc Esc rewind and `@` file mentions;
+  - resume (picker and `-last`), resize reflow and subagents;
+  - the stdio backend (`examples/echo_agent.py`).
+
+  They need `tmux` (and `python3` for the stdio test); they are skipped
+  without tmux or with `-short`. A failing test prints the final screen.
+
 ## Layout
 
 ```
@@ -403,5 +429,6 @@ backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
                  approval, interaction, pager, printer, resume, surfaces, keymap, agents)
 cmd/agenttui     entry point
+e2e/             end-to-end tests: the real binary in tmux, driven by keystrokes
 examples/        echo_agent.py reference backend
 ```

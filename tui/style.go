@@ -53,6 +53,7 @@ type Styles struct {
 	DiffDel   lipgloss.Style
 	diffTint  bool
 	hasBg     bool
+	hasFg     bool
 
 	// Keys lets hints show the (possibly remapped) shortcut of an action.
 	Keys      *keymap
@@ -157,7 +158,41 @@ func (s *Styles) updateDiffTint() {
 // "•" and a dim "◦").
 func blinkOff() bool { return (time.Since(processStart)/(600*time.Millisecond))%2 == 1 }
 
-func (s *Styles) SetForeground(c color.Color) { s.fg = rgb(c) }
+func (s *Styles) SetForeground(c color.Color) { s.fg, s.hasFg = rgb(c), true }
+
+// text is the terminal's text color (assumed from the background when
+// the terminal didn't report it).
+func (s *Styles) text() [3]uint8 {
+	switch {
+	case s.hasFg:
+		return s.fg
+	case isLight(s.bg):
+		return [3]uint8{0, 0, 0}
+	}
+	return [3]uint8{229, 229, 229}
+}
+
+// reasoningTint styles reasoning text: italic and a gray between the
+// text and background colors, so it reads apart from the answer even
+// where bold would cancel faint (VTE). Spans with a color of their own
+// (code, links) keep it, dimmed. Without a known background or truecolor
+// it is Codex's dim italic.
+func (s *Styles) reasoningTint(l Line) Line {
+	tinted := s.hasBg && s.trueColor
+	gray := toColor(blend(s.text(), s.bg, 0.6))
+	out := make(Line, len(l))
+	for i, sp := range l {
+		x := sp.Style.Italic(true)
+		_, none := x.GetForeground().(lipgloss.NoColor)
+		if tinted && none {
+			x = x.Foreground(gray)
+		} else {
+			x = x.Faint(true)
+		}
+		out[i] = Span{Text: sp.Text, Style: &x}
+	}
+	return out
+}
 
 var processStart = time.Now()
 
@@ -183,8 +218,8 @@ func (s *Styles) Shimmer(text string) Line {
 		}
 		var st lipgloss.Style
 		if s.hasBg && s.trueColor {
-			base := blend(s.fg, s.bg, 0.55)
-			c := blend(s.fg, base, t)
+			base := blend(s.text(), s.bg, 0.55)
+			c := blend(s.text(), base, t)
 			st = lipgloss.NewStyle().Foreground(toColor(c)).Bold(true)
 		} else {
 			switch {

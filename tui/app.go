@@ -35,7 +35,7 @@ type Options struct {
 	Backend protocol.Backend
 	// Commands overrides the slash command list (DefaultCommands if nil).
 	Commands []Command
-	// ShowReasoning prints reasoning summaries into the transcript (dim
+	// ShowReasoning prints reasoning summaries into the transcript (gray
 	// italic). By default only the bold title is shown in the status line.
 	ShowReasoning bool
 	// SteerWhileRunning sends Enter-submitted input to the backend
@@ -245,7 +245,8 @@ type convo struct {
 	turnStart    time.Time
 	statusHeader string
 	statusDetail string
-	reasoning    strings.Builder
+	reasoning    strings.Builder // the reasoning section being streamed
+	reasonParts  []string        // its earlier sections (one cell, as in Codex)
 	stream       streamState
 	active       []Cell
 	execByID     map[string]*execCall
@@ -291,11 +292,11 @@ func (m *model) liveTranscript(width int) []Line {
 		}
 		out = append(out, detailLines(c, width, m.st)...)
 	}
-	if m.reasoning.Len() > 0 {
+	if body := m.reasoningBody(); strings.TrimSpace(body) != "" {
 		if len(out) > 0 {
 			out = append(out, Line{})
 		}
-		out = append(out, reasoningCell{m.reasoning.String()}.Lines(width, m.st)...)
+		out = append(out, reasoningCell{body}.Lines(width, m.st)...)
 	}
 	if tail := m.streamAll(); m.stream.active && len(tail) > 0 {
 		if len(out) > 0 {
@@ -639,19 +640,45 @@ func (m *model) updateReasoningHeader() {
 	}
 }
 
-func (m *model) finalizeReasoning(full string) {
-	text := full
-	if text == "" {
-		text = m.reasoning.String()
+// reasoningPending reports whether reasoning text awaits its cell.
+func (m *model) reasoningPending() bool { return m.reasoning.Len() > 0 || len(m.reasonParts) > 0 }
+
+// reasoningSectionBreak ends a reasoning section; the sections of a block
+// share one cell (Codex on_reasoning_section_break).
+func (m *model) reasoningSectionBreak() {
+	if m.reasoning.Len() > 0 {
+		m.reasonParts = append(m.reasonParts, m.reasoning.String())
+		m.reasoning.Reset()
 	}
-	if strings.TrimSpace(text) != "" {
+}
+
+// reasoningBody is what the reasoning cell shows: its sections without
+// the leading "**Title**", which is the status header.
+func (m *model) reasoningBody() string {
+	parts := m.reasonParts
+	if m.reasoning.Len() > 0 {
+		parts = append(parts[:len(parts):len(parts)], m.reasoning.String())
+	}
+	_, body := splitReasoningParts(parts)
+	return body
+}
+
+// finalizeReasoning records the reasoning block; full is its complete
+// text when the backend sends it (it replaces the streamed section).
+func (m *model) finalizeReasoning(full string) {
+	if full != "" {
+		m.reasoning.Reset()
+		m.reasoning.WriteString(full)
+	}
+	m.reasoningSectionBreak()
+	if body := m.reasoningBody(); strings.TrimSpace(body) != "" {
 		// Reasoning is transcript-only (Ctrl+T) unless ShowReasoning.
 		if m.opts.ShowReasoning {
 			m.flushActive(true)
 		}
-		m.commit(reasoningCell{text})
+		m.commit(reasoningCell{body})
 	}
-	m.reasoning.Reset()
+	m.reasonParts = nil
 }
 
 // ---------------------------------------------------------------------------
@@ -903,14 +930,14 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 	case protocol.AgentReasoning:
 		m.finalizeReasoning(e.Text)
 	case protocol.AgentReasoningSectionBreak:
-		m.finalizeReasoning("")
+		m.reasoningSectionBreak()
 	case protocol.AgentMessageDelta:
-		if m.reasoning.Len() > 0 {
+		if m.reasoningPending() {
 			m.finalizeReasoning("")
 		}
 		m.streamDelta(e.Delta)
 	case protocol.AgentMessage:
-		if m.reasoning.Len() > 0 {
+		if m.reasoningPending() {
 			m.finalizeReasoning("") // keep reasoning before its answer
 		}
 		m.finalizeStream(e.Message)
@@ -1045,7 +1072,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 }
 
 func (m *model) endTurn(aborted bool, last string) tea.Cmd {
-	if m.reasoning.Len() > 0 {
+	if m.reasoningPending() {
 		m.finalizeReasoning("")
 	}
 	if aborted {

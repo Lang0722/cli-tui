@@ -131,15 +131,55 @@ type reasoningCell struct{ text string }
 func (reasoningCell) transcriptOnly() bool { return true }
 
 func (c reasoningCell) Lines(width int, st *Styles) []Line {
-	it := st.Dim.Italic(true)
 	md := RenderMarkdown(c.text, st, width-2)
 	for i := range md {
-		md[i].Line = append(Line(nil), md[i].Line...) // may be a shared highlight row
-		for j := range md[i].Line {
-			md[i].Line[j].Style = ptrStyle(md[i].Line[j].Style.Inherit(it))
-		}
+		md[i].Line = st.reasoningTint(md[i].Line)
 	}
 	return wrapMarkdown(md, width, L(S("• ", st.Dim)), L(P("  ")))
+}
+
+// splitReasoningParts splits reasoning sections into the status header
+// and the text the cell shows, like Codex split_reasoning_summary_parts:
+// empty sections and title-only placeholders ("**T**<!-- -->") are
+// dropped, and a leading "**Title**" on its own line is the header.
+func splitReasoningParts(parts []string) (header, body string) {
+	var content []string
+	placeholder := ""
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		end := -1
+		if rest, ok := strings.CutPrefix(p, "**"); ok {
+			if k := strings.Index(rest, "**"); k > 0 {
+				end = k + 4
+			}
+		}
+		b := p
+		if end >= 0 {
+			b = p[end:]
+		}
+		if strings.TrimSpace(b) == "<!-- -->" {
+			if len(content) == 0 && placeholder == "" && end >= 0 {
+				placeholder = p[:end]
+			}
+			continue
+		}
+		content = append(content, p)
+	}
+	text := strings.Join(content, "\n\n")
+	if text == "" {
+		return placeholder, ""
+	}
+	if rest, ok := strings.CutPrefix(text, "**"); ok {
+		if k := strings.Index(rest, "**"); k >= 0 {
+			if after := text[k+4:]; strings.HasPrefix(after, "\n") || strings.HasPrefix(after, "\r") {
+				return text[:k+4], after
+			}
+		}
+	}
+	return placeholder, text
 }
 
 // ---------------------------------------------------------------------------

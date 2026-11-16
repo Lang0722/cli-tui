@@ -164,7 +164,7 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `slash_commands{commands:[{name,description,available_during_task}]}` | adds backend commands to the `/` popup (each advertisement replaces the last). Names that clash with a built-in are ignored. |
 | `session_title{title}` | renames the conversation (status line and window title `thread-name`) |
 | `agent_message_delta` / `agent_message` | `• …` markdown streamed into scrollback line by line. Tables are held back until complete; dropped deltas are repaired from the final message. |
-| `agent_reasoning_delta` / `agent_reasoning` | the latest `**title**` becomes the status header; the text goes to the Ctrl+T transcript |
+| `agent_reasoning_delta` / `agent_reasoning` / `agent_reasoning_section_break` | the latest `**title**` becomes the status header; the text goes to the Ctrl+T transcript as one gray italic cell per reasoning block (sections joined, the leading title dropped, as in Codex) |
 | `exec_command_begin` / `output_delta` / `end` | `• Running` → `• Ran cmd`, with the first and last 5 output lines around `… +N lines (⌃t to view transcript)`. Reads, lists and searches merge into `• Explored`, with `(exit N)` on failures. |
 | `exec_approval_request` / `apply_patch_approval_request` | numbered approval modal; Ctrl+A shows the full command or diff. An exec request may carry `proposed_prefix` (e.g. `["go","test"]`) to offer "don't ask again for commands that start with `go test`"; without it the option is "don't ask again for this command in this session". |
 | `patch_apply_begin` / `end` | `• Edited path (+a -d)` with a line-numbered, tinted, syntax-highlighted diff; `✘ Failed to apply patch` on failure |

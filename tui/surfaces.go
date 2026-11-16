@@ -227,7 +227,7 @@ func (m *model) runState() string {
 	switch {
 	case !m.running:
 		return "Ready"
-	case m.reasoning.Len() > 0 && !m.stream.active:
+	case m.reasoningPending() && !m.stream.active:
 		return "Thinking"
 	}
 	return "Working"

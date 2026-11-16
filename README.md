@@ -253,9 +253,11 @@ without one belong to the main conversation:
   helper was asked. Input you type into the thread is drawn when you send
   it; its `user_message` echo is not drawn again. (In the main thread a
   live `user_message` is still not drawn, only replayed history.)
-- `/subagents` lists the threads (green dot = open, `(current)`,
+- `/subagents` lists main and the open threads (`(current)`,
   `(needs approval)` first). Alt+←/→ cycle through them with an empty
-  composer. Switching clears the screen and reprints the chosen thread,
+  composer. A closed thread drops out of both (Codex keeps it, dimmed); an
+  open helper that has finished its task stays, so you can send it more
+  work. Switching clears the screen and reprints the chosen thread,
   and the footer names it (`Main [default]`, `Robie [explorer]`,
   `` `/root/reviewer` ``).
 - Input, `!` commands and Esc / Ctrl+C go to the watched thread (with its
@@ -264,8 +266,9 @@ without one belong to the main conversation:
   direct input is disabled" and refuses prompts.
 - An approval or question from a thread you aren't watching opens where you
   are, under a `Thread: <name>` header; `o` opens that thread.
-- When the watched thread closes, the UI switches back to main. A closed
-  thread's transcript stays viewable. For path-addressed agents,
+- When the watched thread closes, the UI switches back to main. Once every
+  helper is closed, `/subagents` says so and the footer stops naming the
+  thread. For path-addressed agents,
   `/subagents` first prints a "Sub-agents running" summary.
 
 **Revert.** With an empty composer, Esc Esc opens the transcript in backtrack

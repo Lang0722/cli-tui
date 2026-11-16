@@ -150,9 +150,54 @@ func TestSubagentThreadsSwitchAndApprove(t *testing.T) {
 	if m.thread != "" || !strings.Contains(queuedPlain(m), "Agent thread r1 closed. Switched back to main thread.") {
 		t.Fatalf("close: on %q, out %q", m.thread, queuedPlain(m))
 	}
+	// A closed thread is no longer offered: Alt+← stays on main.
 	m.Update(keyNamed("alt+left"))
-	if m.thread != "r1" || !strings.Contains(queuedPlain(m), "Agent thread r1 is closed. Replaying saved transcript.") {
-		t.Fatalf("closed replay: on %q, out %q", m.thread, queuedPlain(m))
+	if m.thread != "" {
+		t.Fatalf("alt+left opened closed thread %q", m.thread)
+	}
+}
+
+// Closed (finished) subagents drop out of /subagents and Alt+←/→; open
+// ones stay, even when idle, so they can be sent more work.
+func TestClosedSubagentsAreHidden(t *testing.T) {
+	m, _ := agentModel()
+	evIn(m, "", protocol.SessionConfigured{Model: "gpt-5", SessionID: "main-id"})
+	evIn(m, "", protocol.ThreadStarted{ThreadID: "r1", Nickname: "Robie", Role: "explorer"})
+	evIn(m, "", protocol.ThreadStarted{ThreadID: "b1", Nickname: "Bob", Role: "worker"})
+	evIn(m, "b1", protocol.TaskStarted{})
+	evIn(m, "b1", protocol.TaskComplete{}) // finished its task, still open
+	evIn(m, "", protocol.ThreadClosed{ThreadID: "r1"})
+	m.runCommand("subagents", "")
+	v := plainView(m)
+	if strings.Contains(v, "Robie") || !strings.Contains(v, "1. • Main [default] (current)") || !strings.Contains(v, "2. • Bob [worker]") {
+		t.Fatalf("picker should list Main and Bob only:\n%s", v)
+	}
+	m.Update(key("esc"))
+	for _, want := range []string{"b1", "", "b1"} {
+		m.Update(keyNamed("alt+right"))
+		if m.thread != want {
+			t.Fatalf("alt+right: on %q, want %q", m.thread, want)
+		}
+	}
+	// Once every subagent is closed there is nothing to pick or cycle to.
+	evIn(m, "", protocol.ThreadClosed{ThreadID: "b1"})
+	if m.thread != "" {
+		t.Fatalf("not back on main after the watched thread closed (on %q)", m.thread)
+	}
+	m.out.takeQueued()
+	m.Update(keyNamed("alt+right"))
+	if m.thread != "" {
+		t.Fatalf("alt+right opened closed thread %q", m.thread)
+	}
+	m.runCommand("subagents", "")
+	if out := queuedPlain(m); !strings.Contains(out, "No active agents: every subagent has been closed.") {
+		t.Fatalf("all closed: %q", out)
+	}
+	if m.agents.picker != nil {
+		t.Fatal("picker opened with no active agents")
+	}
+	if l := m.footerAgentLabel(); l != "" {
+		t.Fatalf("footer still names a thread: %q", l)
 	}
 }
 

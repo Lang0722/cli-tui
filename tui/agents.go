@@ -45,8 +45,21 @@ func (r *agentRegistry) init(main *convo) {
 	r.picker = nil
 }
 
-// hasSubagents reports whether any thread besides main is tracked.
-func (r *agentRegistry) hasSubagents() bool { return len(r.order) > 1 }
+// hasSubagents reports whether any thread besides main can be watched.
+func (r *agentRegistry) hasSubagents() bool { return len(r.visible("")) > 1 }
+
+// visible is the threads the picker and Alt+←/→ offer, in spawn order:
+// main and every subagent that isn't closed (a finished, closed helper
+// drops out; Codex keeps it, dimmed). The watched thread always stays.
+func (r *agentRegistry) visible(watched string) []string {
+	var ids []string
+	for _, id := range r.order {
+		if t := r.byID[id]; id == "" || id == watched || t != nil && !t.closed {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
 
 // upsert registers a thread (once, keeping first-seen order).
 func (m *model) upsertThread(id string) *agentThread {
@@ -255,27 +268,23 @@ func (m *model) selectThread(id string) tea.Cmd {
 	if t == nil {
 		return nil
 	}
-	cmd := m.showThread(id)
-	if cmd != nil && t.closed && id != "" {
-		m.commit(infoCell(m.st, "Agent thread "+id+" is closed. Replaying saved transcript."))
-	}
-	return cmd
+	return m.showThread(id)
 }
 
 // cycleThread is Alt+←/→: the neighbour in spawn order, wrapping around.
 func (m *model) cycleThread(delta int) tea.Cmd {
-	r := &m.agents
-	if !r.hasSubagents() {
+	ids := m.agents.visible(m.thread)
+	if len(ids) < 2 {
 		return nil
 	}
 	cur := 0
-	for i, id := range r.order {
+	for i, id := range ids {
 		if id == m.thread {
 			cur = i
 		}
 	}
-	n := len(r.order)
-	return m.selectThread(r.order[((cur+delta)%n+n)%n])
+	n := len(ids)
+	return m.selectThread(ids[((cur+delta)%n+n)%n])
 }
 
 // parentOwned reports whether the watched thread refuses direct input.
@@ -608,14 +617,18 @@ func (m *model) pendingApproval(id string) bool {
 
 func (m *model) openAgentPicker() tea.Cmd {
 	r := &m.agents
-	if !r.hasSubagents() {
+	if len(r.order) < 2 {
 		m.commit(infoCell(m.st, "No agents available yet."))
 		return nil
 	}
 	if feed := m.statusFeed(); feed != nil {
 		m.commit(feed)
 	}
-	ids := append([]string(nil), r.order...)
+	ids := r.visible(m.thread)
+	if len(ids) < 2 {
+		m.commit(infoCell(m.st, "No active agents: every subagent has been closed."))
+		return nil
+	}
 	sort.SliceStable(ids, func(i, j int) bool { return m.pendingApproval(ids[i]) && !m.pendingApproval(ids[j]) })
 	p := &agentPicker{ids: ids}
 	for i, id := range ids {

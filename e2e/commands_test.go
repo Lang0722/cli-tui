@@ -197,8 +197,11 @@ func TestSubagents(t *testing.T) {
 
 	s.submit("/subagents")
 	s.waitScreen("Select an agent to watch.")
-	s.waitScreen("Bob [worker]")
-	s.keys("3")
+	s.waitScreen("2. • Bob [worker]") // Robie is closed, so not listed
+	if strings.Contains(s.screen(), ". • Robie") {
+		t.Errorf("closed Robie is listed:\n%s", s.screen())
+	}
+	s.keys("2")
 	s.waitScreen("Bob [worker]")
 	s.poll("the footer to show Bob's thread", func() bool { return strings.Contains(s.screen(), "· Bob [worker]") })
 	// Like Codex, his view starts with the task the main agent gave him.
@@ -211,7 +214,7 @@ func TestSubagents(t *testing.T) {
 	if n := s.count(`› check the flaky one`); n != 1 {
 		t.Errorf("typed input shown %d times", n)
 	}
-	s.keys("M-Left", "M-Left")
+	s.keys("M-Left") // Main, Bob: Robie is skipped
 	s.poll("back on the main thread", func() bool { return strings.Contains(s.screen(), "· Main [default]") })
 }
 

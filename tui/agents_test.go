@@ -238,3 +238,53 @@ func TestAbortRestoresQueuedImages(t *testing.T) {
 		t.Fatalf("images %v", images)
 	}
 }
+
+// Like Codex, a subagent's view shows the prompts its parent sent it (the
+// task it was spawned with, later instructions) as user messages, so its
+// context is clear; input typed into the thread is drawn once.
+func TestSubagentViewShowsParentPrompts(t *testing.T) {
+	m, _ := agentModel()
+	evIn(m, "", protocol.SessionConfigured{Model: "gpt-5", SessionID: "main-id"})
+	evIn(m, "", protocol.ThreadStarted{ThreadID: "r1", Nickname: "Robie", Role: "explorer"})
+	m.out.takeQueued()
+	// Spawned in the background: recorded, not printed into main.
+	evIn(m, "r1", protocol.TaskStarted{})
+	evIn(m, "r1", protocol.UserMessage{Message: "Map the repository layout."})
+	evIn(m, "r1", protocol.AgentMessage{Message: "Done mapping."})
+	evIn(m, "r1", protocol.TaskComplete{})
+	if out := queuedPlain(m); strings.Contains(out, "Map the repository") {
+		t.Fatalf("subagent prompt printed into main: %q", out)
+	}
+	m.Update(keyNamed("alt+right"))
+	if m.thread != "r1" {
+		t.Fatalf("not on the subagent (on %q)", m.thread)
+	}
+	out := queuedPlain(m)
+	if p, a := strings.Index(out, "› Map the repository layout."), strings.Index(out, "• Done mapping."); p < 0 || a < p {
+		t.Fatalf("prompt not shown before the answer:\n%s", out)
+	}
+	// A later instruction from the parent, while watching: drawn live.
+	evIn(m, "r1", protocol.TaskStarted{})
+	evIn(m, "r1", protocol.UserMessage{Message: "Also list the tests."})
+	if out := queuedPlain(m); !strings.Contains(out, "› Also list the tests.") {
+		t.Fatalf("live parent prompt not drawn: %q", out)
+	}
+	evIn(m, "r1", protocol.TaskComplete{})
+	// Input typed here is drawn on submit; its echo is not drawn again.
+	for _, r := range "more" {
+		m.Update(key(string(r)))
+	}
+	m.Update(key("enter"))
+	evIn(m, "r1", protocol.TaskStarted{})
+	evIn(m, "r1", protocol.UserMessage{Message: "more"})
+	if n := strings.Count(queuedPlain(m), "› more"); n != 1 {
+		t.Fatalf("typed input drawn %d times", n)
+	}
+	// The main thread still draws live input only on submit.
+	m.Update(keyNamed("alt+left"))
+	m.out.takeQueued()
+	evIn(m, "", protocol.UserMessage{Message: "echo of main input"})
+	if out := queuedPlain(m); strings.Contains(out, "echo of main input") {
+		t.Fatalf("main thread drew a live user_message: %q", out)
+	}
+}

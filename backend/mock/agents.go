@@ -35,8 +35,10 @@ func (a *subagent) emit(m protocol.EventMsg) {
 }
 
 // task runs one turn on the agent's thread; script gets a context that an
-// Interrupt for this thread cancels.
-func (a *subagent) task(parent context.Context, script func(ctx context.Context) (string, bool)) protocol.AgentState {
+// Interrupt for this thread cancels. The turn starts with its input, the
+// prompt from the parent agent or the user, as a user message (Codex
+// records a subagent's input in its own thread).
+func (a *subagent) task(parent context.Context, prompt string, script func(ctx context.Context) (string, bool)) protocol.AgentState {
 	ctx, cancel := context.WithCancel(a.ctx)
 	if parent != nil {
 		// Interrupting the parent's turn interrupts this task too.
@@ -45,6 +47,9 @@ func (a *subagent) task(parent context.Context, script func(ctx context.Context)
 	a.turnCancel.Store(&cancel)
 	defer func() { a.turnCancel.Store(nil); cancel() }()
 	a.emit(protocol.TaskStarted{ContextWindow: contextWindow})
+	if prompt != "" {
+		a.emit(protocol.UserMessage{Message: prompt})
+	}
 	msg, ok := script(ctx)
 	if !ok {
 		a.emit(protocol.TurnAborted{Reason: "interrupted"})
@@ -85,7 +90,7 @@ func (a *subagent) loop() {
 		case <-a.ctx.Done():
 			return
 		case text := <-a.inputs:
-			a.task(nil, func(ctx context.Context) (string, bool) {
+			a.task(nil, text, func(ctx context.Context) (string, bool) {
 				msg := fmt.Sprintf("%s here. Noted: %q. I'll keep that in mind for the rest of this task.", a.label(), text)
 				return msg, sleep(ctx, 300*time.Millisecond) && a.say(ctx, msg)
 			})
@@ -100,8 +105,8 @@ func (a *subagent) label() string {
 	return a.nick
 }
 
-// spawn registers a thread and starts its first task.
-func (b *Backend) spawn(parent context.Context, nick, role, path string, script func(a *subagent, ctx context.Context) (string, bool)) *subagent {
+// spawn registers a thread and starts its first task, prompt.
+func (b *Backend) spawn(parent context.Context, nick, role, path, prompt string, script func(a *subagent, ctx context.Context) (string, bool)) *subagent {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &subagent{id: fmt.Sprintf("019a%04x-7c1e-7a10-9d2b-%012x", agentSeq.Add(1), time.Now().UnixNano()&0xffffffffffff),
 		nick: nick, role: role, path: path, b: b, inputs: make(chan string, 4), done: make(chan struct{}), ctx: ctx, close: cancel}
@@ -115,7 +120,7 @@ func (b *Backend) spawn(parent context.Context, nick, role, path string, script 
 	}
 	b.emit(st) // saved, so resumed history keeps the agent's name
 	go func() {
-		a.result = a.task(parent, func(ctx context.Context) (string, bool) { return script(a, ctx) })
+		a.result = a.task(parent, prompt, func(ctx context.Context) (string, bool) { return script(a, ctx) })
 		close(a.done)
 		a.loop()
 	}()
@@ -159,7 +164,7 @@ func (t *turn) agentsDemo() bool {
 	spawn := func(nick, role, prompt string, script func(a *subagent, ctx context.Context) (string, bool)) *subagent {
 		id := fmt.Sprintf("spawn-%d", agentSeq.Add(1))
 		t.collab(protocol.CollabToolCall{CallID: id, Tool: protocol.CollabSpawnAgent, Status: protocol.CollabInProgress, Prompt: prompt, Model: b.model, ReasoningEffort: "low"})
-		a := b.spawn(t.ctx, nick, role, "", script)
+		a := b.spawn(t.ctx, nick, role, "", prompt, script)
 		t.collab(protocol.CollabToolCall{CallID: id, Tool: protocol.CollabSpawnAgent, Status: protocol.CollabCompleted, ReceiverThreadIDs: []string{a.id}, Prompt: prompt, Model: b.model, ReasoningEffort: "low"})
 		return a
 	}
@@ -220,7 +225,8 @@ func (t *turn) delegateDemo() bool {
 		return false
 	}
 	path := "/root/reviewer"
-	a := b.spawn(t.ctx, "", "", path, func(a *subagent, ctx context.Context) (string, bool) {
+	prompt := "Review the uncommitted changes to the HTTP server and flag anything risky."
+	a := b.spawn(t.ctx, "", "", path, prompt, func(a *subagent, ctx context.Context) (string, bool) {
 		if !a.exec(ctx, "git diff --stat", " internal/server.go      | 5 +++--\n internal/server_test.go | 7 +++++++\n 2 files changed, 10 insertions(+), 2 deletions(-)\n") {
 			return "", false
 		}

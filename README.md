@@ -171,7 +171,7 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `patch_apply_begin` / `end` | `• Edited path (+a -d)` with a line-numbered, tinted, syntax-highlighted diff; `✘ Failed to apply patch` on failure |
 | `tool_call_begin` / `end` | `• Calling` / `• Called server.tool(args)` / `• Failed` |
 | `plan_update` | `• Updated Plan · 1/3 complete` checklist |
-| `thread_started{thread_id,nickname?,role?,path?,accepts_input?,model?}` / `thread_closed{thread_id}` | register / end a subagent thread |
+| `thread_started{thread_id,nickname?,role?,path?,accepts_input?,model?}` / `thread_closed{thread_id}` | register / end a subagent thread. The thread's prompts are `user_message` events in it (see Subagents) |
 | `collab_tool_call{call_id,tool,status,receiver_thread_ids,prompt,model,reasoning_effort,agents_states}` | `• Spawned Robie [explorer] (model effort)`, `• Sent input to …`, `• Waiting for …` / `• Finished waiting` with each agent's state, `• Resumed …`, `• Closed …` |
 | `sub_agent_activity{kind,agent_thread_id,agent_path}` | ``• Started `/root/reviewer` `` (also `Interacted with`, `Interrupted`, `Completed`) |
 | `selection_request{id,title,items,allow_freeform}` | a picker in place of the composer (digits, j/k, search when there are more than 9 items) |
@@ -241,11 +241,18 @@ without one belong to the main conversation:
 
 ```
 {"msg":{"type":"thread_started","thread_id":"t1","nickname":"Robie","role":"explorer"}}
+{"thread_id":"t1","msg":{"type":"user_message","message":"Map the repository layout."}}
 {"thread_id":"t1","msg":{"type":"exec_command_begin","call_id":"c1","command":["ls"]}}
 ```
 
 - The main transcript shows the collab rows. Each thread's own events
   build that thread's transcript off screen.
+- Send a thread's input as a `user_message` in that thread: the task it was
+  spawned with and each later instruction from the parent. As in Codex,
+  the thread's view shows them as `› …` prompts, so you can see what the
+  helper was asked. Input you type into the thread is drawn when you send
+  it; its `user_message` echo is not drawn again. (In the main thread a
+  live `user_message` is still not drawn, only replayed history.)
 - `/subagents` lists the threads (green dot = open, `(current)`,
   `(needs approval)` first). Alt+←/→ cycle through them with an empty
   composer. Switching clears the screen and reprints the chosen thread,

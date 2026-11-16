@@ -201,6 +201,16 @@ func TestSubagents(t *testing.T) {
 	s.keys("3")
 	s.waitScreen("Bob [worker]")
 	s.poll("the footer to show Bob's thread", func() bool { return strings.Contains(s.screen(), "· Bob [worker]") })
+	// Like Codex, his view starts with the task the main agent gave him.
+	s.waitFor("› Run the test suite and report any failures.")
+	if all := s.all(); strings.Index(all, "› Run the test suite") > strings.LastIndex(all, "• All tests pass") {
+		t.Errorf("Bob's prompt is not above his answer:\n%s", all)
+	}
+	// Input typed into his thread shows once, then his answer.
+	s.turn("check the flaky one", "Noted: \"check the flaky one\"")
+	if n := s.count(`› check the flaky one`); n != 1 {
+		t.Errorf("typed input shown %d times", n)
+	}
 	s.keys("M-Left", "M-Left")
 	s.poll("back on the main thread", func() bool { return strings.Contains(s.screen(), "· Main [default]") })
 }

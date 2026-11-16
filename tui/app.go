@@ -248,6 +248,9 @@ type convo struct {
 	// arrived (Codex last_flushed_agent_message): that late final corrects
 	// the cell where the answer first appeared instead of adding a copy.
 	interrupted *interruptedAnswer
+	// sent is what the user typed into this subagent thread, drawn on
+	// submit; the backend's user_message echo of it is not drawn again.
+	sent []string
 
 	// turn
 	running      bool
@@ -965,11 +968,23 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		return m.notify(m.agent, e.Title)
 	case protocol.UserMessage:
 		// Live input is drawn when submitted; only history is rendered here.
-		if m.replaying {
+		// A subagent thread's prompts come from its parent agent (the task
+		// it was spawned with, later instructions): like Codex, its view
+		// shows them as user messages, live too.
+		switch {
+		case m.replaying:
 			m.finalizeStream("")
 			m.flushActive(true)
 			m.commit(userCell{text: e.Message, images: e.Images})
 			m.composer.addHistory(e.Message, nil)
+		case m.convo.thread != "":
+			if len(m.sent) > 0 && m.sent[0] == e.Message {
+				m.sent = m.sent[1:] // typed here: already drawn
+				break
+			}
+			m.finalizeStream("")
+			m.flushActive(true)
+			m.commit(userCell{text: e.Message, images: e.Images})
 		}
 	case protocol.TaskStarted:
 		if m.replaying {
@@ -1240,6 +1255,9 @@ func (m *model) sendUser(text string) { m.sendInput(pendingInput{text: text}) }
 
 func (m *model) sendInput(in pendingInput) {
 	m.commit(userCell{text: in.text, images: in.images, steer: m.running})
+	if m.thread != "" {
+		m.sent = append(m.sent, in.text)
+	}
 	m.submit(protocol.UserInput{Text: in.text, Images: in.images, ThreadID: m.thread, Skills: m.skills.mentionedSkills(in.text)})
 }
 

@@ -18,6 +18,10 @@ type composer struct {
 	histPastes []map[string]string // paste and image placeholders per history entry
 	histIdx    int                 // len(history) when not browsing
 	histDraft  string
+	// recalled is the text of the entry history navigation last put in the
+	// editor; Up/Down keep browsing only while the editor still holds it.
+	recalled   string
+	isRecalled bool
 	pastes     map[string]string
 	pasteCount int
 	images     map[string]string // "[Image #N]" -> file path
@@ -51,6 +55,25 @@ func (c *composer) Clear() {
 	c.text = nil
 	c.cursor = 0
 	c.histIdx = len(c.history)
+	c.isRecalled = false
+}
+
+// browsingHistory reports whether Up/Down navigate history rather than
+// move the cursor (Codex should_handle_navigation): the editor is empty,
+// or it holds the recalled entry unedited with the cursor at its start or
+// end. Anywhere else the arrows edit, so moving into a recalled message
+// to change it never swaps it for another entry.
+func (c *composer) browsingHistory() bool {
+	if len(c.history) == 0 {
+		return false
+	}
+	if c.Empty() {
+		return true
+	}
+	if c.cursor != 0 && c.cursor != len(c.text) {
+		return false
+	}
+	return c.isRecalled && string(c.text) == c.recalled
 }
 
 func (c *composer) insert(s string) {
@@ -248,6 +271,7 @@ func (c *composer) addHistory(text string, pastes map[string]string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
+	c.isRecalled = false
 	if n := len(c.history); n > 0 && c.history[n-1] == text {
 		c.histIdx = len(c.history)
 		return
@@ -274,6 +298,7 @@ func (c *composer) recall(i int) {
 			c.pastes[ph] = content
 		}
 	}
+	c.recalled, c.isRecalled = string(c.text), true
 }
 
 func (c *composer) historyPrev() bool {
@@ -295,6 +320,7 @@ func (c *composer) historyNext() bool {
 	c.histIdx++
 	if c.histIdx == len(c.history) {
 		c.Set(c.histDraft)
+		c.isRecalled = false // past the newest: browsing ends
 	} else {
 		c.recall(c.histIdx)
 	}
@@ -322,15 +348,14 @@ func (c *composer) HandleEditKey(k tea.KeyPressMsg, act string, width int) bool 
 	case "move_line_end":
 		_, c.cursor = c.lineBounds()
 	case "move_up":
-		onFirst := !strings.ContainsRune(string(c.text[:c.cursor]), '\n')
-		if (c.Empty() || c.histIdx < len(c.history) || onFirst && c.cursor == 0) && c.historyPrev() {
+		if c.browsingHistory() && c.historyPrev() {
 			return true
 		}
 		if !c.moveVertical(-1, width) {
 			c.cursor = 0
 		}
 	case "move_down":
-		if c.histIdx < len(c.history) && c.historyNext() {
+		if c.browsingHistory() && c.historyNext() {
 			return true
 		}
 		if !c.moveVertical(1, width) {

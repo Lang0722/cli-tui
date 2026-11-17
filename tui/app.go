@@ -2014,6 +2014,12 @@ func (m *model) closePopups() {
 // refreshPopups opens/updates the "/" and "@" popups from composer state.
 func (m *model) refreshPopups() tea.Cmd {
 	c := m.composer
+	if c.isRecalled && c.browsingHistory() {
+		// Browsing history: a recalled "/cmd" or "@file" opens no popup
+		// that would take over the arrows (Codex).
+		m.closePopups()
+		return nil
+	}
 	text := c.String()
 	if strings.HasPrefix(text, "/") {
 		first := strings.SplitN(text, " ", 2)[0]

@@ -195,7 +195,7 @@ These are the defaults. Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+V / Alt+V and the
 | `/` · `@` · `!` | command popup · fuzzy file search · shell mode |
 | Esc | interrupt; close a popup. With an empty composer, Esc Esc opens backtrack: ←/→ pick a prompt, Enter rewinds. |
 | Ctrl+C | clear input → interrupt → press twice to quit |
-| ↑/↓, Ctrl+R / Ctrl+S | history; reverse-i-search |
+| ↑/↓, Ctrl+R / Ctrl+S | history (as in Codex, only from an empty prompt or an unedited recalled one with the cursor at its start or end; elsewhere the arrows move the cursor); reverse-i-search |
 | Ctrl+W, Alt+Backspace, Ctrl+Backspace, Ctrl+U/K, Alt+D, Ctrl+Delete, Ctrl+Y | word and line kills, then yank |
 | Ctrl+V / Alt+V | paste a clipboard image (needs `wl-paste` or `xclip`) |
 | Ctrl+G | edit the prompt in `$VISUAL` / `$EDITOR` |

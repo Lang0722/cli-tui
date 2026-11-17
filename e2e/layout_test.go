@@ -97,9 +97,30 @@ func TestCursorStaysInComposerAfterPrint(t *testing.T) {
 			want = i
 		}
 	}
-	x, y := s.cursor()
+	x, y, shown := s.cursor()
 	// The line is 2+16+11 = 29 columns wide; Up from column 25 lands on it.
-	if y != want || x != 25 {
-		t.Errorf("cursor at %d,%d, want 25,%d (in the composer's first line)\n%s", x, y, want, s.screen())
+	if y != want || x != 25 || !shown {
+		t.Errorf("cursor at %d,%d (shown %v), want 25,%d shown (in the composer's first line)\n%s", x, y, shown, want, s.screen())
+	}
+}
+
+// While a turn prints into scrollback, the cursor isn't shown above the
+// composer: each insert briefly puts it at the top of the live frame
+// (column 0, where the composer's cursor never is), so it is hidden until
+// the next frame moves it back.
+func TestCursorNotShownAboveComposerWhileWorking(t *testing.T) {
+	t.Parallel()
+	s := start(t, opts{env: []string{"TERM=xterm-256color"}})
+	s.submit("investigate the failing build")
+	s.running()
+	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if x, y, shown := s.cursor(); shown && x == 0 {
+			t.Fatalf("cursor shown at %d,%d, above the composer\n%s", x, y, s.screen())
+		}
+	}
+	s.waitIdle()
+	time.Sleep(200 * time.Millisecond)
+	if x, _, shown := s.cursor(); !shown || x != 2 {
+		t.Errorf("after the turn: cursor at column %d, shown %v; want shown in the empty composer", x, shown)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -65,4 +66,22 @@ func TestPrintedMsgChangesFrameInvisibly(t *testing.T) {
 	if before.Cursor == nil || after.Cursor == nil || *before.Cursor != *after.Cursor {
 		t.Errorf("cursor moved: %+v -> %+v", before.Cursor, after.Cursor)
 	}
+	// Two prints between frames must not bring back the frame last drawn.
+	m.Update(printedMsg{})
+	if again := m.View(); again.Content == before.Content || again.Content == after.Content {
+		t.Errorf("a later print repeats an earlier frame")
+	}
+	// The marker draws nothing: the cells match the frame without it.
+	if drawn(before.Content) != drawn(after.Content) {
+		t.Errorf("the marker changed the drawn cells")
+	}
+}
+
+// drawn is what Bubble Tea's cell parser makes of a frame.
+func drawn(content string) string {
+	var b strings.Builder
+	for _, l := range uv.NewStyledString(content).Lines(ansi.WcWidth) {
+		b.WriteString(l.Render() + "\n")
+	}
+	return b.String()
 }

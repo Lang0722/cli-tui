@@ -274,11 +274,13 @@ func (s *term) composerLine() string {
 	return ""
 }
 
-// cursor is the terminal cursor's position on the visible screen.
-func (s *term) cursor() (x, y int) {
+// cursor is the terminal cursor's position on the visible screen and
+// whether it is shown.
+func (s *term) cursor() (x, y int, shown bool) {
 	s.t.Helper()
-	fmt.Sscanf(s.tmux("display-message", "-p", "-t", "0", "#{cursor_x} #{cursor_y}"), "%d %d", &x, &y)
-	return x, y
+	var flag int
+	fmt.Sscanf(s.tmux("display-message", "-p", "-t", "0", "#{cursor_x} #{cursor_y} #{cursor_flag}"), "%d %d %d", &x, &y, &flag)
+	return x, y, flag == 1
 }
 
 func (s *term) resize(w, h int) {

@@ -90,9 +90,15 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	p := tea.NewProgram(m, tea.WithContext(ctx))
 	m.send = p.Send
-	go m.out.run(p.Println, func() { p.Send(printedMsg{}) })
+	// Each insert hides the cursor: Bubble Tea writes it with the cursor at
+	// the top of the live frame, and the frame drawn for printedMsg moves
+	// it back and shows it, so it doesn't flash above the composer.
+	insert := func(a ...any) { p.Println(hideCursor + fmt.Sprint(a...)) }
+	go m.out.run(insert, func() { p.Send(printedMsg{}) })
 	_, err := p.Run()
 	m.out.stop()
+	// Bubble Tea only re-shows a cursor it hid itself.
+	_, _ = os.Stdout.WriteString(showCursor)
 	_ = opts.Backend.Submit(context.Background(), protocol.Shutdown{})
 	if err == nil && m.closed && !m.userQuit {
 		err = errBackendClosed
@@ -112,6 +118,11 @@ var errBackendClosed = errors.New("the backend exited (its event stream closed)"
 // until something else changed. Answering it with a frame that differs
 // invisibly makes Bubble Tea redraw and put the cursor back.
 type printedMsg struct{}
+
+const (
+	hideCursor = "\x1b[?25l"
+	showCursor = "\x1b[?25h"
+)
 
 type (
 	backendMsg   struct{ ev protocol.Event }
@@ -173,9 +184,9 @@ type model struct {
 	width, height int
 	out           *printer
 	printedAny    bool
-	printFlip     bool // toggled per printedMsg so the next frame differs
-	sepPrinted    bool // the blank row that separates the next cell is already printed
-	overlayTall   bool // the last frame's overlay covered most of the screen
+	printSeq      uint64 // counts printedMsg so the next frame differs
+	sepPrinted    bool   // the blank row that separates the next cell is already printed
+	overlayTall   bool   // the last frame's overlay covered most of the screen
 	send          func(tea.Msg)
 
 	// The conversation on screen: the main thread or a watched subagent
@@ -857,7 +868,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case printedMsg:
-		m.printFlip = !m.printFlip
+		m.printSeq++
 		return m, nil
 	case tea.BackgroundColorMsg:
 		m.st.SetBackground(msg.Color)
@@ -2243,8 +2254,12 @@ func (m *model) View() tea.View {
 	}
 	all := append(top, bottom...)
 	content := renderLines(all)
-	if m.printFlip {
-		content += "\x1b[m" // differs, draws the same (see printedMsg)
+	if m.printSeq > 0 {
+		// Differs from every earlier frame but draws the same: Bubble
+		// Tea's cell parser drops OSCs other than hyperlinks (see
+		// printedMsg). A toggle could repeat the last frame drawn when
+		// two prints land between frames.
+		content += fmt.Sprintf("\x1b]9999;%d\x07", m.printSeq)
 	}
 	v := tea.NewView(content)
 	if cursorRow >= 0 {

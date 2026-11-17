@@ -107,7 +107,18 @@ const settle = 35 * time.Millisecond
 // which then shrinks and leaves blank rows under the composer. Lines are
 // handed over one at a time so a hold (pager opening, terminal clearing) or
 // a reset takes effect between lines.
-func (p *printer) run(println func(...any)) {
+//
+// printed is called after a run of lines, before waiting: Bubble Tea's
+// insert leaves the terminal cursor at the top of the live frame and only
+// a frame that differs moves it back into the composer (see printedMsg).
+func (p *printer) run(println func(...any), printed func()) {
+	unsignaled := false // lines printed since the last printed call
+	flush := func() {
+		if unsignaled && printed != nil {
+			printed()
+		}
+		unsignaled = false
+	}
 	for {
 		p.mu.Lock()
 		pending := len(p.queue) > 0 && p.held == 0
@@ -124,11 +135,13 @@ func (p *printer) run(println func(...any)) {
 			if p.held != 0 || len(p.queue) == 0 {
 				p.busy = false
 				p.mu.Unlock()
+				flush()
 				p.cond.Broadcast()
 				break
 			}
 			if wait := settle - time.Since(p.queued[0]); wait > 0 {
 				p.mu.Unlock()
+				flush()
 				time.Sleep(wait)
 				continue
 			}
@@ -141,6 +154,7 @@ func (p *printer) run(println func(...any)) {
 				line = " " // Bubble Tea drops empty prints
 			}
 			println(line)
+			unsignaled = true
 		}
 	}
 }

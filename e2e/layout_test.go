@@ -71,3 +71,35 @@ func TestFullHeightOverlayRestores(t *testing.T) {
 	s.waitPinned("after closing /keymap")
 	s.waitFor("↻ Resumed session") // the transcript was re-emitted
 }
+
+// Lines printed into scrollback while a multi-line draft is being edited
+// leave the terminal cursor where the composer's cursor is. Bubble Tea's
+// insert parks it at the top of the live frame, two rows above the
+// composer, and the cursor (and an input method's preedit text) stayed
+// there when the frame didn't change afterwards: here, the answer's last
+// lines printing after the turn ends.
+func TestCursorStaysInComposerAfterPrint(t *testing.T) {
+	t.Parallel()
+	s := start(t, opts{env: []string{"TERM=xterm-256color"}})
+	s.submit("hello")
+	s.running()
+	s.typ("请帮我重构服务器 first line")
+	s.keys("C-j")
+	s.typ("second line with a typo")
+	s.keys("Up") // into the first line, as when fixing a typo there
+	s.waitIdle()
+	s.waitFor("come back to this one") // the answer's last line
+	time.Sleep(300 * time.Millisecond) // settle + a few frames
+	rows := strings.Split(s.screen(), "\n")
+	want := -1
+	for i, r := range rows {
+		if strings.HasPrefix(r, "› 请帮我重构服务器 first line") {
+			want = i
+		}
+	}
+	x, y := s.cursor()
+	// The line is 2+16+11 = 29 columns wide; Up from column 25 lands on it.
+	if y != want || x != 25 {
+		t.Errorf("cursor at %d,%d, want 25,%d (in the composer's first line)\n%s", x, y, want, s.screen())
+	}
+}

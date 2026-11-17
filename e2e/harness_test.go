@@ -64,6 +64,7 @@ type opts struct {
 	home  string   // reuse another run's HOME (sessions, config, history)
 	reset bool     // -reset-demo: install the demo history
 	ready string   // screen text that means started (default "? for shortcuts")
+	env   []string // extra environment, e.g. "TERM=xterm-256color"
 }
 
 func start(t *testing.T, o opts) *term {
@@ -100,6 +101,7 @@ func start(t *testing.T, o opts) *term {
 		"XDG_STATE_HOME=" + filepath.Join(s.home, ".local", "state"),
 		"PATH=" + os.Getenv("PATH"), "LANG=C.UTF-8", "TERM_PROGRAM=", "VISUAL=", "EDITOR=",
 	}
+	env = append(env, o.env...)
 	// sh records the exit code: tmux sometimes misses the child's exit here
 	// and never reaps it (a zombie), leaving #{pane_dead_status} empty.
 	s.status = filepath.Join(t.TempDir(), "exit-status")
@@ -270,6 +272,13 @@ func (s *term) composerLine() string {
 		}
 	}
 	return ""
+}
+
+// cursor is the terminal cursor's position on the visible screen.
+func (s *term) cursor() (x, y int) {
+	s.t.Helper()
+	fmt.Sscanf(s.tmux("display-message", "-p", "-t", "0", "#{cursor_x} #{cursor_y}"), "%d %d", &x, &y)
+	return x, y
 }
 
 func (s *term) resize(w, h int) {

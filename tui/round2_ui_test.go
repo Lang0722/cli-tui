@@ -170,7 +170,7 @@ func TestR2PrinterHoldIsPerLine(t *testing.T) {
 			p.hold(holdPager, true) // pager opens mid-batch
 			close(done)
 		}
-	})
+	}, nil)
 	p.push("1\n2\n3\n4")
 	<-done
 	p.mu.Lock()

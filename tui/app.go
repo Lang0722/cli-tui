@@ -90,7 +90,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	p := tea.NewProgram(m, tea.WithContext(ctx))
 	m.send = p.Send
-	go m.out.run(p.Println)
+	go m.out.run(p.Println, func() { p.Send(printedMsg{}) })
 	_, err := p.Run()
 	m.out.stop()
 	_ = opts.Backend.Submit(context.Background(), protocol.Shutdown{})
@@ -104,6 +104,14 @@ func Run(ctx context.Context, opts Options) error {
 var testHookModel func(*model)
 
 var errBackendClosed = errors.New("the backend exited (its event stream closed)")
+
+// printedMsg says lines were inserted above the live frame. Bubble Tea's
+// insert leaves the terminal cursor at the frame's top row, two rows above
+// the composer, and skips frames equal to the last one, so the cursor (and
+// an input method's preedit text, drawn there) stayed above the composer
+// until something else changed. Answering it with a frame that differs
+// invisibly makes Bubble Tea redraw and put the cursor back.
+type printedMsg struct{}
 
 type (
 	backendMsg   struct{ ev protocol.Event }
@@ -165,6 +173,7 @@ type model struct {
 	width, height int
 	out           *printer
 	printedAny    bool
+	printFlip     bool // toggled per printedMsg so the next frame differs
 	sepPrinted    bool // the blank row that separates the next cell is already printed
 	overlayTall   bool // the last frame's overlay covered most of the screen
 	send          func(tea.Msg)
@@ -846,6 +855,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if widthChanged && m.printedAny && !m.opts.NoReflow {
 			return m, m.scheduleReflow()
 		}
+		return m, nil
+	case printedMsg:
+		m.printFlip = !m.printFlip
 		return m, nil
 	case tea.BackgroundColorMsg:
 		m.st.SetBackground(msg.Color)
@@ -2230,7 +2242,11 @@ func (m *model) View() tea.View {
 		cursorRow -= over
 	}
 	all := append(top, bottom...)
-	v := tea.NewView(renderLines(all))
+	content := renderLines(all)
+	if m.printFlip {
+		content += "\x1b[m" // differs, draws the same (see printedMsg)
+	}
+	v := tea.NewView(content)
 	if cursorRow >= 0 {
 		v.Cursor = tea.NewCursor(cursorCol, len(top)+cursorRow)
 		v.Cursor.Shape = tea.CursorBar

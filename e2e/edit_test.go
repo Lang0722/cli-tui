@@ -2,6 +2,9 @@ package e2e
 
 import (
 	"math/rand"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +156,46 @@ func editDraft(t *testing.T, s *term, r *rand.Rand, steps int) {
 		if c := strings.Count(s.all(), "› "+first); c != 1 {
 			t.Errorf("the draft's first line is on screen or in scrollback %d times", c)
 		}
+	}
+}
+
+// Typing in the middle of an earlier line makes the renderer rewrite the
+// rest of the line and move back to the insertion point, often with a
+// back-tab. gnome-terminal's VTE 0.52 (CentOS 7 and 8) ignores a back-tab's
+// count, so "CSI n Z" must never reach the terminal: only single ones.
+func TestTypingMidLineSendsNoCountedBackTab(t *testing.T) {
+	t.Parallel()
+	s := start(t, opts{env: []string{"TERM=xterm-256color"}})
+	s.typ("Please refactor the server so that the handler validates its input before calling the databse layer")
+	s.keys("C-j")
+	s.typ("Also add tests for the new validaton path.")
+	s.keys("C-j")
+	s.typ("Finally update the README.")
+	time.Sleep(200 * time.Millisecond)
+	raw := filepath.Join(t.TempDir(), "out")
+	s.tmux("pipe-pane", "-o", "-t", "0", "cat >> "+raw)
+	s.keys("Up", "Up", "Home")
+	for i := 0; i < 37; i++ {
+		s.keys("Right")
+	}
+	for _, w := range []string{"i", "really ", "x"} {
+		s.typ(w)
+	}
+	s.keys("Down", "End", "BSpace", "Left", "Left", "Left", "Left", "Left", "Left") // Down: the wrapped row
+	s.typ("missing ")
+	time.Sleep(300 * time.Millisecond)
+	s.tmux("pipe-pane", "-t", "0")
+	b, err := os.ReadFile(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := regexp.MustCompile(`\x1b\[([2-9]|[1-9][0-9]+)Z`).Find(b); m != nil {
+		t.Errorf("a back-tab with a count reached the terminal: %q", m)
+	}
+	if !strings.Contains(string(b), "\x1b[Z") {
+		t.Logf("no back-tab was used (the test no longer exercises the rewrite)")
+	}
+	if scr := s.screen(); !strings.Contains(scr, "that thireally xe handler") || !strings.Contains(scr, "databsmissing e laye") {
+		t.Errorf("edits not shown as typed:\n%s", scr)
 	}
 }

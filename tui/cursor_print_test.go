@@ -85,3 +85,21 @@ func drawn(content string) string {
 	}
 	return b.String()
 }
+
+// A back-tab with a count becomes that many single back-tabs (VTE 0.52
+// ignores the count); everything else passes through untouched.
+func TestSplitBackTabs(t *testing.T) {
+	for in, want := range map[string]string{
+		"abc\x1b[9Zdef":           "abc" + strings.Repeat("\x1b[Z", 9) + "def",
+		"\x1b[2Z":                 "\x1b[Z\x1b[Z",
+		"x\x1b[Zy\x1b[1Z":         "x\x1b[Zy\x1b[1Z",
+		"\x1b[12Z\x1b[3A":         strings.Repeat("\x1b[Z", 12) + "\x1b[3A",
+		"\x1b[?25l\x1b[3;4Z\x1b[": "\x1b[?25l\x1b[3;4Z\x1b[",
+		"Zebra \x1b[38;5;2mZ":     "Zebra \x1b[38;5;2mZ",
+		"\x1b[4Z":                 "\x1b[Z\x1b[Z\x1b[Z\x1b[Z",
+	} {
+		if got := string(splitBackTabs([]byte(in))); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}

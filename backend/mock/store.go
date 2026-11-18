@@ -18,6 +18,9 @@ type sessionFile struct {
 	Meta   protocol.SessionSummary `json:"meta"`
 	Tokens int64                   `json:"tokens"`
 	Events protocol.EventList      `json:"events"`
+	// ForkedFrom is the session this one was forked from (/fork).
+	ForkedFrom      string `json:"forked_from,omitempty"`
+	ForkedFromTitle string `json:"forked_from_title,omitempty"`
 }
 
 type store struct{ dir string }

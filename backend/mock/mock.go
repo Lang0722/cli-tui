@@ -126,6 +126,7 @@ func (b *Backend) configured(f *sessionFile) protocol.SessionConfigured {
 		if f.Meta.Cwd != "" {
 			sc.Cwd = f.Meta.Cwd
 		}
+		sc.ForkedFrom, sc.ForkedFromTitle = f.ForkedFrom, f.ForkedFromTitle
 	}
 	return sc
 }
@@ -336,6 +337,10 @@ func (b *Backend) handle(op protocol.Op) {
 		if err := b.setSkillEnabled(op.Path, op.Enabled); err != nil {
 			b.notice(protocol.Error{Message: "Failed to update skill config for " + op.Path + ": " + err.Error()})
 		}
+	case protocol.ChangeDirectory:
+		b.changeDir(op.Cwd)
+	case protocol.ForkSession:
+		b.fork(op.Name)
 	case protocol.SlashCommand:
 		b.slash(op)
 	case protocol.Shutdown:

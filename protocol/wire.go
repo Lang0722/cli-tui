@@ -34,7 +34,7 @@ func init() {
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}
-	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}, ListSkills{}, SetSkillEnabled{}} {
+	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}, ListSkills{}, SetSkillEnabled{}, ChangeDirectory{}, ForkSession{}} {
 		opTypes[o.opType()] = reflect.TypeOf(o)
 	}
 }

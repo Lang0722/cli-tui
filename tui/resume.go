@@ -265,15 +265,21 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 		m.agent = e.AgentName
 	}
 	m.model, m.effort, m.version, m.sessionID = e.Model, e.ReasoningEffort, e.Version, e.SessionID
+	m.forkedFrom, m.sessionReady = sanitizeLine(e.ForkedFrom), true
+	// A /cd or /fork is answered with the session as it continues.
+	defer m.lineageDone()
 	m.permissions, m.approvalMode = sanitizeLine(e.Permissions), sanitizeLine(e.ApprovalMode)
 	if e.Cwd != "" {
+		if e.Cwd != m.cwd {
+			m.files = nil // the @ index belongs to the old directory
+		}
 		m.cwd = e.Cwd
 		m.st.Cwd = e.Cwd
 	}
 	m.tokensUsed = 0
 	m.dropTurnPrompts() // pickers/approvals of the previous session are stale
 	var cmd tea.Cmd
-	if e.Resumed && m.printedAny && !m.stream.active {
+	if (e.Resumed || m.lineage != nil) && m.printedAny && !m.stream.active {
 		// Switching to a resumed session from inside another one: like
 		// Codex (clear_for_thread_switch), clear the screen and scrollback
 		// and replay from the top, so the composer ends up below the
@@ -290,21 +296,27 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 		m.awaitingResume = false
 		m.deferHeader, m.pendingHeader = false, nil
 		m.commit(h)
+		m.commitForkedFrom(e)
 		return cmd
 	}
 	if len(e.InitialMessages) == 0 {
-		if m.deferHeader {
+		if m.deferHeader && m.lineage == nil {
 			m.pendingHeader = &h
 			return cmd
 		}
 		m.commit(h)
+		m.commitForkedFrom(e)
 		return cmd
 	}
 	m.awaitingResume = false
 	m.deferHeader, m.pendingHeader = false, nil
 	m.setPicker(nil)
 	m.commit(h)
+	m.commitForkedFrom(e)
 	m.replay(e.InitialMessages)
+	if m.lineage != nil {
+		return cmd // lineageDone says what changed instead
+	}
 	m.commit(textCell{bullet: S("↻", m.st.Accent), body: L(S("Resumed session ", m.st.Dim), S(e.SessionID, m.st.Plain),
 		S(fmt.Sprintf(" · %d events · continue below", len(e.InitialMessages)), m.st.Dim))})
 	return cmd
@@ -333,6 +345,9 @@ func (m *model) onSessionUpdated(e protocol.SessionUpdated) tea.Cmd {
 	}
 	if a := sanitizeLine(e.ApprovalMode); a != "" {
 		m.approvalMode = a
+	}
+	if m.lineage != nil && m.lineage.kind == lineageCd && e.Cwd != "" {
+		defer m.lineageDone()
 	}
 	if e.Cwd != "" && e.Cwd != m.cwd {
 		m.cwd = e.Cwd

@@ -208,6 +208,12 @@ type model struct {
 	agent, model, effort, cwd, version string
 	sessionID                          string
 	permissions, approvalMode          string
+	forkedFrom                         string // session this one was forked from
+	sessionReady                       bool   // a session_configured arrived
+
+	// /cd or /fork waiting for the backend (lineage.go)
+	lineage    *lineageOp
+	lineageGen int
 
 	// resume
 	picker         *resumePicker
@@ -964,6 +970,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composer.Set(strings.TrimRight(msg.text, "\n"))
 		}
 		return m, nil
+	case lineageTimeoutMsg:
+		m.onLineageTimeout(msg)
+		return m, nil
 	case diffMsg:
 		switch {
 		case msg.err != nil:
@@ -1268,6 +1277,9 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 	case protocol.Error:
 		m.showPendingHeader()
 		m.awaitingResume = false
+		if !m.replaying {
+			m.lineage = nil // the backend refused the /cd or /fork
+		}
 		m.finalizeStream("")
 		m.flushActive(true)
 		m.commit(errorCell(m.st, e.Message))
@@ -1418,7 +1430,7 @@ func (m *model) keyContexts() []string {
 		return []string{"approval", "list", "global"}
 	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.skills.view != nil, m.agents.picker != nil:
 		return []string{"list"}
-	case m.awaitingList || m.awaitingResume:
+	case m.awaitingList || m.awaitingResume, m.forking():
 		return nil
 	}
 	return []string{"global", "chat", "composer", "editor"}
@@ -1512,6 +1524,13 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	}
 	if m.agents.picker != nil {
 		return m.handleAgentPickerKey(k, act)
+	}
+	if m.forking() {
+		// The composer is hidden until the fork exists (its draft is kept).
+		if key == "ctrl+c" || key == "ctrl+d" {
+			return m.quit()
+		}
+		return nil
 	}
 	if m.awaitingList || m.awaitingResume {
 		// The composer is hidden while sessions load; don't let keys
@@ -1993,6 +2012,10 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		m.skillsMenu()
 	case "pwd":
 		m.commit(infoCell(m.st, "Current working directory: "+tildePath(m.cwd)))
+	case "cd":
+		return m.changeDirectory(args)
+	case "fork":
+		return m.forkSession(args)
 	case "statusline":
 		return m.surfaceCommand(surfaceStatus, args)
 	case "title":
@@ -2026,6 +2049,9 @@ func (m *model) statusCell() Cell {
 	}
 	if m.sessionID != "" {
 		lines = append(lines, row("Session:", m.sessionID))
+	}
+	if m.forkedFrom != "" {
+		lines = append(lines, row("Forked from:", m.forkedFrom))
 	}
 	lines = append(lines, row("Tokens used:", fmt.Sprintf("%d", m.tokensUsed)))
 	if m.inputTokens > 0 || m.outputTokens > 0 {
@@ -2194,6 +2220,8 @@ func (m *model) View() tea.View {
 		bottom = append(bottom, m.keymapLines(w, m.height-len(bottom)-2)...)
 	} else if m.awaitingList || m.awaitingResume {
 		bottom = append(bottom, Line{}, L(S("• ", st.Dim)).Append(st.Shimmer("Loading saved sessions")...))
+	} else if m.forking() {
+		bottom = append(bottom, m.lineagePendingLines()...)
 	} else {
 		if m.shortcuts {
 			bottom = append(bottom, m.shortcutLines(w)...)

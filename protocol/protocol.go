@@ -152,6 +152,11 @@ type SessionConfigured struct {
 	// "permissions" and "approval-mode" and in /status.
 	Permissions  string `json:"permissions,omitempty"`
 	ApprovalMode string `json:"approval_mode,omitempty"`
+	// ForkedFrom is the session this one was forked from (ForkSession), and
+	// ForkedFromTitle its name: "Thread forked from <title> (<id>)", and a
+	// "Forked from" row in /status.
+	ForkedFrom      string `json:"forked_from,omitempty"`
+	ForkedFromTitle string `json:"forked_from_title,omitempty"`
 }
 
 // TaskStarted marks the beginning of a turn.

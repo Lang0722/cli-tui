@@ -1,5 +1,7 @@
 # Handover: input-box render glitch in gnome-terminal (CentOS)
 
+`main` also has `38235dd`, which adds `e2e/edit_test.go` (`TestEditEarlierLinesRendersExactly`).
+
 ## Where things stand
 
 - `main` is at `0e5b1f7`, pushed to origin. Related commits:
@@ -13,7 +15,7 @@
 
 ## Open bug
 
-**Symptom (reported by the user):** in gnome-terminal on CentOS, the user types a multi-line draft and uses the arrow keys to go back and fix a typo in an earlier line. The input box then "suddenly shows a lot of text", repeating what was already typed. The text is English; no input method is involved.
+**Symptom (corrected by the user):** in gnome-terminal on CentOS, the user writes a multi-line prompt, goes back up one or two lines, deletes something with Backspace, then types something. After that "the whole chat box behaves weird". The text is English, no input method is involved, and it doesn't happen in Ghostty on macOS.
 
 **Not reproduced** in:
 - macOS Ghostty, by the user;
@@ -23,6 +25,8 @@
   - sizes 110×40, 80×24, 60×15 and 100×12;
   - idle and while a turn streams.
 - A randomized edit stress test found no tag duplicated in scrollback plus screen. It typed lines tagged `Q01Q`, `Q02Q`, … and used ↑/↓/←/→, Home/End, Backspace and Ctrl+J. Its code is below.
+- An exact-content test now lives in `e2e/edit_test.go` as `TestEditEarlierLinesRendersExactly`, with a fixed seed and lines short enough not to wrap. It runs ↑/↓/←/→/Home/End, Backspace (including joining lines) and typing on earlier lines. After every key it checks that the composer rows on screen equal the expected text and that the cursor sits in the expected cell. It passes in tmux. A scratch variant ran 80 steps for each of 6 seeds and also passed; its only failure was the test's own model not handling wrapped lines.
+- Deletes on an earlier line go out as DCH (`CSI n P`) or a rewrite of the line's tail followed by EL. Inserts go out as a tail rewrite, or ICH (`CSI n @`). Erase may use ECH (`CSI n X`). On the tinted input band these rely on BCE: inserted or erased cells get the current background. Check how the CentOS VTE fills cells after DCH, ICH and ECH.
 
 **Working theory:** VTE interprets some sequence differently than tmux does. The inline renderer redraws with relative moves from where it thinks the cursor is. If that guess is one row off, a redraw lands a row off and leaves stale copies of composer rows behind. Ghostty supports synchronized output (2026) and grapheme width (2027), so Bubble Tea takes a sturdier path there. tmux and VTE both get the plain path.
 
@@ -63,7 +67,8 @@
    - `spawn_async(..., ["agenttui", ...], envv=["TERM=xterm-256color", ...])`;
    - send keys with `feed_child(b"text")`. Arrows are `\x1b[A`, `\x1b[B`, `\x1b[C`, `\x1b[D`; Home is `\x1b[H`; End is `\x1b[F`; Ctrl+J is `\n`;
    - after each step, wait about 250 ms on the GLib loop. Then dump `get_text_range(...)` (or `get_text`) and `get_cursor_position()`;
-   - check that no `QnnQ` tag appears twice, and that the cursor sits on the composer row.
+   - check that no `QnnQ` tag appears twice, and that the cursor sits on the composer row;
+   - better still, port the `draft` model and the key loop from `e2e/edit_test.go` and compare VTE's screen with the expected text after every key. The first mismatching step shows which output VTE handles differently: capture the bytes the app wrote for that step.
 4. When the culprit is found, stop sending it to VTE: a Bubble Tea option, or a `VTE_VERSION`-gated workaround in `tui`. Add a regression test that reproduces the bad sequence's effect, if it can be expressed in tmux. Otherwise document it.
 
 ## Stress test used (scratch, not committed)

@@ -3,8 +3,10 @@ package tui
 import (
 	"bytes"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ttyOut is the program's output, adjusted for two bugs of VTE 0.52, the
@@ -22,37 +24,51 @@ import (
 //
 // On VTE before 0.53 (VTE_VERSION < 5300), sequences its table matcher
 // doesn't know are dropped: that matcher prints an unknown sequence as
-// text ("[>4m[<1u") instead of ignoring it. Bubble Tea sends the keyboard
+// text ("[>4m[<1u") instead of ignoring it. And characters it draws one
+// cell wide where the renderer counts two get a space after them (see
+// forOldVTE). Bubble Tea sends the keyboard
 // protocol ones (kitty keyboard, modifyOtherKeys) at startup, around every
 // switch to and from the alternate screen (the transcript pager, the
 // resume picker) and at exit, where they are left in front of the shell
 // prompt. None of them does anything on that terminal.
 //
-// It embeds the *os.File so Bubble Tea still sees a terminal (Fd) for its
-// size, raw mode and color detection.
+// It is a term.File (Fd) so Bubble Tea still sees a terminal for its size,
+// raw mode and color detection. The *os.File is a field, not embedded: an
+// embedded one would lend ttyOut its WriteString and ReadFrom, and
+// io.WriteString (Bubble Tea's scrollback inserts) would skip Write.
 type ttyOut struct {
-	*os.File
-	oldVTE bool
+	f   *os.File
+	vte int // VTE_VERSION, 0 when not VTE
 }
 
 func newTTYOut(f *os.File) ttyOut {
-	return ttyOut{File: f, oldVTE: isOldVTE(os.Getenv("VTE_VERSION"))}
+	return ttyOut{f: f, vte: vteVersion(os.Getenv("VTE_VERSION"))}
 }
 
-// isOldVTE reports whether VTE_VERSION (e.g. "5204" for 0.52.4) names a VTE
-// with the table matcher, which 0.53 replaced with a parser that ignores
-// unknown sequences.
-func isOldVTE(v string) bool {
+func (o ttyOut) Read(p []byte) (int, error) { return o.f.Read(p) }
+func (o ttyOut) Close() error               { return o.f.Close() }
+func (o ttyOut) Fd() uintptr                { return o.f.Fd() }
+
+// vteVersion parses VTE_VERSION (minor*100 + micro: "5204" is 0.52.4, set
+// by every VTE since 0.34; lost over ssh or sudo); 0 if unset.
+func vteVersion(v string) int {
 	n, err := strconv.Atoi(strings.TrimSpace(v))
-	return err == nil && n > 0 && n < 5300
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
+
+// isOldVTE: a VTE with the table matcher, which 0.53 replaced with a
+// parser that ignores unknown sequences.
+func isOldVTE(v int) bool { return v > 0 && v < 5300 }
 
 func (o ttyOut) Write(p []byte) (int, error) {
 	q := splitBackTabs(p)
-	if o.oldVTE {
-		q = dropUnknownToOldVTE(q)
+	if isOldVTE(o.vte) {
+		q = forOldVTE(q, o.vte)
 	}
-	if _, err := o.File.Write(q); err != nil {
+	if _, err := o.f.Write(q); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -90,8 +106,8 @@ func splitBackTabs(p []byte) []byte {
 	return append(out, p[last:]...)
 }
 
-// dropUnknownToOldVTE removes the control sequences VTE 0.52's table
-// (src/caps-list.hh) has no entry for:
+// forOldVTE adapts output for VTE before 0.53. It removes the control
+// sequences VTE 0.52's table (src/caps-list.hh) has no entry for:
 //
 //   - CSI with a "<", "=" or ">" prefix, except "> c" / "= c" (device
 //     attributes): kitty keyboard push/pop/set, modifyOtherKeys;
@@ -100,40 +116,60 @@ func splitBackTabs(p []byte) []byte {
 //   - CSI with an intermediate other than " q", "\"p", "\"q", "!p", "'z",
 //     "'{", "'|" and "*y", e.g. "? 2026 $ p" (DECRQM);
 //   - OSC with a number VTE doesn't know, e.g. 52 (clipboard), 9 (progress);
-//   - DCS, SOS, PM and APC strings (VTE 0.52 has none).
-func dropUnknownToOldVTE(p []byte) []byte {
-	if !bytes.Contains(p, []byte{0x1b}) {
-		return p
-	}
+//   - DCS, SOS, PM and APC strings (VTE 0.52 has none);
+//   - what older tables lack: "CSI n SP q" (cursor shape) before 0.39.1,
+//     OSC 777 (notification) before 0.44.2 and OSC 8 (hyperlinks) before
+//     0.48.2, where a link's URL would be printed next to its text.
+//
+// And it writes a space after each character the renderer counts as two
+// cells and VTE as one (narrowToOldVTE): VTE then advances two cells too,
+// so what follows lands where the renderer put it, and the space goes on
+// the cell the renderer leaves for the character's second half.
+func forOldVTE(p []byte, version int) []byte {
 	var out []byte
 	last := 0
-	for i := 0; i+1 < len(p); i++ {
-		if p[i] != 0x1b {
-			continue
+	cut := func(i, next int, add string) {
+		if out == nil {
+			out = make([]byte, 0, len(p)+16)
 		}
-		var end int
-		var keep bool
-		switch p[i+1] {
-		case '[':
-			end, keep = csiEnd(p, i+2)
-		case ']':
-			end, keep = oscEnd(p, i+2)
-		case 'P', 'X', '^', '_':
-			end, keep = stringEnd(p, i+2), false
-		default:
-			continue
-		}
-		if end < 0 { // unterminated: leave it to the terminal
-			break
-		}
-		if !keep {
-			if out == nil {
-				out = make([]byte, 0, len(p))
+		out = append(out, p[last:i]...)
+		out = append(out, add...)
+		last = next
+	}
+	for i := 0; i < len(p); {
+		c := p[i]
+		if c < 0x80 {
+			if c != 0x1b || i+1 >= len(p) {
+				i++
+				continue
 			}
-			out = append(out, p[last:i]...)
-			last = end
+			var end int
+			var keep bool
+			switch p[i+1] {
+			case '[':
+				end, keep = csiEnd(p, i+2, version)
+			case ']':
+				end, keep = oscEnd(p, i+2, version)
+			case 'P', 'X', '^', '_':
+				end, keep = stringEnd(p, i+2), false
+			default:
+				i += 2
+				continue
+			}
+			if end < 0 { // unterminated: leave it to the terminal
+				break
+			}
+			if !keep {
+				cut(i, end, "")
+			}
+			i = end
+			continue
 		}
-		i = end - 1
+		r, size := utf8.DecodeRune(p[i:])
+		if r >= 0x2630 && narrowOnOldVTE(r) {
+			cut(i+size, i+size, " ")
+		}
+		i += size
 	}
 	if out == nil {
 		return p
@@ -141,9 +177,15 @@ func dropUnknownToOldVTE(p []byte) []byte {
 	return append(out, p[last:]...)
 }
 
+func narrowOnOldVTE(r rune) bool {
+	t := narrowToOldVTE
+	i := sort.Search(len(t), func(i int) bool { return t[i][1] >= r })
+	return i < len(t) && t[i][0] <= r
+}
+
 // csiEnd returns where the CSI whose parameters start at i ends, and
-// whether VTE 0.52 knows it.
-func csiEnd(p []byte, i int) (int, bool) {
+// whether that VTE version knows it.
+func csiEnd(p []byte, i, version int) (int, bool) {
 	prefix := byte(0)
 	if i < len(p) && strings.IndexByte("<=>?", p[i]) >= 0 {
 		prefix = p[i]
@@ -173,7 +215,9 @@ func csiEnd(p []byte, i int) (int, bool) {
 		return end, true
 	default:
 		switch inter + string(final) {
-		case " q", "\"p", "\"q", "!p", "'z", "'{", "'|", "*y":
+		case " q":
+			return end, version >= 3901
+		case "\"p", "\"q", "!p", "'z", "'{", "'|", "*y":
 			return end, true
 		}
 		return end, false
@@ -192,13 +236,21 @@ var oldVTEOSC = map[string]bool{
 }
 
 // oscEnd returns where the OSC whose text starts at i ends (after BEL or
-// ST), and whether VTE 0.52 knows its number.
-func oscEnd(p []byte, i int) (int, bool) {
+// ST), and whether that VTE version knows its number.
+func oscEnd(p []byte, i, version int) (int, bool) {
 	j := i
 	for j < len(p) && p[j] >= '0' && p[j] <= '9' {
 		j++
 	}
-	return stringEnd(p, i), oldVTEOSC[string(p[i:j])]
+	n := string(p[i:j])
+	known := oldVTEOSC[n]
+	switch n {
+	case "8":
+		known = version >= 4802
+	case "777":
+		known = version >= 4402
+	}
+	return stringEnd(p, i), known
 }
 
 // stringEnd returns the index after the BEL or ST that ends the string

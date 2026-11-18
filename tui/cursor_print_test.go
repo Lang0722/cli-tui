@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"bytes"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -106,7 +109,8 @@ func TestSplitBackTabs(t *testing.T) {
 
 // VTE before 0.53 prints sequences its table doesn't know as text: they
 // are dropped there, and everything it knows passes through untouched.
-func TestDropUnknownToOldVTE(t *testing.T) {
+// Characters it draws narrower than the renderer get a space.
+func TestForOldVTE(t *testing.T) {
 	for in, want := range map[string]string{
 		// what Bubble Tea sends at startup, around the alternate screen and at exit
 		"\x1b[>4;2m\x1b[>1u\x1b[?u\x1b[6 q\r\x1b[J":             "\x1b[6 q\r\x1b[J",
@@ -121,13 +125,76 @@ func TestDropUnknownToOldVTE(t *testing.T) {
 		"plain › text": "plain › text",
 		"\x1b[>4":      "\x1b[>4", // unterminated: left alone
 	} {
-		if got := string(dropUnknownToOldVTE([]byte(in))); got != want {
+		if got := string(forOldVTE([]byte(in), 5204)); got != want {
 			t.Errorf("%q:\n got %q\nwant %q", in, got, want)
 		}
 	}
 	for v, old := range map[string]bool{"5204": true, "3803": true, "5202": true, "5300": false, "6402": false, "7800": false, "": false, "x": false} {
-		if isOldVTE(v) != old {
+		if isOldVTE(vteVersion(v)) != old {
 			t.Errorf("isOldVTE(%q) = %v", v, !old)
 		}
+	}
+	// Older tables know fewer sequences.
+	link := "\x1b]8;;https://x\x07Codex\x1b]8;;\x07"
+	for _, c := range []struct {
+		version  int
+		in, want string
+	}{
+		{4601, link, "Codex"},
+		{4802, link, link},
+		{4401, "\a\x1b]777;notify;a;b\x07", "\a"},
+		{4402, "\a\x1b]777;notify;a;b\x07", "\a\x1b]777;notify;a;b\x07"},
+		{3804, "\x1b[6 q\r", "\r"},
+		{4002, "\x1b[6 q\r", "\x1b[6 q\r"},
+	} {
+		if got := string(forOldVTE([]byte(c.in), c.version)); got != c.want {
+			t.Errorf("%d %q: got %q, want %q", c.version, c.in, got, c.want)
+		}
+	}
+}
+
+// Every rune in narrowToOldVTE is two cells to the renderer: the table is
+// only right for the wcwidth it was generated against.
+func TestNarrowToOldVTEIsWideToRenderer(t *testing.T) {
+	for _, r := range narrowToOldVTE {
+		for c := r[0]; c <= r[1]; c++ {
+			if w := ansi.StringWidthWc(string(c)); w != 2 {
+				t.Fatalf("U+%04X: renderer width %d, want 2 (regenerate oldvte_width.go)", c, w)
+			}
+		}
+	}
+	for _, c := range "🟢🧪🧩🥳🫡☰" {
+		if !narrowOnOldVTE(c) {
+			t.Errorf("%c not in narrowToOldVTE", c)
+		}
+	}
+	for _, c := range "✅😀中🔴⚠" {
+		if narrowOnOldVTE(c) {
+			t.Errorf("%c in narrowToOldVTE", c)
+		}
+	}
+}
+
+// Every way Bubble Tea writes goes through the filter: io.WriteString
+// (scrollback inserts) and io.Copy (frames) included.
+func TestTTYOutFiltersEveryWritePath(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := ttyOut{f: f, vte: 4601}
+	var w io.Writer = o
+	if _, ok := w.(io.StringWriter); ok {
+		t.Fatal("ttyOut is an io.StringWriter: io.WriteString would bypass Write")
+	}
+	if _, ok := w.(io.ReaderFrom); ok {
+		t.Fatal("ttyOut is an io.ReaderFrom: io.Copy could bypass Write")
+	}
+	link := "\x1b]8;;https://x\x07Codex\x1b]8;;\x07 \x1b[9Z"
+	_, _ = io.WriteString(o, link)
+	_, _ = io.Copy(o, bytes.NewBufferString(link))
+	got, _ := os.ReadFile(f.Name())
+	if want := strings.Repeat("Codex "+strings.Repeat("\x1b[Z", 9), 2); string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

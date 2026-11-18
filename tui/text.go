@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"charm.land/lipgloss/v2"
@@ -229,12 +230,24 @@ func (l Line) Truncate(width int) Line {
 	return out
 }
 
+// strw is the display width of s, measured the way the renderer measures
+// the cells it draws, so layout (wrapping, padding, the composer's cursor)
+// matches what reaches the screen.
 func strw(s string) int {
 	if printableASCII(s) {
 		return len(s)
 	}
-	return ansi.StringWidth(s)
+	if graphemeWidths.Load() {
+		return ansi.StringWidth(s)
+	}
+	return ansi.StringWidthWc(s)
 }
+
+// graphemeWidths: the terminal reported grapheme cluster support (mode
+// 2027), so Bubble Tea's renderer switched from wcwidth (the sum of the
+// codepoints: "⚠️" 1 cell, "👍🏽" 4, a ZWJ family 6, as terminals without
+// the mode draw them) to one width per grapheme cluster.
+var graphemeWidths atomic.Bool
 
 // printableASCII reports whether s is only ' '..'~': one cell per byte,
 // so widths need no grapheme segmentation (the common case, and uniseg

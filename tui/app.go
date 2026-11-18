@@ -25,6 +25,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
+	"github.com/charmbracelet/x/ansi"
 
 	"agenttui/config"
 	"agenttui/protocol"
@@ -88,7 +89,14 @@ func Run(ctx context.Context, opts Options) error {
 	if testHookModel != nil {
 		testHookModel(m)
 	}
-	p := tea.NewProgram(m, tea.WithContext(ctx), tea.WithOutput(newTTYOut(os.Stdout)))
+	out := newTTYOut(os.Stdout)
+	popts := []tea.ProgramOption{tea.WithContext(ctx), tea.WithOutput(out)}
+	if out.vte > 0 && out.vte < 3600 && colorprofile.Detect(os.Stdout, os.Environ()) == colorprofile.TrueColor {
+		// VTE 0.34 has no 24-bit color: it reads "38;2;r;g;b" as
+		// 38;2 and then r, g and b as attributes (bold, reverse, ...).
+		popts = append(popts, tea.WithColorProfile(colorprofile.ANSI256))
+	}
+	p := tea.NewProgram(m, popts...)
 	m.send = p.Send
 	// Each insert hides the cursor: Bubble Tea writes it with the cursor at
 	// the top of the live frame, and the frame drawn for printedMsg moves
@@ -881,6 +889,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyboardEnhancementsMsg:
 		m.kittyKeys = msg.SupportsKeyDisambiguation()
+		return m, nil
+	case tea.ModeReportMsg:
+		// The condition under which Bubble Tea's renderer switches to
+		// grapheme widths (see strw).
+		if msg.Mode == ansi.ModeUnicodeCore && (msg.Value == ansi.ModeSet || msg.Value == ansi.ModeReset || msg.Value == ansi.ModePermanentlySet) {
+			graphemeWidths.Store(true)
+		}
 		return m, nil
 	case imageMsg:
 		if msg.err != nil {

@@ -12,7 +12,8 @@ package protocol
 // has already resolved it (~, relative paths) to an absolute path and
 // checked that it is a directory it can access.
 type ChangeDirectory struct {
-	Cwd string `json:"cwd"`
+	Cwd       string `json:"cwd"`
+	SessionID string `json:"session_id,omitempty"` // see sessions_live.go
 }
 
 // ForkSession asks for a new session that starts with a copy of the
@@ -20,7 +21,8 @@ type ChangeDirectory struct {
 // SessionConfigured that answers carries the new SessionID and, in
 // ForkedFrom (and ForkedFromTitle), the session it was copied from.
 type ForkSession struct {
-	Name string `json:"name,omitempty"`
+	Name      string `json:"name,omitempty"`
+	SessionID string `json:"session_id,omitempty"` // the session to copy
 }
 
 func (ChangeDirectory) opType() string { return "change_directory" }

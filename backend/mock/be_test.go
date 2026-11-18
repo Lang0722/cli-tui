@@ -52,7 +52,7 @@ func TestBeRewindStaleMeta(t *testing.T) {
 		}
 	}
 	b.mu.Lock()
-	title, tokens, id := b.cur.Meta.Title, b.cur.Tokens, b.cur.Meta.ID
+	title, tokens, id := b.attached.f.Meta.Title, b.attached.f.Tokens, b.attached.f.Meta.ID
 	b.mu.Unlock()
 	t.Logf("after rewind to 0 + 'hi': title=%q tokens=%d last token_count=%d", title, tokens, tc.TotalTokens)
 	if title != "hi" {
@@ -79,14 +79,14 @@ func TestBeShellAcrossNew(t *testing.T) {
 	b.Submit(bg, protocol.UserInput{Text: "hi"})
 	collect(b, endOfTurn, 5*time.Second)
 	b.mu.Lock()
-	oldID := b.cur.Meta.ID
+	oldID := b.attached.f.Meta.ID
 	b.mu.Unlock()
 	b.Submit(bg, protocol.ShellCommand{Command: "sleep 0.5; echo done"})
 	time.Sleep(100 * time.Millisecond)
 	b.Submit(bg, protocol.SlashCommand{Name: "new"})
 	collect(b, func(m protocol.EventMsg) bool { _, ok := m.(protocol.ExecCommandEnd); return ok }, 3*time.Second)
 	b.mu.Lock()
-	newSess := b.cur
+	newSess := b.attached.f
 	b.mu.Unlock()
 	old, _ := b.store.load(oldID)
 	var oldTypes, newTypes []string

@@ -13,14 +13,14 @@ import (
 // turn is one running request, bound to the session it started in.
 type turn struct {
 	b      *Backend
-	sess   *sessionFile
+	l      *live
 	ctx    context.Context
 	done   chan struct{}
 	images []string
 	skills []protocol.SkillRef // skills mentioned in the prompt
 }
 
-func (t *turn) emit(m protocol.EventMsg) { t.b.emitIn(t.sess, m) }
+func (t *turn) emit(m protocol.EventMsg) { t.b.send(t.l, "", m) }
 
 func (t *turn) sleep(d time.Duration) bool { return sleep(t.ctx, d) }
 
@@ -67,7 +67,7 @@ func (t *turn) exec(id string, cmd []string, out string, code int) bool {
 }
 
 func (t *turn) addTokens(n int64) {
-	total := t.b.tokens(t.sess) + n
+	total := t.b.tokens(t.l) + n
 	t.emit(protocol.TokenCount{InputTokens: total - n/10, OutputTokens: n / 10, TotalTokens: total, ContextWindow: contextWindow})
 }
 
@@ -106,19 +106,21 @@ func (t *turn) run(text string) {
 	default:
 		ok = t.chat(text)
 	}
-	// Mark the backend idle *before* the final event, so input the UI sends
-	// in response to it (e.g. a queued message) is accepted.
-	t.b.mu.Lock()
-	if t.b.active == t {
-		t.b.active, t.b.cancel = nil, nil
-	}
-	t.b.mu.Unlock()
+	// The final event goes out while the turn still owns the session, so
+	// no new turn's TaskStarted can overtake it. Input the UI sends in
+	// response to it (e.g. a queued message) is queued meanwhile and
+	// started just below.
 	if !ok {
 		t.emit(protocol.TurnAborted{Reason: "interrupted"})
 	} else {
 		t.emit(protocol.TaskComplete{})
 	}
-	t.b.startPending()
+	t.b.mu.Lock()
+	if t.l.active == t {
+		t.l.active, t.l.cancel = nil, nil
+	}
+	t.b.mu.Unlock()
+	t.b.startPending(t.l)
 }
 
 func containsAny(s string, words ...string) bool {
@@ -156,7 +158,7 @@ func (t *turn) greet() bool {
 	if !t.stream("**Saying hello**", true) || !t.sleep(300*time.Millisecond) {
 		return false
 	}
-	n := t.b.history(t.sess)
+	n := t.b.history(t.l)
 	intro := "Hi! I'm the **mock agent** that ships with agenttui. Nothing here calls a model."
 	if n > 1 {
 		intro = fmt.Sprintf("Hi again! We're in a resumed session with %d earlier messages.", n-1)
@@ -211,7 +213,7 @@ func (t *turn) chat(text string) bool {
 		topic = string([]rune(topic)[:59]) + "…"
 	}
 	reply := fmt.Sprintf(chatReplies[int(t.b.turn.Load())%len(chatReplies)], topic)
-	if n := t.b.history(t.sess); n > 1 {
+	if n := t.b.history(t.l); n > 1 {
 		reply += fmt.Sprintf("\n\n_(%d earlier messages in this session.)_", n-1)
 	}
 	if len(t.images) > 0 {
@@ -270,8 +272,7 @@ func (t *turn) toolDemo(text string) bool {
 		"internal/server.go":      {Kind: protocol.ChangeUpdate, UnifiedDiff: "@@ -40,5 +40,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {\n \tctx := r.Context()\n-\t// TODO: handle timeouts\n-\tresp, err := s.backend.Do(ctx, r)\n+\tctx, cancel := context.WithTimeout(ctx, s.timeout)\n+\tdefer cancel()\n+\tresp, err := s.backend.Do(ctx, r)\n \tif err != nil {\n \t\treturn\n"},
 		"internal/server_test.go": {Kind: protocol.ChangeAdd, Content: "package internal\n\nimport \"testing\"\n\nfunc TestTimeout(t *testing.T) {\n\tt.Parallel()\n}\n"},
 	}
-	t.emit(protocol.ApplyPatchApprovalRequest{CallID: "p1", Changes: changes, Reason: "Add request timeout and a regression test"})
-	d, ok := t.b.waitApproval(t.ctx, "p1")
+	d, ok := t.b.approve(t.ctx, t.l, "", "p1", protocol.ApplyPatchApprovalRequest{CallID: "p1", Changes: changes, Reason: "Add request timeout and a regression test"})
 	if !ok || d == protocol.DecisionAbort {
 		return false
 	}
@@ -286,8 +287,7 @@ func (t *turn) toolDemo(text string) bool {
 	t.emit(protocol.PatchApplyEnd{CallID: "p1", Success: true})
 
 	testCmd := []string{"bash", "-lc", "go test ./..."}
-	t.emit(protocol.ExecApprovalRequest{CallID: "c5", Command: testCmd, Reason: "Run the test suite to verify the change", ProposedPrefix: []string{"go", "test"}})
-	d, ok = t.b.waitApproval(t.ctx, "c5")
+	d, ok = t.b.approve(t.ctx, t.l, "", "c5", protocol.ExecApprovalRequest{CallID: "c5", Command: testCmd, Reason: "Run the test suite to verify the change", ProposedPrefix: []string{"go", "test"}})
 	if !ok || d == protocol.DecisionAbort {
 		return false
 	}
@@ -400,7 +400,7 @@ func (t *turn) question() bool {
 	if !t.stream("**Clarifying the request**", true) || !t.sleep(300*time.Millisecond) {
 		return false
 	}
-	r, ok := t.b.ask(t.ctx, protocol.SelectionRequest{
+	r, ok := t.b.ask(t.ctx, t.l, protocol.SelectionRequest{
 		Title:         "Which approach should I take?",
 		Subtitle:      "The mock asks a question mid-turn; the answer comes back as a selection_response.",
 		Items:         []protocol.SelectionItem{{Name: "Minimal fix", Description: "smallest change that works"}, {Name: "Refactor", Description: "clean up while fixing"}, {Name: "Explain only", Description: "no code changes"}},

@@ -159,7 +159,8 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 
 `user_input`, `interrupt`, `shell_command`, the approvals and
 `selection_response` carry `thread_id` when they are for a subagent thread
-(see [Subagents](#subagents)).
+(see [Subagents](#subagents)). Session-scoped ops also carry `session_id`
+(see [Concurrent sessions](#concurrent-sessions)).
 
 ### Events (backend → UI)
 
@@ -188,9 +189,53 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `hooks_list{hooks:[{key,event,matcher?,source?,source_path?,plugin_id?,handler?,command?,async?,timeout_sec?,context_limit?,status_message?,enabled,trust}],warnings?,errors?}` | the `/hooks` browser. `event` is a Codex hook event (`PreToolUse`, `Stop`, …); `trust` is `managed`, `trusted`, `untrusted` or `modified` (the last two need review before they run). |
 | `hook_started{run_id,event,status_message}` / `hook_completed{run_id,status,output:[{kind,text}]}` | a hook run: after 300 ms its message joins the status row (`· checking command policy`). A completed run whose output is only `context` leaves nothing; others print `• Blocked by hook` / `• Hook failed` / `• Hook stopped` with `  └ ` output lines, or `↳ Hook · warning`. `status` is `completed`, `failed`, `blocked` or `stopped`; `kind` is `warning`, `stop`, `feedback`, `context` or `error`. |
 | `task_list{tasks:[{id,title?,preview?,cwd?,status?,updated_at,unread?,model?,reasoning_effort?}],has_more?}` | the agent command center, newest first. `status` is `needs_input`, `error`, `working`, `ready` or `inactive` (the default); `preview` is the first prompt (shown when there is no `title`). The conversation on screen shows its live state whatever the backend says. |
+| `task_updated{task}` | one task's row changed (same fields as in `task_list`); sent unasked. Updates the command center in place and the footer's `N background tasks need input`; a task that starts waiting while in the background also sends a desktop notification. |
 | `token_count` | `N% context left` (or `NK used`) |
 | `error` / `warning` / `background_event` | `■` red, `⚠`, dim `•` |
 | `stream_error` | a transient detail line under the status row |
+
+### Concurrent sessions
+
+A backend may run several sessions at once, as Codex keeps a task running
+when the command center switches to another. The UI shows one session at
+a time, the *attached* one: the session of the last `session_configured`.
+Everything here is optional; a backend that runs one conversation at a
+time can ignore it. The full rules are in `protocol/sessions_live.go`.
+
+- **Envelope.** Events may carry `session_id` next to `id` and
+  `thread_id`. The UI drops events of any other session than the attached
+  one, so a backend may broadcast. Events about the backend itself
+  (`session_list`, `task_list`, `task_updated`, `slash_commands`,
+  `skills_list`, `hooks_list`, `shutdown_complete`) are never dropped, and
+  `session_configured` always attaches.
+- **Switching does not stop a session.** The command center sends
+  `resume_session` (Enter) or `slash_command{name:"new"}` (`n`) while a turn
+  runs; that turn, its approvals and its subagents go on in the background.
+- **Catch-up.** Answer the attach with `session_configured`
+  (`initial_messages` = the history up to the running turn's user message)
+  followed by live events that rebuild what a watcher would see now:
+  `task_started`, the turn's events so far (deltas may be merged, finished
+  calls sent as begin + end), every request still waiting for an answer,
+  and each open subagent's `thread_started` and events. After that, send
+  each later event of the session exactly once. The mock does this by
+  recording and sending under the lock that attaching takes.
+- **Ops name their session.** `user_input`, `shell_command`, `interrupt`,
+  the approvals, `selection_response`, `rewind`, `slash_command`,
+  `change_directory` and `fork_session` carry `session_id`: the session the
+  UI was showing. Apply them to that session even if another is attached
+  by now (the user answered, then switched). When the user switches away
+  from a busy session, the messages queued behind its turn are sent to it
+  this way, and run there. `interrupt{session_id}` is the command center's
+  stop key.
+- **Status.** Send `task_updated` when a background turn starts, finishes
+  or starts waiting for the user; set `unread` for a task that finished or
+  started waiting while it was not attached (attaching clears it).
+
+```
+stdout → {"id":"7","session_id":"s1","msg":{"type":"exec_approval_request","call_id":"c5","command":["go","test"]}}
+stdout → {"msg":{"type":"task_updated","task":{"id":"s1","status":"needs_input","unread":true,"updated_at":"…"}}}
+stdin  ← {"type":"exec_approval","call_id":"c5","decision":"approved","session_id":"s1"}
+```
 
 ## Keys
 
@@ -277,9 +322,19 @@ project and prompt.
 
 ↑/↓ (or j/k) move, PgUp/PgDn page, Enter or → opens a task (resumes it;
 the current one just returns to the chat), Esc goes back, `n` starts a new
-task, `g` cycles the grouping (Project, Directory, Status, Model), `?`
-lists the shortcuts and "Show more" loads ten more tasks. Codex' search,
-rename, fork, stop, archive, hide, delete and pins are not ported yet.
+task, `x` stops a working or waiting task, `g` cycles the grouping
+(Project, Directory, Status, Model), `?` lists the shortcuts and "Show
+more" loads ten more tasks. Codex' search, rename, fork, archive, hide,
+delete and pins are not ported yet.
+
+Opening another task (or `n`) while a turn runs does not stop it: like
+Codex, the task goes on in the background, the messages queued behind it
+are sent to it, and its row updates live (Working, Needs input, then Ready
+with the unread dot). When a background task waits on an approval or a
+question, the footer says `1 background task needs input · ← to view`;
+opening it shows the request again. Coming back to a task that is still
+running replays its history and picks the turn up where it is (see
+[Concurrent sessions](#concurrent-sessions)).
 
 ## Subagents
 
@@ -507,7 +562,8 @@ snapshots.
 - **Terminal and session:** title, notifications, resume, `/copy`,
   `/export`, `/clear`, `/cd`, `/fork`.
 - **Agent command center:** ← / `/agents`, status tabs, grouping, details
-  pane, "Show more" (search, rename and task actions not yet).
+  pane, "Show more", tasks that keep running in the background, `x` stop
+  (search, rename and the other task actions not yet).
 - **Hooks:** the `/hooks` browser (enable, trust, details) and hook run
   rows and cells.
 - **Subagents:** collab and activity rows, per-thread transcripts,
@@ -567,6 +623,9 @@ go test ./...
   - the Ctrl+T pager and find, Esc Esc rewind and `@` file mentions;
   - resume (picker and `-last`), resize reflow and subagents;
   - the agent command center (←, Esc back, Enter resumes);
+  - background tasks: a turn that goes on while another task is open (back
+    after it finished and mid-turn, each message shown once), an approval
+    that waits in the background, and `x` stop;
   - skills: the `$` popup, mentions and Enable/Disable Skills;
   - layout: the composer stays on the last row after turns, approvals,
     `/resume` inside a session and closing `/keymap`;

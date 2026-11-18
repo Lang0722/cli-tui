@@ -96,7 +96,7 @@ func (f *fuzzer) event() (protocol.Event, string) {
 	}
 	cmd := []string{"bash", "-lc", f.pick([]string{"ls -la", "go test ./...", "cat README.md", "rg foo", "echo " + f.pick(fuzzTexts)})}
 	var e protocol.EventMsg
-	switch r.Intn(34) {
+	switch r.Intn(35) {
 	case 0:
 		e = protocol.SessionConfigured{Model: f.pick([]string{"gpt-5", "o3", ""}), Cwd: "/home/u/p", SessionID: f.id("s"), Resumed: r.Intn(4) == 0,
 			InitialMessages: []protocol.EventMsg{protocol.UserMessage{Message: "earlier"}, protocol.AgentMessage{Message: f.pick(fuzzMarkdown)}}}
@@ -200,10 +200,25 @@ func (f *fuzzer) event() (protocol.Event, string) {
 			e = protocol.CollabToolCall{CallID: f.id("k"), Tool: protocol.CollabSpawnAgent, Status: protocol.CollabStatus(f.pick([]string{"in_progress", "completed", "failed"})),
 				ReceiverThreadIDs: []string{f.id("t")}, Prompt: f.pick(fuzzTexts)}
 		}
+	case 33:
+		e = protocol.TaskUpdated{Task: protocol.TaskSummary{ID: f.id("s"), Title: f.pick(fuzzTexts),
+			Status: f.pick([]string{protocol.TaskNeedsInput, protocol.TaskWorking, protocol.TaskReady, protocol.TaskError, ""}), Unread: r.Intn(2) == 0}}
 	default:
 		e = protocol.UserMessage{Message: f.pick(fuzzTexts)}
 	}
-	return protocol.Event{Thread: thread, Msg: e}, fmt.Sprintf("event %T thread=%q", e, thread)
+	// Concurrent sessions: most events are the attached session's (or
+	// untagged); some belong to another one and must leave no trace.
+	session := ""
+	switch r.Intn(6) {
+	case 0:
+		session = f.id("s")
+	case 1:
+		session = f.m.sessionID
+	}
+	if sc, ok := e.(protocol.SessionConfigured); ok {
+		session = sc.SessionID
+	}
+	return protocol.Event{Session: session, Thread: thread, Msg: e}, fmt.Sprintf("event %T session=%q thread=%q", e, session, thread)
 }
 
 func (f *fuzzer) step() (tea.Msg, string) {

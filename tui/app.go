@@ -215,8 +215,10 @@ type model struct {
 	forkedFrom                         string // session this one was forked from
 	sessionReady                       bool   // a session_configured arrived
 
-	// the agent command center (center.go)
+	// the agent command center (center.go) and the other sessions'
+	// last known rows (sessions.go)
 	center *agentCenter
+	tasks  map[string]protocol.TaskSummary
 
 	// /hooks (hooks.go)
 	hooksView   *hooksBrowser
@@ -530,6 +532,9 @@ func deltaText(m protocol.EventMsg) string {
 }
 
 func (m *model) submit(op protocol.Op) {
+	// Name the session on screen: the op may reach the backend after the
+	// user switched to another one (sessions.go).
+	op = protocol.ForSession(op, m.sessionID)
 	if err := m.opts.Backend.Submit(m.ctx, op); err != nil {
 		m.commit(errorCell(m.st, "failed to send to backend: "+err.Error()))
 	}
@@ -1111,6 +1116,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) backendEvent(ev protocol.Event) tea.Cmd {
+	if m.ofOtherSession(ev) {
+		return nil // a session in the background (sessions.go)
+	}
 	cmd := m.routeEvent(ev)
 	if m.pendingReflow != reflowNone && !m.stream.active {
 		mode := m.pendingReflow
@@ -1200,7 +1208,10 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 	case protocol.HooksList:
 		m.onHooksList(e)
 	case protocol.TaskList:
+		m.noteTaskList(e)
 		m.onTaskList(e)
+	case protocol.TaskUpdated:
+		return m.onTaskUpdated(e.Task)
 	case protocol.HookStarted:
 		if !m.replaying { // a replayed start has nothing left to wait for
 			m.onHookStarted(e)
@@ -2607,6 +2618,12 @@ func (m *model) footerLine(w int, showContext bool) Line {
 	case showContext && m.footerAgentLabel() != "" && (m.composer.Empty() || !m.running):
 		// Codex shows the watched agent where the hint would be.
 		left = L(P("  "), d(m.footerAgentLabel()))
+	case m.composer.Empty() && m.backgroundNeeds() > 0:
+		// Another session waits on an approval or a question.
+		left = L(P("  "), S(backgroundNeedsLabel(m.backgroundNeeds()), st.Yellow))
+		if m.centerAvailable() {
+			left = append(left, d(" · "), k("←"), d(" to view"))
+		}
 	case m.composer.Empty():
 		left = L(P("  "))
 		if m.centerAvailable() {

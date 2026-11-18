@@ -37,20 +37,26 @@ type UserInput struct {
 	// Skills are the enabled skills mentioned as "$name" in Text (see
 	// skills.go), so the backend can load them for this turn.
 	Skills []SkillRef `json:"skills,omitempty"`
+	// SessionID is the session the input is for (see sessions_live.go);
+	// "" means the attached one.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // ShellCommand is a command the user typed in "!" shell mode. The backend
 // runs it and reports it with ExecCommandBegin/End carrying
 // Source: "user_shell" (rendered as "You ran").
 type ShellCommand struct {
-	Command  string `json:"command"`
-	ThreadID string `json:"thread_id,omitempty"` // the watched thread
+	Command   string `json:"command"`
+	ThreadID  string `json:"thread_id,omitempty"`  // the watched thread
+	SessionID string `json:"session_id,omitempty"` // see sessions_live.go
 }
 
 // Interrupt asks the backend to abort the running turn. The backend should
-// answer with TurnAborted.
+// answer with TurnAborted. The agent command center stops a task that runs
+// in the background with an Interrupt naming its SessionID.
 type Interrupt struct {
-	ThreadID string `json:"thread_id,omitempty"` // the watched thread
+	ThreadID  string `json:"thread_id,omitempty"`  // the watched thread
+	SessionID string `json:"session_id,omitempty"` // see sessions_live.go
 }
 
 // ExecApproval answers an ExecApprovalRequest.
@@ -60,14 +66,16 @@ type ExecApproval struct {
 	ThreadID string         `json:"thread_id,omitempty"` // thread that asked
 	// Prefix is the request's ProposedPrefix, echoed back with
 	// DecisionApprovedForPrefix.
-	Prefix []string `json:"prefix,omitempty"`
+	Prefix    []string `json:"prefix,omitempty"`
+	SessionID string   `json:"session_id,omitempty"` // session that asked
 }
 
 // PatchApproval answers an ApplyPatchApprovalRequest.
 type PatchApproval struct {
-	CallID   string         `json:"call_id"`
-	Decision ReviewDecision `json:"decision"`
-	ThreadID string         `json:"thread_id,omitempty"` // thread that asked
+	CallID    string         `json:"call_id"`
+	Decision  ReviewDecision `json:"decision"`
+	ThreadID  string         `json:"thread_id,omitempty"`  // thread that asked
+	SessionID string         `json:"session_id,omitempty"` // session that asked
 }
 
 // SlashCommand is forwarded for slash commands the TUI does not handle
@@ -75,6 +83,8 @@ type PatchApproval struct {
 type SlashCommand struct {
 	Name string `json:"name"`
 	Args string `json:"args"`
+	// SessionID is the session the command was typed in.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // Shutdown is sent when the UI exits.
@@ -115,6 +125,10 @@ const (
 // submission and is informational only.
 type Event struct {
 	ID string
+	// Session is the session this event belongs to (envelope "session_id",
+	// see sessions_live.go); "" means the attached one, or that the event
+	// is about the backend rather than a conversation.
+	Session string
 	// Thread is the subagent thread this event belongs to; "" is the main
 	// conversation (see agents.go).
 	Thread string

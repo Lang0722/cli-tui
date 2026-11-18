@@ -25,7 +25,7 @@ func TestBeSteerDesyncsRewind(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	b.mu.Lock()
 	var users []string
-	for _, e := range b.cur.Events {
+	for _, e := range b.attached.f.Events {
 		if u, ok := e.(protocol.UserMessage); ok {
 			users = append(users, u.Message)
 		}
@@ -64,7 +64,7 @@ func TestBeShellHugeOutput(t *testing.T) {
 	evs := collect(b, func(m protocol.EventMsg) bool { _, ok := m.(protocol.ExecCommandEnd); return ok }, 30*time.Second)
 	end := evs[len(evs)-1].(protocol.ExecCommandEnd)
 	b.mu.Lock()
-	id := b.cur.Meta.ID
+	id := b.attached.f.Meta.ID
 	b.mu.Unlock()
 	st, _ := os.Stat(b.store.path(id))
 	t.Logf("single event carries %d bytes of output; session file is %d bytes", len(end.AggregatedOutput), st.Size())

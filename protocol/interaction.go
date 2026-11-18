@@ -30,6 +30,8 @@ type SelectionResponse struct {
 	Text  string `json:"text,omitempty"`
 	// ThreadID is the thread that asked ("" = main).
 	ThreadID string `json:"thread_id,omitempty"`
+	// SessionID is the session that asked (see sessions_live.go).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // Rewind is sent by Esc Esc backtracking (Codex "edit previous message"):
@@ -38,7 +40,8 @@ type SelectionResponse struct {
 // The UI restores that prompt into the composer for editing. Files on disk
 // are not reverted.
 type Rewind struct {
-	UserMessageIndex int `json:"user_message_index"`
+	UserMessageIndex int    `json:"user_message_index"`
+	SessionID        string `json:"session_id,omitempty"` // see sessions_live.go
 }
 
 func (SelectionRequest) eventType() string { return "selection_request" }

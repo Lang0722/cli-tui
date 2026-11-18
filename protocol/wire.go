@@ -30,7 +30,7 @@ func init() {
 		PatchApplyBegin{}, PatchApplyEnd{}, ToolCallBegin{}, ToolCallEnd{},
 		PlanUpdate{}, TokenCount{}, BackgroundEvent{}, Warning{}, Error{},
 		StreamError{}, ShutdownComplete{}, SessionList{}, SessionTitle{}, UserMessage{}, SelectionRequest{},
-		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{}, SkillsList{}, HooksList{}, HookStarted{}, HookCompleted{}, TaskList{},
+		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{}, SkillsList{}, HooksList{}, HookStarted{}, HookCompleted{}, TaskList{}, TaskUpdated{},
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}
@@ -236,18 +236,20 @@ func MarshalEvent(e Event) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(struct {
-		ID     string          `json:"id,omitempty"`
-		Thread string          `json:"thread_id,omitempty"`
-		Msg    json.RawMessage `json:"msg"`
-	}{e.ID, e.Thread, msg})
+		ID      string          `json:"id,omitempty"`
+		Session string          `json:"session_id,omitempty"`
+		Thread  string          `json:"thread_id,omitempty"`
+		Msg     json.RawMessage `json:"msg"`
+	}{e.ID, e.Session, e.Thread, msg})
 }
 
 // UnmarshalEvent decodes a JSON line into an Event.
 func UnmarshalEvent(data []byte) (Event, error) {
 	var env struct {
-		ID     json.RawMessage `json:"id"`
-		Thread json.RawMessage `json:"thread_id"`
-		Msg    json.RawMessage `json:"msg"`
+		ID      json.RawMessage `json:"id"`
+		Session json.RawMessage `json:"session_id"`
+		Thread  json.RawMessage `json:"thread_id"`
+		Msg     json.RawMessage `json:"msg"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil {
 		return Event{}, err
@@ -259,7 +261,7 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	return Event{ID: rawID(env.ID), Thread: rawID(env.Thread), Msg: v.(EventMsg)}, nil
+	return Event{ID: rawID(env.ID), Session: rawID(env.Session), Thread: rawID(env.Thread), Msg: v.(EventMsg)}, nil
 }
 
 // MarshalOp encodes an Op as a single JSON line (without newline).

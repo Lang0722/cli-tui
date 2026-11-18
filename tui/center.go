@@ -299,6 +299,7 @@ const (
 	centerClose
 	centerOpen
 	centerNew
+	centerStop
 	centerMore
 	centerQuit
 )
@@ -330,6 +331,11 @@ func (c *agentCenter) handleKey(k tea.KeyPressMsg, act string) centerAction {
 		return centerNone
 	case "n":
 		return centerNew
+	case "x":
+		if _, ok := c.selectedRow(); ok {
+			return centerStop
+		}
+		return centerNone
 	case "ctrl+c", "ctrl+d":
 		return centerQuit
 	}
@@ -552,6 +558,9 @@ func (c *agentCenter) footerHints(keys *keymap, st *Styles) Line {
 	add(strings.Join(nav, "/"), "move")
 	add(keys.primary("list.accept"), "open")
 	add("n", "new")
+	if r, ok := c.selectedRow(); ok && (r.Status == protocol.TaskWorking || r.Status == protocol.TaskNeedsInput) {
+		add("x", "stop")
+	}
 	return l
 }
 
@@ -560,7 +569,7 @@ func (c *agentCenter) helpLines(width int, keys *keymap, st *Styles) []Line {
 		{"Navigate", [][2]string{{keys.primary("list.move_up"), "Up"}, {keys.primary("list.move_down"), "Down"},
 			{keys.primary("list.accept"), "Open"}, {keys.primary("list.page_up"), "Page up"},
 			{keys.primary("list.page_down"), "Page down"}, {"⌃c", "Quit"}}},
-		{"Tasks", [][2]string{{"n", "New"}}},
+		{"Tasks", [][2]string{{"n", "New"}, {"x", "Stop"}}},
 		{"View", [][2]string{{"tab/⇧tab", "Filter"}, {"g", "Group"}}},
 	}
 	out := []Line{L(S("Task shortcuts", st.Bold)), {}}
@@ -996,6 +1005,7 @@ func (c *convo) firstPrompt() string {
 
 func (m *model) handleCenterKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	c := m.center
+	c.refreshCurrent(m) // act on the rows as they are now (x on a running task)
 	switch c.handleKey(k, act) {
 	case centerQuit:
 		return m.quit()
@@ -1005,20 +1015,29 @@ func (m *model) handleCenterKey(k tea.KeyPressMsg, act string) tea.Cmd {
 		c.limit += centerPage
 		return m.requestTasks()
 	case centerNew:
-		if m.mainConvo().running {
-			c.notice = "'/new' is disabled while a task is in progress."
+		if m.lineage != nil {
+			c.notice = "Wait for the current /cd or /fork to finish."
 			return nil
 		}
 		m.closeCenter()
+		if m.live() {
+			// The task on screen keeps running in the background
+			// (sessions.go); the screen is cleared for the new one.
+			m.submit(protocol.SlashCommand{Name: "new"})
+			return nil
+		}
 		return m.runCommand("new", "")
+	case centerStop:
+		r, _ := c.selectedRow()
+		c.notice = m.stopTask(r)
 	case centerOpen:
 		r, _ := c.selectedRow()
 		if r.current {
 			m.closeCenter()
 			return nil
 		}
-		if m.mainConvo().running || len(m.approvals) > 0 || m.lineage != nil {
-			c.notice = "Finish or interrupt the current task before opening another."
+		if m.lineage != nil {
+			c.notice = "Wait for the current /cd or /fork to finish."
 			return nil
 		}
 		m.closeCenter()

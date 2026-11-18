@@ -266,6 +266,14 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 	if a := sanitizeLine(e.AgentName); a != "" {
 		m.agent = a
 	}
+	// Another session (or this one sent again from the top): the turn on
+	// screen belongs to the one being left and goes on without us. Its
+	// catch-up follows this event if we come back (sessions.go).
+	switched := m.sessionID != "" && e.SessionID != "" && e.SessionID != m.sessionID
+	wasLive := m.live()
+	if switched || e.Resumed {
+		m.dropLive()
+	}
 	m.model, m.effort, m.version, m.sessionID = sanitizeLine(e.Model), sanitizeLine(e.ReasoningEffort), sanitizeLine(e.Version), e.SessionID
 	m.forkedFrom, m.sessionReady = sanitizeLine(e.ForkedFrom), true
 	m.hookRuns = nil
@@ -282,7 +290,7 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 	m.tokensUsed = 0
 	m.dropTurnPrompts() // pickers/approvals of the previous session are stale
 	var cmd tea.Cmd
-	if (e.Resumed || m.lineage != nil) && m.printedAny && !m.stream.active {
+	if (e.Resumed || m.lineage != nil || switched && wasLive) && m.printedAny {
 		// Switching to a resumed session from inside another one: like
 		// Codex (clear_for_thread_switch), clear the screen and scrollback
 		// and replay from the top, so the composer ends up below the

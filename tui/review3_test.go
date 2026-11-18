@@ -252,8 +252,9 @@ func TestCenterUsesTheMainSession(t *testing.T) {
 	}
 	m.Update(keyNamed("down"))
 	m.Update(keyNamed("enter"))
-	if countOps[protocol.ResumeSession](be) != 0 {
-		t.Error("opened another task while main was running")
+	// Main keeps running in the background; the other task opens.
+	if countOps[protocol.ResumeSession](be) != 1 {
+		t.Error("the other task did not open while main was running")
 	}
 }
 

@@ -31,29 +31,36 @@ const (
 )
 
 type Backend struct {
-	events    chan protocol.Event
-	store     store
-	cwd       string
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	approvals map[string]chan protocol.ReviewDecision
-	answers   map[string]chan protocol.SelectionResponse
-	model     string
-	effort    string
-	access    int // index into accessModes
-	turn      atomic.Int64
-	pending   []protocol.UserInput // input received while a turn was running
-	saveErr   bool                 // a save failure was already reported
-	active    *turn                // the running turn, if any
-	agents    map[string]*subagent // open helper threads (agents.go)
-	cur       *sessionFile         // nil until the first message of a new session
-	hooks     []protocol.HookInfo  // /hooks (hooks.go)
+	events  chan protocol.Event
+	store   store
+	cwd     string // where new sessions start (/cd changes it)
+	mu      sync.Mutex
+	model   string
+	effort  string
+	access  int // index into accessModes
+	turn    atomic.Int64
+	saveErr bool                // a save failure was already reported
+	hooks   []protocol.HookInfo // /hooks (hooks.go)
+	answers map[string]answerWait
+
+	// sessions are the loaded sessions (live.go); attached is the one the
+	// UI shows. sendMu orders every event send against attaching.
+	sessions map[string]*live
+	attached *live
+	sendMu   sync.Mutex
 
 	// Submit only enqueues; ops run in order on the mock's own goroutine so
 	// the UI never waits on disk writes, sleeps or event-channel sends.
 	opMu   sync.Mutex
 	ops    []protocol.Op
 	opWake chan struct{}
+}
+
+// answerWait is a question waiting for its selection_response; l is the
+// session that asked (nil for backend pickers such as /model).
+type answerWait struct {
+	ch chan protocol.SelectionResponse
+	l  *live
 }
 
 // New creates a mock backend that keeps sessions in dir (DefaultDir() if
@@ -64,17 +71,16 @@ func New(dir string) (*Backend, error) {
 	}
 	cwd, _ := os.Getwd()
 	b := &Backend{
-		events:    make(chan protocol.Event, 1024),
-		store:     store{dir: dir},
-		cwd:       cwd,
-		approvals: map[string]chan protocol.ReviewDecision{},
-		agents:    map[string]*subagent{},
-		answers:   map[string]chan protocol.SelectionResponse{},
-		model:     modelName,
-		effort:    effort,
-		access:    1,
-		opWake:    make(chan struct{}, 1),
-		hooks:     demoHooks(),
+		events:   make(chan protocol.Event, 1024),
+		store:    store{dir: dir},
+		cwd:      cwd,
+		answers:  map[string]answerWait{},
+		sessions: map[string]*live{},
+		model:    modelName,
+		effort:   effort,
+		access:   1,
+		opWake:   make(chan struct{}, 1),
+		hooks:    demoHooks(),
 	}
 	if list, err := b.store.list(); err == nil && len(list) == 0 {
 		if err := seedDemo(&b.store, cwd); err != nil {
@@ -82,9 +88,18 @@ func New(dir string) (*Backend, error) {
 		}
 	}
 	go b.opLoop()
-	b.emit(b.configured(nil))
+	// A fresh session: announce its id now, so the UI knows which listed
+	// task is the one on screen (command center, /status).
+	b.attach(b.fresh(), false)
 	b.notice(protocol.SlashCommands{Commands: mockCommands})
 	return b, nil
+}
+
+// fresh is a new, empty session in the current directory.
+func (b *Backend) fresh() *live {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return newLive(&sessionFile{Meta: protocol.SessionSummary{ID: newID(), Cwd: b.cwd}})
 }
 
 // ResetDemo deletes the mock's sessions in dir and rewrites the demo ones.
@@ -112,100 +127,79 @@ func ResetDemo(dir string) error {
 	return seedDemo(&store{dir: dir}, cwd)
 }
 
-func (b *Backend) configured(f *sessionFile) protocol.SessionConfigured {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	mode := accessModes[b.access]
-	sc := protocol.SessionConfigured{
-		Model: b.model, ReasoningEffort: b.effort, Cwd: b.cwd,
-		Version: version, AgentName: agentName,
-		Permissions: mode.permissions, ApprovalMode: mode.approval,
-	}
-	if f == nil {
-		// A fresh session: announce its id now, so the UI knows which
-		// listed task is the one on screen (command center, /status).
-		if b.cur == nil {
-			b.cur = &sessionFile{Meta: protocol.SessionSummary{ID: newID(), Cwd: b.cwd}}
-		}
-		sc.SessionID = b.cur.Meta.ID
-	}
-	if f != nil {
-		sc.SessionID, sc.Title = f.Meta.ID, f.Meta.Title
-		// Copy: the session keeps growing while the UI replays this.
-		sc.InitialMessages = append(protocol.EventList(nil), f.Events...)
-		if f.Meta.Cwd != "" {
-			sc.Cwd = f.Meta.Cwd
-		}
-		sc.ForkedFrom, sc.ForkedFromTitle = f.ForkedFrom, f.ForkedFromTitle
-	}
-	return sc
-}
-
 func (b *Backend) Events() <-chan protocol.Event { return b.events }
 
-// session returns the current session, creating a new one if needed.
+// session returns the attached session's file.
 func (b *Backend) session() *sessionFile {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.cur == nil {
-		b.cur = &sessionFile{Meta: protocol.SessionSummary{ID: newID(), Cwd: b.cwd}}
-	}
-	return b.cur
+	return b.attached.f
 }
 
-// emit sends an event, recording it in the current session.
-func (b *Backend) emit(m protocol.EventMsg) { b.emitIn(b.session(), m) }
-
-// emitIn sends an event and appends it to sess's saved history. Turns hold
-// on to the session they started in, so a turn that is still winding down
-// after /new or a resume never writes into the other conversation.
-func (b *Backend) emitIn(sess *sessionFile, m protocol.EventMsg) {
-	if replayable(m) && sess != nil {
-		b.mu.Lock()
-		before := sess.Meta.Title
-		sess.record(m, time.Now())
-		retitled := sess.Meta.Title != before && sess == b.cur
-		title := sess.Meta.Title
-		err := b.store.save(sess)
-		report := err != nil && !b.saveErr
-		b.saveErr = b.saveErr || err != nil
-		b.mu.Unlock()
-		if report {
-			b.notice(protocol.Warning{Message: "could not save the session: " + err.Error()})
-		}
-		if retitled {
-			defer b.notice(protocol.SessionTitle{Title: title})
-		}
+// target is the session an op names ("" = the attached one). load also
+// loads a saved session that isn't running yet (input sent to it).
+func (b *Backend) target(id string, load bool) (*live, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if id == "" {
+		return b.attached, nil
 	}
-	b.events <- protocol.Event{ID: fmt.Sprint(b.turn.Load()), Msg: m}
+	if l := b.sessions[id]; l != nil {
+		return l, nil
+	}
+	if !load {
+		return nil, fmt.Errorf("session %s is not running", id)
+	}
+	f, err := b.store.load(id)
+	if err != nil {
+		return nil, err
+	}
+	l := newLive(f)
+	b.sessions[id] = l
+	return l, nil
 }
 
-// notice sends an event without saving it in the conversation (status
-// messages about the backend itself, not part of the chat).
+// notice sends an event about the backend itself (not part of any
+// conversation, never recorded).
 func (b *Backend) notice(m protocol.EventMsg) {
+	b.sendMu.Lock()
+	defer b.sendMu.Unlock()
 	b.events <- protocol.Event{ID: fmt.Sprint(b.turn.Load()), Msg: m}
 }
 
-func (b *Backend) tokens(sess *sessionFile) int64 {
+// tell sends a message to whoever watches session l now (a reply to an op
+// on it, not part of its history).
+func (b *Backend) tell(l *live, m protocol.EventMsg) {
+	b.sendMu.Lock()
+	defer b.sendMu.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return sess.Tokens
+	attached := b.attached == l
+	b.mu.Unlock()
+	if attached {
+		b.events <- protocol.Event{ID: fmt.Sprint(b.turn.Load()), Session: l.id(), Msg: m}
+	}
 }
 
-func (b *Backend) history(sess *sessionFile) int {
+func (b *Backend) tokens(l *live) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return sess.Meta.Messages
+	return l.f.Tokens
 }
 
-// stopTurn cancels the running turn and waits (bounded) for it to finish,
-// so its TurnAborted is delivered before whatever replaces the session.
-func (b *Backend) stopTurn() {
+func (b *Backend) history(l *live) int {
 	b.mu.Lock()
-	b.pending = nil // queued input belongs to the conversation being left
-	t := b.active
-	if b.cancel != nil {
-		b.cancel()
+	defer b.mu.Unlock()
+	return l.f.Meta.Messages
+}
+
+// stopTurn cancels l's running turn and waits (bounded) for it to finish,
+// so its TurnAborted is delivered before whatever comes next.
+func (b *Backend) stopTurn(l *live) {
+	b.mu.Lock()
+	l.pending = nil // queued input belongs to the conversation being changed
+	t := l.active
+	if l.cancel != nil {
+		l.cancel()
 	}
 	b.mu.Unlock()
 	if t != nil {
@@ -247,80 +241,99 @@ func (b *Backend) opLoop() {
 func (b *Backend) handle(op protocol.Op) {
 	switch op := op.(type) {
 	case protocol.UserInput:
+		l, err := b.target(op.SessionID, true)
+		if err != nil {
+			b.notice(protocol.Error{Message: "Cannot send to session " + op.SessionID + ": " + err.Error()})
+			return
+		}
 		if op.ThreadID != "" {
-			if a := b.agent(op.ThreadID); a != nil {
+			if a := b.agent(l, op.ThreadID); a != nil {
 				select {
 				case a.inputs <- op.Text:
 				default:
-					b.notice(protocol.Warning{Message: a.label() + " is busy; try again shortly."})
+					b.tell(l, protocol.Warning{Message: a.label() + " is busy; try again shortly."})
 				}
 			} else {
-				b.notice(protocol.Error{Message: "Agent thread " + op.ThreadID + " is closed."})
+				b.tell(l, protocol.Error{Message: "Agent thread " + op.ThreadID + " is closed."})
 			}
 			return
 		}
 		b.mu.Lock()
-		if b.cancel != nil {
-			// Input during a turn (agenttui -steer): run it next, in order,
+		if l.cancel != nil {
+			// Input during a turn (agenttui -steer, or messages the UI had
+			// queued when the user switched away): run it next, in order,
 			// so the saved conversation matches what the UI shows.
-			b.pending = append(b.pending, op)
+			op.SessionID = l.id()
+			l.pending = append(l.pending, op)
 			b.mu.Unlock()
 			return
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		b.cancel = cancel
+		l.cancel = cancel
 		b.turn.Add(1)
+		t := &turn{b: b, l: l, ctx: ctx, done: make(chan struct{}), images: op.Images, skills: op.Skills}
+		l.active = t
 		b.mu.Unlock()
-		sess := b.session()
-		t := &turn{b: b, sess: sess, ctx: ctx, done: make(chan struct{})}
-		b.mu.Lock()
-		b.active = t
-		b.mu.Unlock()
-		b.emitIn(sess, protocol.UserMessage{Message: op.Text, Images: op.Images})
-		t.images, t.skills = op.Images, op.Skills
+		b.send(l, "", protocol.UserMessage{Message: op.Text, Images: op.Images})
 		go t.run(op.Text)
 	case protocol.ShellCommand:
-		go b.runShell(op.Command)
+		l, err := b.target(op.SessionID, true)
+		if err != nil {
+			b.notice(protocol.Error{Message: "Cannot run in session " + op.SessionID + ": " + err.Error()})
+			return
+		}
+		go b.runShell(l, op.Command)
 	case protocol.SelectionResponse:
 		b.mu.Lock()
-		ch := b.answers[op.ID]
+		w := b.answers[op.ID]
 		delete(b.answers, op.ID)
+		if w.l != nil {
+			w.l.resolve(op.ID)
+		}
 		b.mu.Unlock()
-		if ch != nil {
-			ch <- op
+		if w.ch != nil {
+			w.ch <- op
+		}
+		if w.l != nil {
+			b.refresh(w.l)
 		}
 	case protocol.Rewind:
-		b.stopTurn()
+		l, err := b.target(op.SessionID, false)
+		if err != nil {
+			b.notice(protocol.Error{Message: "Cannot rewind: " + err.Error()})
+			return
+		}
+		b.stopTurn(l)
 		b.mu.Lock()
-		var title *string
-		if b.cur != nil {
-			before := b.cur.Meta.Title
-			b.cur.rewind(op.UserMessageIndex)
-			_ = b.store.save(b.cur)
-			if t := b.cur.Meta.Title; t != before {
-				title = &t
-			}
-		}
+		before := l.f.Meta.Title
+		l.f.rewind(op.UserMessageIndex)
+		_ = b.store.save(l.f)
+		title := l.f.Meta.Title
 		b.mu.Unlock()
-		if title != nil {
-			b.notice(protocol.SessionTitle{Title: *title})
+		if title != before {
+			b.tell(l, protocol.SessionTitle{Title: title})
 		}
+		b.refresh(l)
 	case protocol.Interrupt:
+		l, err := b.target(op.SessionID, false)
+		if err != nil {
+			return // nothing runs there
+		}
 		if op.ThreadID != "" {
-			if a := b.agent(op.ThreadID); a != nil {
+			if a := b.agent(l, op.ThreadID); a != nil {
 				a.interrupt()
 			}
 			return
 		}
 		b.mu.Lock()
-		if b.cancel != nil {
-			b.cancel()
+		if l.cancel != nil {
+			l.cancel()
 		}
 		b.mu.Unlock()
 	case protocol.ExecApproval:
-		b.answer(op.CallID, op.Decision)
+		b.answer(op.SessionID, op.CallID, op.Decision)
 	case protocol.PatchApproval:
-		b.answer(op.CallID, op.Decision)
+		b.answer(op.SessionID, op.CallID, op.Decision)
 	case protocol.ListSessions:
 		list, err := b.store.list()
 		if err != nil {
@@ -328,19 +341,21 @@ func (b *Backend) handle(op protocol.Op) {
 		}
 		b.notice(protocol.SessionList{Sessions: list})
 	case protocol.ResumeSession:
-		b.stopTurn()
-		b.closeAgents()
-		f, err := b.store.load(op.ID)
-		if err != nil {
+		id := op.ID
+		if id == "" {
+			if list, _ := b.store.list(); len(list) > 0 {
+				id = list[0].ID
+			}
+		}
+		l, err := b.target(id, true)
+		if id == "" || err != nil {
+			if err == nil {
+				err = os.ErrNotExist
+			}
 			b.notice(protocol.Error{Message: "resume: no saved session " + op.ID + ": " + err.Error()})
 			return
 		}
-		b.mu.Lock()
-		b.cur = f
-		b.mu.Unlock()
-		sc := b.configured(f)
-		sc.Resumed = true
-		b.notice(sc)
+		b.attach(l, true)
 	case protocol.ListSkills:
 		b.notice(protocol.SkillsList{Skills: b.skillList()})
 	case protocol.SetSkillEnabled:
@@ -356,9 +371,13 @@ func (b *Backend) handle(op protocol.Op) {
 	case protocol.TrustHooks:
 		b.trustHooks(op.Keys)
 	case protocol.ChangeDirectory:
-		b.changeDir(op.Cwd)
+		if l := b.attachedAs(op.SessionID, "/cd"); l != nil {
+			b.changeDir(l, op.Cwd)
+		}
 	case protocol.ForkSession:
-		b.fork(op.Name)
+		if l := b.attachedAs(op.SessionID, "/fork"); l != nil {
+			b.fork(l, op.Name)
+		}
 	case protocol.SlashCommand:
 		b.slash(op)
 	case protocol.Shutdown:
@@ -366,32 +385,47 @@ func (b *Backend) handle(op protocol.Op) {
 	}
 }
 
+// attachedAs returns the attached session if id names it (or is empty);
+// a command typed in a session the UI has left since is refused.
+func (b *Backend) attachedAs(id, what string) *live {
+	b.mu.Lock()
+	l := b.attached
+	b.mu.Unlock()
+	if id != "" && id != l.id() {
+		b.notice(protocol.Error{Message: what + " was not run: session " + id + " is no longer open."})
+		return nil
+	}
+	return l
+}
+
 // runShell executes a "!" command the user typed, like Codex' user shell
 // commands. It runs bash -lc in the session directory in its own session
 // (no controlling terminal, so it can't steal the TUI's keyboard or draw
 // over it), streams output, and is killed with its whole process group
 // after 60 s. Events go to the session the command started in.
-func (b *Backend) runShell(command string) {
-	sess := b.session()
+func (b *Backend) runShell(l *live, command string) {
 	b.mu.Lock()
-	cwd := b.cwd // /cd changes it from the op loop
+	cwd := l.f.Meta.Cwd // /cd changes it from the op loop
+	if cwd == "" {
+		cwd = b.cwd
+	}
 	b.mu.Unlock()
 	id := fmt.Sprintf("sh-%d", time.Now().UnixNano())
 	argv := []string{"bash", "-lc", command}
-	b.emitIn(sess, protocol.ExecCommandBegin{CallID: id, Command: argv, Cwd: cwd, Source: "user_shell"})
+	b.send(l, "", protocol.ExecCommandBegin{CallID: id, Command: argv, Cwd: cwd, Source: "user_shell"})
 	start := time.Now()
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = cwd
 	cmd.Stdin = nil // /dev/null: interactive prompts get EOF instead of hanging
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	out := &cappedOutput{onChunk: func(chunk string) {
-		b.notice(protocol.ExecCommandOutputDelta{CallID: id, Stream: "stdout", Chunk: chunk})
+		b.send(l, "", protocol.ExecCommandOutputDelta{CallID: id, Stream: "stdout", Chunk: chunk})
 	}}
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.WaitDelay = time.Second // don't wait on pipes held by background children
 	code := 0
 	if err := cmd.Start(); err != nil {
-		b.emitIn(sess, protocol.ExecCommandEnd{CallID: id, ExitCode: 127, AggregatedOutput: err.Error()})
+		b.send(l, "", protocol.ExecCommandEnd{CallID: id, ExitCode: 127, AggregatedOutput: err.Error()})
 		return
 	}
 	timer := time.AfterFunc(shellTimeout, func() {
@@ -407,7 +441,7 @@ func (b *Backend) runShell(command string) {
 			code = ee.ExitCode()
 		}
 	}
-	b.emitIn(sess, protocol.ExecCommandEnd{CallID: id, ExitCode: code, AggregatedOutput: out.String(), DurationMs: time.Since(start).Milliseconds()})
+	b.send(l, "", protocol.ExecCommandEnd{CallID: id, ExitCode: code, AggregatedOutput: out.String(), DurationMs: time.Since(start).Milliseconds()})
 }
 
 const (
@@ -458,15 +492,13 @@ func (c *cappedOutput) String() string {
 func (b *Backend) slash(op protocol.SlashCommand) {
 	switch op.Name {
 	case "new":
-		b.stopTurn()
-		b.closeAgents()
-		b.mu.Lock()
-		b.cur = nil
-		b.mu.Unlock()
-		b.notice(b.configured(nil))
+		// The session being left keeps running in the background.
+		b.attach(b.fresh(), false)
 	case "compact":
-		b.emit(protocol.BackgroundEvent{Message: "Compacted conversation history"})
-		b.emit(protocol.TokenCount{TotalTokens: 4000, ContextWindow: contextWindow})
+		if l := b.attachedAs(op.SessionID, "/compact"); l != nil {
+			b.send(l, "", protocol.BackgroundEvent{Message: "Compacted conversation history"})
+			b.send(l, "", protocol.TokenCount{TotalTokens: 4000, ContextWindow: contextWindow})
+		}
 	case "model":
 		go b.pickModel()
 	case "approvals":
@@ -478,7 +510,7 @@ func (b *Backend) slash(op protocol.SlashCommand) {
 			for i, m := range accessModes {
 				items = append(items, protocol.SelectionItem{Name: m.name, Description: m.desc, Current: i == cur})
 			}
-			r, ok := b.ask(context.Background(), protocol.SelectionRequest{
+			r, ok := b.ask(context.Background(), nil, protocol.SelectionRequest{
 				Title: "Select Approval Mode", Subtitle: "The mock backend always asks; this only demonstrates the picker.", Items: items})
 			if ok && r.Index >= 0 && r.Index < len(accessModes) {
 				b.mu.Lock()
@@ -508,22 +540,30 @@ var mockCommands = []protocol.CommandInfo{
 	{Name: "standup", Description: "(mock) a command the backend advertised", AvailableDuringTask: true},
 }
 
-// ask sends a SelectionRequest and waits for the answer.
-func (b *Backend) ask(ctx context.Context, req protocol.SelectionRequest) (protocol.SelectionResponse, bool) {
+// ask sends a SelectionRequest and waits for the answer. l is the session
+// that asks (it then needs input until answered), nil for a backend picker.
+func (b *Backend) ask(ctx context.Context, l *live, req protocol.SelectionRequest) (protocol.SelectionResponse, bool) {
 	if req.ID == "" {
 		req.ID = fmt.Sprintf("q-%d", time.Now().UnixNano())
 	}
 	ch := make(chan protocol.SelectionResponse, 1)
 	b.mu.Lock()
-	b.answers[req.ID] = ch
+	b.answers[req.ID] = answerWait{ch: ch, l: l}
 	b.mu.Unlock()
-	b.notice(req)
+	if l != nil {
+		b.send(l, "", req)
+	} else {
+		b.notice(req)
+	}
 	select {
 	case r := <-ch:
 		return r, true
 	case <-ctx.Done():
 		b.mu.Lock()
 		delete(b.answers, req.ID)
+		if l != nil {
+			l.resolve(req.ID)
+		}
 		b.mu.Unlock()
 		return protocol.SelectionResponse{}, false
 	}
@@ -540,7 +580,7 @@ func (b *Backend) pickModel() {
 		items = append(items, protocol.SelectionItem{Name: m, Current: m == curModel,
 			Description: map[string]string{"mock-model": "balanced", "mock-model-fast": "quick answers", "mock-model-large": "slow and thorough"}[m]})
 	}
-	r, ok := b.ask(context.Background(), protocol.SelectionRequest{Title: "Select Model and Effort", Subtitle: "Switch the model for this and future turns", Items: items})
+	r, ok := b.ask(context.Background(), nil, protocol.SelectionRequest{Title: "Select Model and Effort", Subtitle: "Switch the model for this and future turns", Items: items})
 	if !ok || r.Index < 0 {
 		return
 	}
@@ -550,7 +590,7 @@ func (b *Backend) pickModel() {
 	for _, e := range efforts {
 		eitems = append(eitems, protocol.SelectionItem{Name: e, Current: e == curEffort})
 	}
-	r, ok = b.ask(context.Background(), protocol.SelectionRequest{Title: "Select Reasoning Level for " + model, Items: eitems})
+	r, ok = b.ask(context.Background(), nil, protocol.SelectionRequest{Title: "Select Reasoning Level for " + model, Items: eitems})
 	if !ok || r.Index < 0 {
 		return
 	}
@@ -560,27 +600,39 @@ func (b *Backend) pickModel() {
 	b.notice(protocol.SessionUpdated{Model: model, ReasoningEffort: efforts[r.Index]})
 }
 
-func (b *Backend) answer(id string, d protocol.ReviewDecision) {
+// answer delivers an approval decision to the session that asked.
+func (b *Backend) answer(session, id string, d protocol.ReviewDecision) {
+	l, err := b.target(session, false)
+	if err != nil {
+		return // that session is gone; its turn was stopped
+	}
 	b.mu.Lock()
-	ch := b.approvals[id]
-	delete(b.approvals, id)
+	ch := l.approvals[id]
+	delete(l.approvals, id)
+	l.resolve(id)
 	b.mu.Unlock()
 	if ch != nil {
 		ch <- d
 	}
+	b.refresh(l)
 }
 
-func (b *Backend) waitApproval(ctx context.Context, id string) (protocol.ReviewDecision, bool) {
+// approve sends an approval request on a thread of session l and waits
+// for the answer. The answer channel exists before the request is sent, so
+// even an instant answer is not lost.
+func (b *Backend) approve(ctx context.Context, l *live, thread, id string, req protocol.EventMsg) (protocol.ReviewDecision, bool) {
 	ch := make(chan protocol.ReviewDecision, 1)
 	b.mu.Lock()
-	b.approvals[id] = ch
+	l.approvals[id] = ch
 	b.mu.Unlock()
+	b.send(l, thread, req)
 	select {
 	case d := <-ch:
 		return d, true
 	case <-ctx.Done():
 		b.mu.Lock()
-		delete(b.approvals, id)
+		delete(l.approvals, id)
+		l.resolve(id)
 		b.mu.Unlock()
 		return "", false
 	}
@@ -595,15 +647,15 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// startPending runs the next input that arrived during the last turn.
-func (b *Backend) startPending() {
+// startPending runs the next input that arrived during l's last turn.
+func (b *Backend) startPending(l *live) {
 	b.mu.Lock()
-	if len(b.pending) == 0 || b.cancel != nil {
+	if len(l.pending) == 0 || l.cancel != nil {
 		b.mu.Unlock()
 		return
 	}
-	next := b.pending[0]
-	b.pending = b.pending[1:]
+	next := l.pending[0]
+	l.pending = l.pending[1:]
 	b.mu.Unlock()
 	_ = b.Submit(context.Background(), next)
 }

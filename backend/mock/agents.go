@@ -22,6 +22,9 @@ var agentSeq atomic.Int64
 type subagent struct {
 	id, nick, role, path string
 	b                    *Backend
+	l                    *live // the session it belongs to
+	started              protocol.ThreadStarted
+	log                  catchup // its events, for a UI that attaches later
 	inputs               chan string
 	done                 chan struct{} // first task finished
 	result               protocol.AgentState
@@ -30,9 +33,7 @@ type subagent struct {
 	turnCancel           atomic.Pointer[context.CancelFunc]
 }
 
-func (a *subagent) emit(m protocol.EventMsg) {
-	a.b.events <- protocol.Event{Thread: a.id, Msg: m}
-}
+func (a *subagent) emit(m protocol.EventMsg) { a.b.send(a.l, a.id, m) }
 
 // task runs one turn on the agent's thread; script gets a context that an
 // Interrupt for this thread cancels. The turn starts with its input, the
@@ -105,20 +106,27 @@ func (a *subagent) label() string {
 	return a.nick
 }
 
-// spawn registers a thread and starts its first task, prompt.
-func (b *Backend) spawn(parent context.Context, nick, role, path, prompt string, script func(a *subagent, ctx context.Context) (string, bool)) *subagent {
+// spawn registers a thread of turn t's session and starts its first
+// task, prompt.
+func (t *turn) spawn(nick, role, path, prompt string, script func(a *subagent, ctx context.Context) (string, bool)) *subagent {
+	b, parent := t.b, t.ctx
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &subagent{id: fmt.Sprintf("019a%04x-7c1e-7a10-9d2b-%012x", agentSeq.Add(1), time.Now().UnixNano()&0xffffffffffff),
-		nick: nick, role: role, path: path, b: b, inputs: make(chan string, 4), done: make(chan struct{}), ctx: ctx, close: cancel}
+		nick: nick, role: role, path: path, b: b, l: t.l, inputs: make(chan string, 4), done: make(chan struct{}), ctx: ctx, close: cancel}
 	b.mu.Lock()
-	b.agents[a.id] = a
+	model := b.model
 	b.mu.Unlock()
-	st := protocol.ThreadStarted{ThreadID: a.id, Nickname: nick, Role: role, Path: path, Model: b.model}
+	st := protocol.ThreadStarted{ThreadID: a.id, Nickname: nick, Role: role, Path: path, Model: model}
 	if path != "" {
 		no := false
 		st.AcceptsInput = &no
 	}
-	b.emit(st) // saved, so resumed history keeps the agent's name
+	a.started = st
+	b.mu.Lock()
+	t.l.agents[a.id] = a
+	t.l.agentOrder = append(t.l.agentOrder, a.id)
+	b.mu.Unlock()
+	t.emit(st) // saved, so resumed history keeps the agent's name
 	go func() {
 		a.result = a.task(parent, prompt, func(ctx context.Context) (string, bool) { return script(a, ctx) })
 		close(a.done)
@@ -128,30 +136,25 @@ func (b *Backend) spawn(parent context.Context, nick, role, path, prompt string,
 }
 
 func (b *Backend) closeAgent(a *subagent) {
-	b.mu.Lock()
-	delete(b.agents, a.id)
-	b.mu.Unlock()
 	a.close()
-	b.notice(protocol.ThreadClosed{ThreadID: a.id})
-}
-
-// closeAgents ends every helper (new session, resume).
-func (b *Backend) closeAgents() {
+	b.send(a.l, "", protocol.ThreadClosed{ThreadID: a.id})
 	b.mu.Lock()
-	var all []*subagent
-	for _, a := range b.agents {
-		all = append(all, a)
+	delete(a.l.agents, a.id)
+	order := a.l.agentOrder[:0]
+	for _, id := range a.l.agentOrder {
+		if id != a.id {
+			order = append(order, id)
+		}
 	}
+	a.l.agentOrder = order
 	b.mu.Unlock()
-	for _, a := range all {
-		b.closeAgent(a)
-	}
 }
 
-func (b *Backend) agent(id string) *subagent {
+// agent returns an open helper thread of session l.
+func (b *Backend) agent(l *live, id string) *subagent {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.agents[id]
+	return l.agents[id]
 }
 
 func (t *turn) collab(c protocol.CollabToolCall) { t.emit(c) }
@@ -164,7 +167,7 @@ func (t *turn) agentsDemo() bool {
 	spawn := func(nick, role, prompt string, script func(a *subagent, ctx context.Context) (string, bool)) *subagent {
 		id := fmt.Sprintf("spawn-%d", agentSeq.Add(1))
 		t.collab(protocol.CollabToolCall{CallID: id, Tool: protocol.CollabSpawnAgent, Status: protocol.CollabInProgress, Prompt: prompt, Model: b.model, ReasoningEffort: "low"})
-		a := b.spawn(t.ctx, nick, role, "", prompt, script)
+		a := t.spawn(nick, role, "", prompt, script)
 		t.collab(protocol.CollabToolCall{CallID: id, Tool: protocol.CollabSpawnAgent, Status: protocol.CollabCompleted, ReceiverThreadIDs: []string{a.id}, Prompt: prompt, Model: b.model, ReasoningEffort: "low"})
 		return a
 	}
@@ -182,8 +185,7 @@ func (t *turn) agentsDemo() bool {
 	bob := spawn("Bob", "worker", "Run the test suite and report any failures.", func(a *subagent, ctx context.Context) (string, bool) {
 		cmd := []string{"bash", "-lc", "go test ./..."}
 		id := fmt.Sprintf("%s-ap%d", a.id, agentSeq.Add(1))
-		a.emit(protocol.ExecApprovalRequest{CallID: id, Command: cmd, Reason: "Run the test suite"})
-		d, ok := b.waitApproval(ctx, id)
+		d, ok := b.approve(ctx, a.l, a.id, id, protocol.ExecApprovalRequest{CallID: id, Command: cmd, Reason: "Run the test suite"})
 		if !ok || d == protocol.DecisionAbort {
 			return "", false
 		}
@@ -220,13 +222,12 @@ func (t *turn) agentsDemo() bool {
 }
 
 func (t *turn) delegateDemo() bool {
-	b := t.b
 	if !t.say("I'll hand the review to a dedicated reviewer agent.") {
 		return false
 	}
 	path := "/root/reviewer"
 	prompt := "Review the uncommitted changes to the HTTP server and flag anything risky."
-	a := b.spawn(t.ctx, "", "", path, prompt, func(a *subagent, ctx context.Context) (string, bool) {
+	a := t.spawn("", "", path, prompt, func(a *subagent, ctx context.Context) (string, bool) {
 		if !a.exec(ctx, "git diff --stat", " internal/server.go      | 5 +++--\n internal/server_test.go | 7 +++++++\n 2 files changed, 10 insertions(+), 2 deletions(-)\n") {
 			return "", false
 		}

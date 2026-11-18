@@ -180,17 +180,7 @@ func TestCenterCurrentTaskIsLive(t *testing.T) {
 	if v := centerText(m); !strings.Contains(v, "● Current task") || !strings.Contains(v, "Working 2") {
 		t.Errorf("a running turn:\n%s", v)
 	}
-	// Opening another task waits for the turn; the current one goes back.
-	m.center.sel = 1
-	n := len(be.ops)
-	m.Update(key("enter"))
-	if len(be.ops) != n || !strings.Contains(centerText(m), "Finish or interrupt the current task before opening another.") {
-		t.Errorf("switched while running: %#v\n%s", lastOp(be), centerText(m))
-	}
-	m.Update(key("n"))
-	if !strings.Contains(centerText(m), "'/new' is disabled while a task is in progress.") {
-		t.Errorf("n while running:\n%s", centerText(m))
-	}
+	// Enter on the current task goes back to it.
 	m.center.sel = 0
 	m.Update(key("enter"))
 	if m.center != nil {
@@ -199,6 +189,18 @@ func TestCenterCurrentTaskIsLive(t *testing.T) {
 	// Output that arrived meanwhile is printed once the screen is back.
 	if m.out.held&holdCenter != 0 {
 		t.Error("output still held")
+	}
+	// Another task opens while this one runs: it goes on in the
+	// background (sessions.go).
+	m.Update(keyNamed("left"))
+	if m.center == nil {
+		t.Fatal("← did not reopen the center while a turn runs")
+	}
+	evIn(m, "", demoTasks(time.Now()))
+	m.center.sel = 1
+	m.Update(key("enter"))
+	if op, ok := lastOp(be).(protocol.ResumeSession); !ok || op.ID != "a" {
+		t.Errorf("switching while running sent %#v", lastOp(be))
 	}
 }
 

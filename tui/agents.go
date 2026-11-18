@@ -198,9 +198,14 @@ func (t *agentThread) noteActivity(m protocol.EventMsg) {
 
 // routeEvent handles an event on the thread it belongs to.
 func (m *model) routeEvent(ev protocol.Event) tea.Cmd {
-	if _, ok := ev.Msg.(protocol.SessionConfigured); ok {
+	if sc, ok := ev.Msg.(protocol.SessionConfigured); ok {
 		if ev.Thread != "" {
 			return nil // a subagent's own session: its header comes from main
+		}
+		if m.sessionID != "" && sc.SessionID != "" && sc.SessionID != m.sessionID {
+			// The switch happened: the session being left keeps what was
+			// queued for it (sessions.go), before its threads are reset.
+			m.leaveSession()
 		}
 		var cmd tea.Cmd
 		if m.thread != "" {

@@ -88,7 +88,7 @@ func Run(ctx context.Context, opts Options) error {
 	if testHookModel != nil {
 		testHookModel(m)
 	}
-	p := tea.NewProgram(m, tea.WithContext(ctx), tea.WithOutput(ttyOut{os.Stdout}))
+	p := tea.NewProgram(m, tea.WithContext(ctx), tea.WithOutput(newTTYOut(os.Stdout)))
 	m.send = p.Send
 	// Each insert hides the cursor: Bubble Tea writes it with the cursor at
 	// the top of the live frame, and the frame drawn for printedMsg moves

@@ -103,3 +103,31 @@ func TestSplitBackTabs(t *testing.T) {
 		}
 	}
 }
+
+// VTE before 0.53 prints sequences its table doesn't know as text: they
+// are dropped there, and everything it knows passes through untouched.
+func TestDropUnknownToOldVTE(t *testing.T) {
+	for in, want := range map[string]string{
+		// what Bubble Tea sends at startup, around the alternate screen and at exit
+		"\x1b[>4;2m\x1b[>1u\x1b[?u\x1b[6 q\r\x1b[J":             "\x1b[6 q\r\x1b[J",
+		"\x1b[>4m\x1b[<1u\x1b[?1049h\x1b[?25l\x1b[0 q":          "\x1b[?1049h\x1b[?25l\x1b[0 q",
+		"\x1b[?2026$p\x1b[?2027$p\x1b]10;?\x07\x1b[?5W.":        "\x1b]10;?\x07.",
+		"\x1b[=1;1u\x1b[>c\x1b[c\x1b[?1004h\x1b[?2004l":         "\x1b[>c\x1b[c\x1b[?1004h\x1b[?2004l",
+		"a\x1b]52;c;aGk=\x07b\x1b]9;4;0\x1b\\c":                 "abc",
+		"\x1b]2;title\x07\x1b]8;;http://x\x1b\\l\x1b]8;;\x07":   "\x1b]2;title\x07\x1b]8;;http://x\x1b\\l\x1b]8;;\x07",
+		"\x1b]777;notify;a;b\x07\x1bP+q544e\x1b\\\x1b_Gx\x1b\\": "\x1b]777;notify;a;b\x07",
+		// a frame: all known
+		"\x1b[?25l\x1b[3A\x1b[2Ztext\x1b[K\x1bM\x1b[38;2;1;2;3m\x1b[4:3m\x1b[12P\x08\x1b[2;30r\x1b[1S\x1b[3L\x1b[5X\x1b[2@\x1b[?25h": "\x1b[?25l\x1b[3A\x1b[2Ztext\x1b[K\x1bM\x1b[38;2;1;2;3m\x1b[4:3m\x1b[12P\x08\x1b[2;30r\x1b[1S\x1b[3L\x1b[5X\x1b[2@\x1b[?25h",
+		"plain › text": "plain › text",
+		"\x1b[>4":      "\x1b[>4", // unterminated: left alone
+	} {
+		if got := string(dropUnknownToOldVTE([]byte(in))); got != want {
+			t.Errorf("%q:\n got %q\nwant %q", in, got, want)
+		}
+	}
+	for v, old := range map[string]bool{"5204": true, "3803": true, "5202": true, "5300": false, "6402": false, "7800": false, "": false, "x": false} {
+		if isOldVTE(v) != old {
+			t.Errorf("isOldVTE(%q) = %v", v, !old)
+		}
+	}
+}

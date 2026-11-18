@@ -78,7 +78,8 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | `$` | the skill popup; pick one (e.g. `$repo-scout map the code`) and the agent reads its `SKILL.md` and follows it |
 | `/model`, `/approvals` | backend-driven pickers |
 
-Then try Ctrl+T (transcript), Esc Esc (rewind to an earlier prompt), Ctrl+R
+Then try ← on an empty prompt (the agent command center: every saved
+conversation with its status; Enter opens one), Ctrl+T (transcript), Esc Esc (rewind to an earlier prompt), Ctrl+R
 (history search), `/skills` (enable or disable the demo skills), `/hooks`
 (turn the demo hooks on or off, trust new ones), `/fork`, `/cd ..`, `/export`,
 and quitting followed by `./agenttui resume -last`.
@@ -152,6 +153,7 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 | `change_directory{cwd}` | `/cd [path]`: an existing directory, already resolved against the current one (`~` expanded). Answer with `session_configured` (`resumed:true`, the conversation in `initial_messages`, the new `cwd`), or just `session_updated{cwd}`; report failures with `error` |
 | `fork_session{name?}` | `/fork [name]`: copy the conversation into a new session and continue there. Answer with the new session's `session_configured` (`resumed:true`, `initial_messages`, `forked_from` = the parent's id, `forked_from_title`, and `title` = `name` if given) |
 | `list_hooks` | `/hooks`; reply with `hooks_list` |
+| `list_tasks{limit}` | the agent command center opens (← on an empty prompt, or `/agents`), and again with 10 more for each "Show more"; reply with `task_list`. Enter on a task sends `resume_session`. |
 | `set_hook_enabled{key,enabled}` / `trust_hooks{keys}` | a hook toggled or trusted in `/hooks`; persist it (report failures with `error`, e.g. `Failed to update hook config: …`) |
 | `shutdown` | UI exit |
 
@@ -185,6 +187,7 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `skills_list{skills:[{name,display_name?,description?,short_description?,path,enabled,scope?}],errors?:[{path,message}]}` | the skills catalog for `$` mentions and `/skills` (disabled skills included; `plugin:skill` names show as `skill (plugin)`). New `errors` print `⚠ Skipped loading N skill(s) due to invalid SKILL.md files.` and one `⚠ path: message` line each. Reads of a listed `SKILL.md` show as `Read SKILL.md (name skill)`. Can also be sent unprompted. |
 | `hooks_list{hooks:[{key,event,matcher?,source?,source_path?,plugin_id?,handler?,command?,async?,timeout_sec?,context_limit?,status_message?,enabled,trust}],warnings?,errors?}` | the `/hooks` browser. `event` is a Codex hook event (`PreToolUse`, `Stop`, …); `trust` is `managed`, `trusted`, `untrusted` or `modified` (the last two need review before they run). |
 | `hook_started{run_id,event,status_message}` / `hook_completed{run_id,status,output:[{kind,text}]}` | a hook run: after 300 ms its message joins the status row (`· checking command policy`). A completed run whose output is only `context` leaves nothing; others print `• Blocked by hook` / `• Hook failed` / `• Hook stopped` with `  └ ` output lines, or `↳ Hook · warning`. `status` is `completed`, `failed`, `blocked` or `stopped`; `kind` is `warning`, `stop`, `feedback`, `context` or `error`. |
+| `task_list{tasks:[{id,title?,preview?,cwd?,status?,updated_at,unread?,model?,reasoning_effort?}],has_more?}` | the agent command center, newest first. `status` is `needs_input`, `error`, `working`, `ready` or `inactive` (the default); `preview` is the first prompt (shown when there is no `title`). The conversation on screen shows its live state whatever the backend says. |
 | `token_count` | `N% context left` (or `NK used`) |
 | `error` / `warning` / `background_event` | `■` red, `⚠`, dim `•` |
 | `stream_error` | a transient detail line under the status row |
@@ -210,6 +213,7 @@ These are the defaults. Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+V / Alt+V and the
 | Shift+← / Alt+↑ | pop the last queued message back for editing |
 | Ctrl+T | transcript pager: `/` find, `n`/`N`, pgup/pgdn, home/end, q |
 | Ctrl+O · Ctrl+L · Ctrl+Z | copy last response · clear the screen · suspend |
+| ← | the agent command center (empty composer) |
 | Alt+← / Alt+→ | watch the previous / next subagent thread (empty composer) |
 | `?` | shortcut overlay (empty composer) |
 
@@ -218,13 +222,13 @@ the overlay shows ⇧enter or ⌃j accordingly.
 
 Local slash commands: `/status`, `/diff` (opens a pager), `/transcript`,
 `/resume`, `/copy`, `/export [file]`, `/clear`, `/cd [path]`, `/pwd`, `/fork [name]`,
-`/mention`, `/skills`, `/hooks`, `/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. The other built-in
+`/mention`, `/skills`, `/hooks`, `/agents`, `/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. The other built-in
 commands, and the ones the backend advertises, are sent as `slash_command`.
 An unknown `/name` is not sent: like Codex it prints
 `Unrecognized command '/name'` and keeps the draft (paths such as
 `/usr/bin/x` and text starting with a space are sent as prompts).
 While a task runs, `/model`, `/approvals`, `/diff`, `/status`, `/copy`,
-`/pwd`, `/mention`, `/skills`, `/hooks`, `/transcript`, `/statusline`, `/title`,
+`/pwd`, `/mention`, `/skills`, `/hooks`, `/agents`, `/transcript`, `/statusline`, `/title`,
 `/subagents` and `/quit` still work; the rest wait for the turn to end.
 
 ## Skills
@@ -260,6 +264,22 @@ and needing review). Enter opens an event's hooks with their details;
 space or Enter turns one on or off, `t` trusts the selected hook (or, on
 the events page, all of them), Esc goes back. Managed hooks can't be
 changed, and new or modified hooks must be trusted before they can run.
+
+## Agent command center
+
+← on an empty prompt (or `/agents`) opens Codex' agent command center
+full-screen: the backend's tasks (`task_list`) grouped by project, with
+status tabs (`All`, `Needs you`, `Working`, `Ready`, `Inactive`; Tab /
+Shift+Tab), a status dot (red ● needs input, red ! error, green ● working,
+cyan ○ ready, gray ○ inactive, blue ● unread) and the time of the last
+update. From 90 columns a details pane shows the selected task's model,
+project and prompt.
+
+↑/↓ (or j/k) move, PgUp/PgDn page, Enter or → opens a task (resumes it;
+the current one just returns to the chat), Esc goes back, `n` starts a new
+task, `g` cycles the grouping (Project, Directory, Status, Model), `?`
+lists the shortcuts and "Show more" loads ten more tasks. Codex' search,
+rename, fork, stop, archive, hide, delete and pins are not ported yet.
 
 ## Subagents
 
@@ -486,6 +506,8 @@ snapshots.
   - Diffs with tints and highlighting.
 - **Terminal and session:** title, notifications, resume, `/copy`,
   `/export`, `/clear`, `/cd`, `/fork`.
+- **Agent command center:** ← / `/agents`, status tabs, grouping, details
+  pane, "Show more" (search, rename and task actions not yet).
 - **Hooks:** the `/hooks` browser (enable, trust, details) and hook run
   rows and cells.
 - **Subagents:** collab and activity rows, per-thread transcripts,
@@ -499,7 +521,7 @@ snapshots.
 
 - **Codex-specific:** login and onboarding, model catalog and rate-limit
   cards, MCP inventory and elicitation forms, plugins and apps, voice
-  and realtime, agents command center and side conversations, worktrees,
+  and realtime, side conversations, worktrees,
   goals, pets, Daybreak, update prompts. Generic equivalents are the
   backend-driven `selection_request` and slash-command forwarding.
 - **Secondary, not done yet:**
@@ -539,6 +561,7 @@ go test ./...
     `/statusline` and `/export`;
   - the Ctrl+T pager and find, Esc Esc rewind and `@` file mentions;
   - resume (picker and `-last`), resize reflow and subagents;
+  - the agent command center (←, Esc back, Enter resumes);
   - skills: the `$` popup, mentions and Enable/Disable Skills;
   - layout: the composer stays on the last row after turns, approvals,
     `/resume` inside a session and closing `/keymap`;
@@ -550,12 +573,12 @@ go test ./...
 ## Layout
 
 ```
-protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, lineage.go, hooks.go, wire.go)
+protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, lineage.go, hooks.go, tasks.go, wire.go)
 config/          settings file (TOML)
-backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, /cd, /fork, hooks, real "!" commands
+backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, /cd, /fork, hooks, tasks, real "!" commands
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
-                 approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills, lineage, hooks)
+                 approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills, lineage, hooks, center)
 cmd/agenttui     entry point
 e2e/             end-to-end tests: the real binary in tmux, driven by keystrokes
 examples/        echo_agent.py reference backend

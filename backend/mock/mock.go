@@ -339,6 +339,8 @@ func (b *Backend) handle(op protocol.Op) {
 		if err := b.setSkillEnabled(op.Path, op.Enabled); err != nil {
 			b.notice(protocol.Error{Message: "Failed to update skill config for " + op.Path + ": " + err.Error()})
 		}
+	case protocol.ListTasks:
+		b.notice(b.tasks(op.Limit))
 	case protocol.ListHooks:
 		b.notice(b.hooksList())
 	case protocol.SetHookEnabled:

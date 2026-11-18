@@ -30,11 +30,11 @@ func init() {
 		PatchApplyBegin{}, PatchApplyEnd{}, ToolCallBegin{}, ToolCallEnd{},
 		PlanUpdate{}, TokenCount{}, BackgroundEvent{}, Warning{}, Error{},
 		StreamError{}, ShutdownComplete{}, SessionList{}, SessionTitle{}, UserMessage{}, SelectionRequest{},
-		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{}, SkillsList{}, HooksList{}, HookStarted{}, HookCompleted{},
+		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{}, SkillsList{}, HooksList{}, HookStarted{}, HookCompleted{}, TaskList{},
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}
-	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}, ListSkills{}, SetSkillEnabled{}, ChangeDirectory{}, ForkSession{}, ListHooks{}, SetHookEnabled{}, TrustHooks{}} {
+	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}, ListSkills{}, SetSkillEnabled{}, ChangeDirectory{}, ForkSession{}, ListHooks{}, SetHookEnabled{}, TrustHooks{}, ListTasks{}} {
 		opTypes[o.opType()] = reflect.TypeOf(o)
 	}
 }

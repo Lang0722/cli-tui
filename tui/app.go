@@ -211,6 +211,9 @@ type model struct {
 	forkedFrom                         string // session this one was forked from
 	sessionReady                       bool   // a session_configured arrived
 
+	// the agent command center (center.go)
+	center *agentCenter
+
 	// /hooks (hooks.go)
 	hooksView   *hooksBrowser
 	hooksWanted bool // a list_hooks is waiting for its answer
@@ -980,6 +983,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case hooksTimeoutMsg:
 		m.onHooksTimeout(msg)
 		return m, nil
+	case centerTimeoutMsg:
+		m.onCenterTimeout(msg)
+		return m, nil
 	case lineageTimeoutMsg:
 		m.onLineageTimeout(msg)
 		return m, nil
@@ -1002,7 +1008,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.hooksView == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.hooksView == nil && m.center == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -1106,6 +1112,8 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.setBackendCommands(e.Commands)
 	case protocol.HooksList:
 		m.onHooksList(e)
+	case protocol.TaskList:
+		m.onTaskList(e)
 	case protocol.HookStarted:
 		m.onHookStarted(e)
 	case protocol.HookCompleted:
@@ -1445,6 +1453,8 @@ func (m *model) keyContexts() []string {
 		return nil // /keymap captures keys itself
 	case m.pager != nil:
 		return []string{"pager"}
+	case m.center != nil:
+		return []string{"list"}
 	case len(m.approvals) > 0:
 		return []string{"approval", "list", "global"}
 	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.skills.view != nil, m.hooksView != nil, m.agents.picker != nil:
@@ -1526,6 +1536,9 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 		}
 		return nil
 	}
+	if m.center != nil {
+		return m.handleCenterKey(k, act)
+	}
 	if len(m.approvals) > 0 {
 		return m.handleApprovalKey(key, act)
 	}
@@ -1596,6 +1609,11 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 			}
 		}
 		return nil
+	}
+	// ← on an empty prompt opens the agent command center (Codex
+	// agents_navigation.rs), unless ← was remapped away from the editor.
+	if key == "left" && m.centerAvailable() {
+		return m.openCenter()
 	}
 	// Codex' fixed Alt+←/→: watch the previous/next agent thread, only
 	// with an empty composer (otherwise they keep moving by word).
@@ -2040,6 +2058,8 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return m.forkSession(args)
 	case "hooks":
 		return m.openHooks()
+	case "agents":
+		return m.openCenter()
 	case "statusline":
 		return m.surfaceCommand(surfaceStatus, args)
 	case "title":
@@ -2192,6 +2212,14 @@ func (m *model) View() tea.View {
 	}
 	if m.pager != nil {
 		v := tea.NewView(m.pager.render(m.width, m.height))
+		v.AltScreen = true
+		v.WindowTitle = m.title()
+		return v
+	}
+	if m.center != nil {
+		// Codex draws the command center over the whole screen.
+		m.center.refreshCurrent(m)
+		v := tea.NewView(renderLines(m.center.Lines(m.width, m.height, m.keys, m.st)))
 		v.AltScreen = true
 		v.WindowTitle = m.title()
 		return v
@@ -2428,8 +2456,18 @@ func (m *model) footerLine(w int, showContext bool) Line {
 		// Codex shows the watched agent where the hint would be.
 		left = L(P("  "), d(m.footerAgentLabel()))
 	case m.composer.Empty():
+		left = L(P("  "))
+		if m.centerAvailable() {
+			left = append(left, k("←"), d(" for agents"))
+		}
 		if q := m.keys.primary("composer.toggle_shortcuts"); q != "" {
-			left = L(P("  "), k(q), d(" for shortcuts"))
+			if len(left) > 1 {
+				left = append(left, d(" · "))
+			}
+			left = append(left, k(q), d(" for shortcuts"))
+		}
+		if len(left) == 1 {
+			left = nil
 		}
 	default:
 		left = nil // Codex hides hints while you type; context stays
@@ -2478,73 +2516,58 @@ func (m *model) shortcutLines(w int) []Line {
 	} else {
 		tab = "Send message"
 	}
-	type item = [2]string
-	groups := []struct {
-		title string
-		items []item
-	}{
-		{"Compose", []item{{"/", "Commands"}, {"@", "Mention files"}, {"!", "Shell command"}, {newline, "New line"},
+	groups := []shortcutGroup{
+		{"Compose", [][2]string{{"/", "Commands"}, {"@", "Mention files"}, {"!", "Shell command"}, {newline, "New line"},
 			{"⌃v", "Paste image"}, {km.primary("global.open_external_editor"), "External editor"}, {km.primary("composer.history_search_previous"), "Search history"}, {"esc esc", "Edit last message"}}},
-		{"Session", []item{{km.primary("composer.queue"), tab}, {km.primary("chat.edit_queued_message"), "Edit queued message"}, {km.primary("chat.interrupt_turn"), "Interrupt"}, {"⌃c", ctrlc}, {km.primary("global.copy"), "Copy last response"}, {km.primary("global.clear_terminal"), "Clear screen"}, {"⌃z", "Suspend"}, {"⌥← / ⌥→", "Subagents (empty prompt)"}}},
-		{"Transcript", []item{{km.primary("global.open_transcript"), "Open transcript"}, {km.primary("pager.find"), "Find (in transcript)"}, {"pgup / pgdn", "Scroll"}, {"home / end", "Top / latest"}}},
+		{"Session", [][2]string{{km.primary("composer.queue"), tab}, {km.primary("chat.edit_queued_message"), "Edit queued message"}, {km.primary("chat.interrupt_turn"), "Interrupt"}, {"⌃c", ctrlc}, {km.primary("global.copy"), "Copy last response"}, {km.primary("global.clear_terminal"), "Clear screen"}, {"⌃z", "Suspend"}, {"⌥← / ⌥→", "Subagents (empty prompt)"}}},
+		{"Transcript", [][2]string{{km.primary("global.open_transcript"), "Open transcript"}, {km.primary("pager.find"), "Find (in transcript)"}, {"pgup / pgdn", "Scroll"}, {"home / end", "Top / latest"}}},
 	}
-	// Unbound actions have no hint.
-	for g := range groups {
-		kept := groups[g].items[:0]
-		for _, it := range groups[g].items {
-			if it[0] != "" {
-				kept = append(kept, it)
-			}
-		}
-		groups[g].items = kept
-	}
-	render := func(g int) []Line {
+	out := []Line{{}, L(P("  "), S("Keyboard shortcuts", st.Bold)), {}}
+	out = append(out, shortcutColumns(groups, w, "  ", st)...)
+	out = append(out, Line{}, L(P("  "), S("/keymap", st.Accent), S(" customize shortcuts", st.Dim)))
+	return out
+}
+
+type shortcutGroup struct {
+	title string
+	items [][2]string // key, action; unbound (empty) keys are left out
+}
+
+// shortcutColumns lays shortcut groups out in as many columns as fit (3, 2
+// or 1); with fewer columns the remaining groups stack in the last one,
+// like Codex' shortcut_help::group_lines.
+func shortcutColumns(groups []shortcutGroup, w int, indent string, st *Styles) []Line {
+	render := func(g shortcutGroup) []Line {
 		kw := 0
-		for _, it := range groups[g].items {
+		for _, it := range g.items {
 			kw = max(kw, strw(it[0]))
 		}
-		out := []Line{L(S(groups[g].title, st.Bold))}
-		for _, it := range groups[g].items {
-			out = append(out, L(S(it[0], st.Accent), P(strings.Repeat(" ", kw-strw(it[0])+2)), S(it[1], st.Dim)))
+		out := []Line{L(S(g.title, st.Bold))}
+		for _, it := range g.items {
+			if it[0] != "" {
+				out = append(out, L(S(it[0], st.Accent), P(strings.Repeat(" ", kw-strw(it[0])+2)), S(it[1], st.Dim)))
+			}
 		}
 		return out
 	}
 	cols := make([][]Line, len(groups))
-	colW := make([]int, len(groups))
 	for g := range groups {
-		cols[g] = render(g)
-		for _, l := range cols[g] {
-			colW[g] = max(colW[g], l.Width())
-		}
+		cols[g] = render(groups[g])
 	}
-	out := []Line{{}, L(P("  "), S("Keyboard shortcuts", st.Bold)), {}}
-	// Lay groups out in as many columns as fit (3, 2 or 1); with fewer
-	// columns the remaining groups stack in the last one, like Codex.
-	stack := func(gs []int) []Line {
+	stack := func(from int) []Line {
 		var col []Line
-		for k, g := range gs {
-			if k > 0 {
+		for g := from; g < len(cols); g++ {
+			if g > from {
 				col = append(col, Line{})
 			}
 			col = append(col, cols[g]...)
 		}
 		return col
 	}
-	layout := func(n int) [][]Line {
-		var res [][]Line
-		for c := 0; c < n-1; c++ {
-			res = append(res, cols[c])
-		}
-		var rest []int
-		for g := n - 1; g < len(groups); g++ {
-			rest = append(rest, g)
-		}
-		return append(res, stack(rest))
-	}
 	var columns [][]Line
 	for n := len(groups); n >= 1; n-- {
-		columns = layout(n)
-		t := 2
+		columns = append(append([][]Line{}, cols[:n-1]...), stack(n-1))
+		t := strw(indent)
 		for _, c := range columns {
 			cw := 0
 			for _, l := range c {
@@ -2564,8 +2587,9 @@ func (m *model) shortcutLines(w int) []Line {
 		}
 		h = max(h, len(col))
 	}
+	var out []Line
 	for r := 0; r < h; r++ {
-		l := L(P("  "))
+		l := L(P(indent))
 		for c, col := range columns {
 			var part Line
 			if r < len(col) {
@@ -2578,6 +2602,5 @@ func (m *model) shortcutLines(w int) []Line {
 		}
 		out = append(out, l.Truncate(w))
 	}
-	out = append(out, Line{}, L(P("  "), S("/keymap", st.Accent), S(" customize shortcuts", st.Dim)))
 	return out
 }

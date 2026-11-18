@@ -44,6 +44,7 @@ const (
 	holdPager  holdReason = 1 << iota // alt-screen pager is open
 	holdClear                         // the terminal is being cleared for a reflow
 	holdPicker                        // alt-screen resume picker is open
+	holdCenter                        // alt-screen agent command center is open
 )
 
 func newPrinter() *printer {

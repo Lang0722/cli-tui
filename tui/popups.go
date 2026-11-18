@@ -38,6 +38,7 @@ var DefaultCommands = []Command{
 	{Name: "init", Description: "create an AGENTS.md file with instructions for the agent"},
 	{Name: "compact", Description: "summarize conversation to prevent hitting the context limit"},
 	{Name: "review", Description: "review my current changes and find issues"},
+	{Name: "agents", Description: "open the agent command center", Local: true, DuringTask: true},
 	{Name: "diff", Description: "show git diff (including untracked files)", Local: true, DuringTask: true},
 	{Name: "mention", Description: "mention a file", Local: true, DuringTask: true},
 	{Name: "status", Description: "show current session configuration and token usage", Local: true, DuringTask: true},

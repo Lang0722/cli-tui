@@ -124,3 +124,34 @@ func TestCursorNotShownAboveComposerWhileWorking(t *testing.T) {
 		t.Errorf("after the turn: cursor at column %d, shown %v; want shown in the empty composer", x, shown)
 	}
 }
+
+// ← on an empty prompt opens the agent command center in the alternate
+// screen; Esc returns to the chat as it was, Enter resumes a task.
+func TestAgentCommandCenter(t *testing.T) {
+	t.Parallel()
+	s := start(t, opts{reset: true})
+	s.turn("remember the word pineapple", "pineapple")
+	s.waitScreen("← for agents")
+	s.waitIdle()
+	before := s.screen()
+	s.keys("Left")
+	s.waitScreen("Agent command center")
+	if !s.altScreen() {
+		t.Errorf("command center drawn inline")
+	}
+	s.waitScreen("› ○ remember the word pineapple")
+	s.waitScreen("TestParseDuration fails")
+	s.keys("Escape")
+	s.waitGone("Agent command center")
+	s.poll("the chat screen restored", func() bool { return s.screen() == before })
+
+	s.keys("Left")
+	s.waitScreen("Agent command center")
+	s.keys("Down", "Enter")
+	s.waitFor("↻ Resumed session")
+	s.waitPinned("after opening a task")
+	s.notContains("remember the word pineapple")
+	if s.altScreen() {
+		t.Errorf("still in the alternate screen")
+	}
+}

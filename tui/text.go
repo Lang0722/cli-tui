@@ -374,7 +374,8 @@ func Wrap(l Line, width int, first, rest Line) []Line {
 	}
 	fw, rw := first.Width(), rest.Width()
 	if width-fw < 1 || width-rw < 1 {
-		width = max(fw, rw) + 1
+		first, rest, width = fitPrefixes(first, rest, width)
+		fw, rw = first.Width(), rest.Width()
 	}
 	var out []Line
 	cur := append(Line{}, first...)
@@ -515,12 +516,31 @@ func sanitizeLine(s string) string {
 	return strings.ReplaceAll(sanitize(s), "\n", " ")
 }
 
+// fitPrefixes cuts prefixes (deep list or quote nesting) that leave no
+// room for text, keeping half the width for it. Widening past the
+// terminal instead would make the terminal wrap the row and shift
+// everything printed after it.
+func fitPrefixes(first, rest Line, width int) (Line, Line, int) {
+	if width < 2 {
+		return first, rest, max(first.Width(), rest.Width()) + 1 // nothing sensible fits
+	}
+	keep := width - max(1, width/2)
+	if first.Width() > keep {
+		first = first.Truncate(keep)
+	}
+	if rest.Width() > keep {
+		rest = rest.Truncate(keep)
+	}
+	return first, rest, width
+}
+
 // WrapChars hard-wraps at the character (keeping spaces), as Codex does for
 // diff lines and code, with the same prefix scheme as Wrap.
 func WrapChars(l Line, width int, first, rest Line) []Line {
 	fw, rw := first.Width(), rest.Width()
 	if width-fw < 1 || width-rw < 1 {
-		width = max(fw, rw) + 1
+		first, rest, width = fitPrefixes(first, rest, width)
+		fw, rw = first.Width(), rest.Width()
 	}
 	var out []Line
 	cur := append(Line{}, first...)

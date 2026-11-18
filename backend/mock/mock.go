@@ -121,6 +121,14 @@ func (b *Backend) configured(f *sessionFile) protocol.SessionConfigured {
 		Version: version, AgentName: agentName,
 		Permissions: mode.permissions, ApprovalMode: mode.approval,
 	}
+	if f == nil {
+		// A fresh session: announce its id now, so the UI knows which
+		// listed task is the one on screen (command center, /status).
+		if b.cur == nil {
+			b.cur = &sessionFile{Meta: protocol.SessionSummary{ID: newID(), Cwd: b.cwd}}
+		}
+		sc.SessionID = b.cur.Meta.ID
+	}
 	if f != nil {
 		sc.SessionID, sc.Title = f.Meta.ID, f.Meta.Title
 		// Copy: the session keeps growing while the UI replays this.
@@ -365,12 +373,15 @@ func (b *Backend) handle(op protocol.Op) {
 // after 60 s. Events go to the session the command started in.
 func (b *Backend) runShell(command string) {
 	sess := b.session()
+	b.mu.Lock()
+	cwd := b.cwd // /cd changes it from the op loop
+	b.mu.Unlock()
 	id := fmt.Sprintf("sh-%d", time.Now().UnixNano())
 	argv := []string{"bash", "-lc", command}
-	b.emitIn(sess, protocol.ExecCommandBegin{CallID: id, Command: argv, Cwd: b.cwd, Source: "user_shell"})
+	b.emitIn(sess, protocol.ExecCommandBegin{CallID: id, Command: argv, Cwd: cwd, Source: "user_shell"})
 	start := time.Now()
 	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Dir = b.cwd
+	cmd.Dir = cwd
 	cmd.Stdin = nil // /dev/null: interactive prompts get EOF instead of hanging
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	out := &cappedOutput{onChunk: func(chunk string) {

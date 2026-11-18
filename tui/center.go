@@ -928,6 +928,7 @@ func (m *model) onTaskList(e protocol.TaskList) {
 	if r, ok := c.selectedRow(); ok {
 		sel = r.ID
 	}
+	more := c.loaded && c.sel == centerShowMore // Codex keeps show_more_selected
 	c.loading, c.failed, c.loaded, c.hasMore = false, false, true, e.HasMore
 	c.rows = c.rows[:0]
 	seen := map[string]bool{}
@@ -941,13 +942,16 @@ func (m *model) onTaskList(e protocol.TaskList) {
 	// The conversation on screen is shown as it is now, even before the
 	// backend lists it.
 	if m.sessionID != "" && !seen[m.sessionID] && m.hasUserTurn() {
-		c.rows = append([]centerRow{m.centerRow(protocol.TaskSummary{ID: m.sessionID, Preview: m.firstPrompt(), UpdatedAt: time.Now()})}, c.rows...)
+		c.rows = append([]centerRow{m.centerRow(protocol.TaskSummary{ID: m.sessionID, Preview: m.mainConvo().firstPrompt(), UpdatedAt: time.Now()})}, c.rows...)
 	}
 	c.sel = -2
 	for i, r := range c.rows {
-		if (sel != "" && r.ID == sel) || (sel == "" && r.current) {
+		if (sel != "" && r.ID == sel) || (sel == "" && !more && r.current) {
 			c.sel = i
 		}
+	}
+	if more && c.hasMore {
+		c.sel = centerShowMore
 	}
 	c.reconcile()
 }
@@ -956,11 +960,13 @@ func (m *model) centerRow(t protocol.TaskSummary) centerRow {
 	r := centerRow{TaskSummary: t}
 	if t.ID == m.sessionID && m.sessionID != "" {
 		// The UI knows its own task's state best.
+		// The center lists sessions: its row is the main conversation,
+		// even while a subagent thread is on screen.
 		r.current = true
 		switch {
 		case len(m.approvals) > 0 || len(m.selections) > 0:
 			r.Status = protocol.TaskNeedsInput
-		case m.running:
+		case m.mainConvo().running:
 			r.Status = protocol.TaskWorking
 		default:
 			r.Status = protocol.TaskReady
@@ -978,9 +984,9 @@ func (m *model) centerRow(t protocol.TaskSummary) centerRow {
 	return r
 }
 
-// firstPrompt is the first prompt of the conversation on screen.
-func (m *model) firstPrompt() string {
-	for _, c := range m.committed[min(m.sessionStart, len(m.committed)):] {
+// firstPrompt is the first prompt of the conversation.
+func (c *convo) firstPrompt() string {
+	for _, c := range c.committed[min(c.sessionStart, len(c.committed)):] {
 		if u, ok := c.(userCell); ok && !u.command {
 			return u.text
 		}
@@ -999,7 +1005,7 @@ func (m *model) handleCenterKey(k tea.KeyPressMsg, act string) tea.Cmd {
 		c.limit += centerPage
 		return m.requestTasks()
 	case centerNew:
-		if m.running {
+		if m.mainConvo().running {
 			c.notice = "'/new' is disabled while a task is in progress."
 			return nil
 		}
@@ -1011,7 +1017,7 @@ func (m *model) handleCenterKey(k tea.KeyPressMsg, act string) tea.Cmd {
 			m.closeCenter()
 			return nil
 		}
-		if m.running || len(m.approvals) > 0 || m.lineage != nil {
+		if m.mainConvo().running || len(m.approvals) > 0 || m.lineage != nil {
 			c.notice = "Finish or interrupt the current task before opening another."
 			return nil
 		}
@@ -1037,4 +1043,6 @@ func (c *agentCenter) refreshCurrent(m *model) {
 			c.rows[i] = m.centerRow(c.rows[i].TaskSummary)
 		}
 	}
+	// A new state can move the row out of the open tab.
+	c.reconcile()
 }

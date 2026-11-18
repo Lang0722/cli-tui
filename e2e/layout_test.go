@@ -155,3 +155,24 @@ func TestAgentCommandCenter(t *testing.T) {
 		t.Errorf("still in the alternate screen")
 	}
 }
+
+// Output that arrives while an alternate-screen view (command center,
+// transcript pager) is open reaches the scrollback when it closes.
+func TestAltScreenViewsKeepTurnOutput(t *testing.T) {
+	t.Parallel()
+	for _, open := range []string{"Left", "C-t"} {
+		s := start(t, opts{reset: true})
+		s.submit("tell me about caching")
+		s.running()
+		s.keys(open)
+		s.poll("the alternate screen", s.altScreen)
+		s.waitIdle()
+		s.keys("Escape")
+		s.poll("the main screen", func() bool { return !s.altScreen() })
+		s.waitFor("effective_go")
+		s.waitScreen("› Ask Agent to do anything")
+		if n := s.count("effective_go"); n != 1 {
+			t.Errorf("%s: answer printed %d times", open, n)
+		}
+	}
+}

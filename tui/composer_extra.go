@@ -294,13 +294,14 @@ func (c *composer) expand(text string, pastes bool) (string, []string) {
 // --- reverse history search (Ctrl+R) ---------------------------------------
 
 type historySearch struct {
-	query string
-	idx   int // history index of the current match, -1 if none
-	draft string
+	query   string
+	idx     int // history index of the current match, -1 if none
+	draft   string
+	draftPH map[string]string // the draft's pastes and images (see placeholderContents)
 }
 
 func (c *composer) startSearch() {
-	c.search = &historySearch{idx: -1, draft: string(c.text)}
+	c.search = &historySearch{idx: -1, draft: string(c.text), draftPH: c.placeholderContents()}
 }
 
 // searchStep finds the next unique match older (dir=-1) or newer (+1) than
@@ -326,6 +327,7 @@ func (c *composer) searchRefresh() {
 	c.searchStep(-1)
 	if c.search.idx < 0 {
 		c.Set(c.search.draft)
+		c.restorePlaceholders(c.search.draftPH)
 	}
 }
 
@@ -334,6 +336,7 @@ func (c *composer) endSearch(accept bool) {
 	c.search = nil
 	if !accept {
 		c.Set(s.draft)
+		c.restorePlaceholders(s.draftPH)
 		return
 	}
 	if s.idx >= 0 {

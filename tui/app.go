@@ -178,6 +178,9 @@ type streamState struct {
 type interruptedAnswer struct {
 	idx int    // its agentCell in committed
 	src string // the text it was printed from
+	// shown is all the answer's text printed so far: when several cells
+	// cut it into segments, the earlier segments followed by src.
+	shown string
 }
 
 type tailCache struct {
@@ -305,6 +308,7 @@ type convo struct {
 	stream       streamState
 	active       []Cell
 	execByID     map[string]*execCall
+	ended        map[string]bool // exec calls ended this turn (a repeated end is dropped)
 	toolByID     map[string]*toolCell
 	hadTools     bool
 	queued       []pendingInput
@@ -314,6 +318,10 @@ type convo struct {
 	// it hidden until new work starts, so the turn's end doesn't shrink
 	// the bottom pane).
 	statusHidden bool
+
+	// edits counts changes to committed other than appends (a corrected
+	// answer, a rewind): the pager re-renders when it changes.
+	edits int
 
 	// tokens
 	hookRuns []*hookRun // hooks running (hooks.go)
@@ -332,6 +340,7 @@ func newConvo(thread string) *convo {
 // and released when the pager closes.
 func (m *model) openPager() {
 	m.pager = newTranscriptPager(func() []Cell { return m.committed }, m.liveTranscript, m.st)
+	m.pager.version = func() any { return pagerVersion{m.convo, m.convo.edits} }
 	m.out.hold(holdPager, true)
 }
 
@@ -791,6 +800,15 @@ func (m *model) finalizeStream(final string) {
 		m.interrupted = nil
 		return
 	}
+	if in := m.interrupted; final != "" && in != nil && strings.HasPrefix(final, in.shown) {
+		// The final repeats the segments already printed before this one:
+		// only the rest is this segment's.
+		final = final[len(in.shown):]
+		m.interrupted = nil
+		if strings.TrimSpace(final) == "" {
+			return // the late final of the earlier segments: this stream is the next answer
+		}
+	}
 	src := m.stream.src.String()
 	// Repair dropped deltas: if the final message extends what streamed,
 	// render the final text (Codex repairs on completion too).
@@ -825,7 +843,11 @@ func (m *model) finalizeStream(final string) {
 		}
 		return
 	case final == "":
-		m.interrupted = &interruptedAnswer{len(m.committed), src}
+		shown := src
+		if in := m.interrupted; in != nil {
+			shown = in.shown + src // the same answer, cut again
+		}
+		m.interrupted = &interruptedAnswer{len(m.committed), src, shown}
 	default:
 		m.interrupted = nil // a completed answer ends the wait (as Codex)
 	}
@@ -849,16 +871,21 @@ func (m *model) correctInterrupted(final string) bool {
 		return false
 	}
 	m.interrupted = nil
-	if sameAnswer(final, in.src) {
+	if sameAnswer(final, in.src) || sameAnswer(final, in.shown) {
 		return true // already shown
 	}
-	if !strings.HasPrefix(strings.TrimSpace(final), strings.TrimSpace(in.src)) {
+	if in.shown != in.src && strings.HasPrefix(final, in.shown) {
+		// Cut into segments, then deltas dropped: the missing end
+		// belongs to the last segment.
+		final = in.src + final[len(in.shown):]
+	} else if !strings.HasPrefix(strings.TrimSpace(final), strings.TrimSpace(in.src)) {
 		return false // another answer
 	}
 	// Deltas were dropped: show the full text where the answer appeared.
 	if in.idx < len(m.committed) {
 		if c, ok := m.committed[in.idx].(agentCell); ok && c.md == in.src {
 			m.committed[in.idx] = agentCell{final}
+			m.edits++
 			if !m.replaying && !m.opts.NoReflow {
 				m.pendingReflow = reflowFull
 			}
@@ -999,6 +1026,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case backendDone:
 		m.closed = true
 		m.finalizeStream("")
+		// Keep what the running command printed: it most likely explains
+		// the exit. Marked failed, like Codex's finalize_turn.
+		m.abortActive()
 		m.flushActive(true)
 		m.commit(errorCell(m.st, "backend closed the event stream"))
 		return m, m.quit()
@@ -1034,7 +1064,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.flash("editor failed: " + msg.err.Error())
 		} else {
-			m.composer.Set(strings.TrimRight(msg.text, "\n"))
+			m.composer.Set(cleanInput(strings.TrimRight(msg.text, "\n")))
 		}
 		return m, nil
 	case hooksTimeoutMsg:
@@ -1065,7 +1095,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.hooksView == nil && m.center == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.hooksView == nil && m.center == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume && !m.forking() {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -1172,7 +1202,9 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 	case protocol.TaskList:
 		m.onTaskList(e)
 	case protocol.HookStarted:
-		m.onHookStarted(e)
+		if !m.replaying { // a replayed start has nothing left to wait for
+			m.onHookStarted(e)
+		}
 	case protocol.HookCompleted:
 		m.onHookCompleted(e)
 	case protocol.SkillsList:
@@ -1208,7 +1240,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 			m.finalizeStream("")
 			m.flushActive(true)
 			m.commit(userCell{text: e.Message, images: e.Images})
-			m.composer.addHistory(e.Message, nil)
+			m.composer.addHistory(cleanInput(e.Message), nil)
 		case m.convo.thread != "":
 			if len(m.sent) > 0 && m.sent[0] == e.Message {
 				m.sent = m.sent[1:] // typed here: already drawn
@@ -1222,8 +1254,12 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		if m.replaying {
 			break
 		}
+		if m.stream.active {
+			m.finalizeStream("") // the last turn's end was lost: don't append to its answer
+		}
 		m.turnHasAgent = false
 		m.interrupted = nil
+		m.hookRuns, m.ended = nil, nil // Codex clear_active_hook_cell: no orphaned rows
 		m.running, m.turnStart = true, time.Now()
 		m.statusHeader, m.statusDetail, m.hadTools = "Working", "", false
 		if e.ContextWindow > 0 {
@@ -1261,6 +1297,9 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		}
 		parsed = m.skills.annotateSkillReads(parsed, cwd)
 		call := &execCall{id: e.CallID, command: e.Command, parsed: parsed, started: time.Now(), user: e.Source == "user_shell"}
+		if old := m.execByID[e.CallID]; old != nil && !old.done {
+			old.done, old.exit = true, 130 // a reused id: the first call's end can't come
+		}
 		m.execByID[e.CallID] = call
 		if n := len(m.active); n > 0 && call.isExploring() {
 			if x, ok := m.active[n-1].(*execCell); ok && x.exploring() {
@@ -1276,6 +1315,13 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		}
 	case protocol.ExecCommandEnd:
 		c := m.execByID[e.CallID]
+		if c == nil && m.ended[e.CallID] {
+			break // a repeated end: the call is already shown
+		}
+		if m.ended == nil {
+			m.ended = map[string]bool{}
+		}
+		m.ended[e.CallID] = true
 		if c == nil { // end without begin: synthesize
 			c = &execCall{id: e.CallID, parsed: []protocol.ParsedCommand{{Kind: protocol.CmdUnknown}}}
 			m.active = append(m.active, &execCell{calls: []*execCall{c}})
@@ -1360,9 +1406,13 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.commit(warningCell(m.st, e.Message))
 	case protocol.Error:
 		m.showPendingHeader()
-		m.awaitingResume = false
-		if !m.replaying {
-			m.lineage = nil // the backend refused the /cd or /fork
+		if m.onMain() {
+			// The backend refused the resume, /cd or /fork. A subagent's
+			// error is about its own work, not about them.
+			m.awaitingResume = false
+			if !m.replaying {
+				m.lineage = nil
+			}
 		}
 		m.finalizeStream("")
 		m.flushActive(true)
@@ -1379,10 +1429,20 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 	return nil
 }
 
+// onMain reports whether the event being handled belongs to the main
+// conversation (not a subagent thread's).
+func (m *model) onMain() bool {
+	t := m.agents.byID[""]
+	return t == nil || t.convo == m.convo
+}
+
 func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 	if m.reasoningPending() {
 		m.finalizeReasoning("")
 	}
+	// A hook whose completion never came would otherwise show (and
+	// tick) for the rest of the session.
+	m.hookRuns = nil
 	if aborted {
 		m.finalizeStream("")
 		// Mark anything still running as failed (Codex marks them red).
@@ -1401,6 +1461,9 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 		} else if last != "" && !m.turnHasAgent {
 			m.finalizeStream(last)
 		}
+		// A call whose end never came (a dropped event) would otherwise
+		// hold every later cell out of scrollback for the whole session.
+		m.abortActive()
 		m.flushActive(true)
 		// A picker still open when the turn completes did not block it (e.g.
 		// the effort step of /model used during the turn), so it stays;
@@ -2135,33 +2198,45 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 }
 
 func (m *model) statusCell() Cell {
-	st := m.st
-	row := func(k, v string) Line { return L(S(fmt.Sprintf("  %-14s", k), st.Dim), P(v)) }
-	lines := []Line{
-		L(S("• ", st.Plain), S(m.agent+" status", st.Bold)),
-		row("Model:", strings.TrimSpace(m.model+" "+m.effort)),
-		row("Directory:", tildePath(m.cwd)),
-	}
+	c := statusRows{title: m.agent + " status"}
+	row := func(k, v string) { c.rows = append(c.rows, [2]string{k, sanitizeLine(v)}) }
+	row("Model:", strings.TrimSpace(m.model+" "+m.effort))
+	row("Directory:", tildePath(m.cwd))
 	if m.permissions != "" {
-		lines = append(lines, row("Permissions:", m.permissions))
+		row("Permissions:", m.permissions)
 	}
 	if m.approvalMode != "" {
-		lines = append(lines, row("Approval:", m.approvalMode))
+		row("Approval:", m.approvalMode)
 	}
 	if m.sessionID != "" {
-		lines = append(lines, row("Session:", m.sessionID))
+		row("Session:", m.sessionID)
 	}
 	if m.forkedFrom != "" {
-		lines = append(lines, row("Forked from:", m.forkedFrom))
+		row("Forked from:", m.forkedFrom)
 	}
-	lines = append(lines, row("Tokens used:", fmt.Sprintf("%d", m.tokensUsed)))
+	row("Tokens used:", fmt.Sprintf("%d", m.tokensUsed))
 	if m.inputTokens > 0 || m.outputTokens > 0 {
-		lines = append(lines, row("", fmt.Sprintf("%s in · %s out", compactCount(m.inputTokens), compactCount(m.outputTokens))))
+		row("", fmt.Sprintf("%s in · %s out", compactCount(m.inputTokens), compactCount(m.outputTokens)))
 	}
 	if m.contextWindow > 0 {
-		lines = append(lines, row("Context:", fmt.Sprintf("%d%% left of %d", m.contextLeft(), m.contextWindow)))
+		row("Context:", fmt.Sprintf("%d%% left of %d", m.contextLeft(), m.contextWindow))
 	}
-	return rawCell(lines)
+	return c
+}
+
+// statusRows is the /status card: a long value (a deep cwd) wraps under
+// itself instead of running past the terminal edge.
+type statusRows struct {
+	title string
+	rows  [][2]string
+}
+
+func (c statusRows) Lines(width int, st *Styles) []Line {
+	out := []Line{L(S("• ", st.Plain), S(sanitizeLine(c.title), st.Bold))}
+	for _, r := range c.rows {
+		out = append(out, Wrap(L(P(r[1])), width, L(S(fmt.Sprintf("  %-14s", r[0]), st.Dim)), L(P(strings.Repeat(" ", 16))))...)
+	}
+	return out
 }
 
 func (m *model) contextLeft() int64 {
@@ -2388,7 +2463,9 @@ func (m *model) View() tea.View {
 		}
 		// On short terminals show the composer rows around the cursor
 		// instead of letting the frame clamp cut off the part being edited.
-		if avail := m.height - 1 - len(bottom) - 1 - len(below); len(rows) > avail && avail >= 1 {
+		// With no room at all, keep the cursor's row: the trim below
+		// then drops the status and queued rows above it instead.
+		if avail := max(1, m.height-1-len(bottom)-1-len(below)); len(rows) > avail {
 			start := max(0, min(crow-avail+1, len(rows)-avail))
 			rows, crow = rows[start:start+avail], crow-start
 		}

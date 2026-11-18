@@ -565,6 +565,11 @@ func hookQuietSuccess(e protocol.HookCompleted) bool {
 
 func (m *model) onHookStarted(e protocol.HookStarted) {
 	m.finalizeStream("")
+	if m.running {
+		// The hook shows in the status row; bring it back if the
+		// committed answer hid it (Codex ensure_status_indicator).
+		m.statusHidden = false
+	}
 	now := time.Now()
 	for _, r := range m.hookRuns {
 		if r.id == e.RunID {

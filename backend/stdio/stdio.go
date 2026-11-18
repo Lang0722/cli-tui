@@ -175,6 +175,12 @@ func (b *Backend) handleLine(line []byte) {
 		return
 	}
 	ev, err := protocol.UnmarshalEvent(line)
+	var unknown *protocol.UnknownTypeError
+	if errors.As(err, &unknown) {
+		// A newer backend's event: well-formed, just not one we draw.
+		fmt.Fprintf(b.log, "agenttui: skipped event of unknown type %q\n", unknown.Type)
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(b.log, "agenttui: bad event: %v: %.500s\n", err, line)
 		b.mu.Lock()

@@ -362,6 +362,7 @@ func (m *model) rewindTo(cellIdx int) tea.Cmd {
 	}
 	m.submit(protocol.Rewind{UserMessageIndex: n})
 	m.committed = m.committed[:cellIdx]
+	m.edits++
 	m.committed = append(m.committed, infoCell(m.st, "Conversation reverted to this point. File changes are unchanged."))
 	m.queued = nil // Codex clears the input queue on revert
 	m.restorePrompt(uc)

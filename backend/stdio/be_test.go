@@ -36,7 +36,7 @@ sys.stdout.write('{"id":"1","msg":{"type":"task_complete"}}\n'); sys.stdout.flus
 		t.Fatal(err)
 	}
 	var got []string
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(10 * raceSlowdown * time.Second)
 	for {
 		select {
 		case ev, ok := <-b.Events():
@@ -48,7 +48,7 @@ sys.stdout.write('{"id":"1","msg":{"type":"task_complete"}}\n'); sys.stdout.flus
 			}
 			got = append(got, protocol.EventType(ev.Msg))
 		case <-timeout:
-			t.Errorf("events channel never closed after 10s; got %v; log=%q (child pid %d still alive: %v)", got, log.String(), b.cmd.Process.Pid, alive(b.cmd))
+			t.Errorf("events channel never closed in time; got %v; log=%q (child pid %d still alive: %v)", got, log.String(), b.cmd.Process.Pid, alive(b.cmd))
 			b.cmd.Process.Kill()
 			return
 		}
@@ -115,5 +115,37 @@ func TestBeGrandchildHoldsStdout(t *testing.T) {
 		t.Logf("closed=%v", !ok)
 	case <-time.After(3 * time.Second):
 		t.Errorf("agent process exited but Events() still open after 3s (stdout held by its background child)")
+	}
+}
+
+// An event of a type this UI doesn't know (a newer backend) is skipped
+// quietly; a malformed one is still reported.
+func TestBeUnknownTypeIsNotMalformed(t *testing.T) {
+	script := `import sys
+sys.stdout.write('{"id":"1","msg":{"type":"brand_new_event","x":1}}\n')
+sys.stdout.write('{"id":"1","msg":{"type":"exec_command_end","call_id":"c","exit_code":{}}}\n')
+sys.stdout.flush()
+`
+	b, err := Start(context.Background(), &syncBuf{}, "python3", "-c", script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warnings []string
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case ev, ok := <-b.Events():
+			if !ok {
+				if len(warnings) != 1 || !strings.Contains(warnings[0], "exec_command_end") {
+					t.Errorf("warnings = %q", warnings)
+				}
+				return
+			}
+			if w, ok := ev.Msg.(protocol.Warning); ok {
+				warnings = append(warnings, w.Message)
+			}
+		case <-timeout:
+			t.Fatal("events channel never closed")
+		}
 	}
 }

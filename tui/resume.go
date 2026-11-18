@@ -261,11 +261,14 @@ func (m *model) showPendingHeader() {
 // onSessionConfigured prints the header for a new session, or the header
 // plus the replayed transcript for a resumed one.
 func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
-	if e.AgentName != "" {
-		m.agent = e.AgentName
+	// Backend strings reach scrollback (headers, /status, decision rows):
+	// strip control sequences once here.
+	if a := sanitizeLine(e.AgentName); a != "" {
+		m.agent = a
 	}
-	m.model, m.effort, m.version, m.sessionID = e.Model, e.ReasoningEffort, e.Version, e.SessionID
+	m.model, m.effort, m.version, m.sessionID = sanitizeLine(e.Model), sanitizeLine(e.ReasoningEffort), sanitizeLine(e.Version), e.SessionID
 	m.forkedFrom, m.sessionReady = sanitizeLine(e.ForkedFrom), true
+	m.hookRuns = nil
 	// A /cd or /fork is answered with the session as it continues.
 	defer m.lineageDone()
 	m.permissions, m.approvalMode = sanitizeLine(e.Permissions), sanitizeLine(e.ApprovalMode)
@@ -317,7 +320,7 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 	if m.lineage != nil {
 		return cmd // lineageDone says what changed instead
 	}
-	m.commit(textCell{bullet: S("↻", m.st.Accent), body: L(S("Resumed session ", m.st.Dim), S(e.SessionID, m.st.Plain),
+	m.commit(textCell{bullet: S("↻", m.st.Accent), body: L(S("Resumed session ", m.st.Dim), S(sanitizeLine(e.SessionID), m.st.Plain),
 		S(fmt.Sprintf(" · %d events · continue below", len(e.InitialMessages)), m.st.Dim))})
 	return cmd
 }
@@ -330,10 +333,10 @@ func (m *model) onSessionUpdated(e protocol.SessionUpdated) tea.Cmd {
 	}
 	model, effort := m.model, m.effort
 	if e.Model != "" {
-		model = e.Model
+		model = sanitizeLine(e.Model)
 	}
 	if e.ReasoningEffort != "" {
-		effort = e.ReasoningEffort
+		effort = sanitizeLine(e.ReasoningEffort)
 	}
 	if model != m.model || effort != m.effort {
 		m.model, m.effort = model, effort

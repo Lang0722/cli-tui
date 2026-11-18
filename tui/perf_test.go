@@ -161,7 +161,11 @@ func BenchmarkPagerFrame(b *testing.B) {
 	m.View()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ev(m, protocol.AgentMessageDelta{Delta: "more "})
+		d := "more "
+		if i%100 == 99 {
+			d = "\n\n" // keep paragraphs answer-sized, so the cost doesn't grow with b.N
+		}
+		ev(m, protocol.AgentMessageDelta{Delta: d})
 		m.View()
 	}
 }

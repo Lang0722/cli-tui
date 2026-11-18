@@ -217,7 +217,7 @@ func decisionCell(a *approval, d protocol.ReviewDecision, agent string, st *Styl
 		n := len(a.changes)
 		if n == 1 {
 			for p := range a.changes {
-				what = "edit " + relPath(a.cwd, p)
+				what = "edit " + sanitizeLine(relPath(a.cwd, p))
 			}
 		} else {
 			what = "edit " + itoa(n) + " files"

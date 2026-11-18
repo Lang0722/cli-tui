@@ -127,6 +127,8 @@ func normalize(v any, t reflect.Type, field string) any {
 		return v
 	}
 	switch t.Kind() {
+	case reflect.Ptr: // optional fields (*int): the same leniency
+		return normalize(v, t.Elem(), field)
 	case reflect.Struct:
 		m, ok := v.(map[string]any)
 		if !ok {
@@ -177,13 +179,25 @@ func normalize(v any, t reflect.Type, field string) any {
 		default:
 			return v
 		}
-		if i, err := num.Int64(); err == nil {
-			return i
+		f, err := num.Float64()
+		if i, ierr := num.Int64(); ierr == nil {
+			f, err = float64(i), nil
+			if fitsInt(t, i) {
+				return i
+			}
 		}
-		if f, err := num.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-			return int64(math.Round(f)) // e.g. Python's (time.time()-t0)*1000
+		if err != nil || math.IsNaN(f) {
+			return v
 		}
-		return v
+		// e.g. Python's (time.time()-t0)*1000. Out of range clamps rather
+		// than wrapping (1e30 is not a negative exit code) or failing the
+		// whole event.
+		lo, hi := intRange(t)
+		c := math.Max(lo, math.Min(hi, math.Round(f)))
+		if lo == 0 {
+			return uint64(c)
+		}
+		return int64(c) // exact, unlike a float64 re-encoded as JSON
 	case reflect.String:
 		if n, ok := v.(json.Number); ok {
 			return n.String()
@@ -191,6 +205,28 @@ func normalize(v any, t reflect.Type, field string) any {
 		return v
 	}
 	return v
+}
+
+// intRange is the range of an integer kind, as float64 bounds that
+// encoding/json accepts for it.
+func intRange(t reflect.Type) (lo, hi float64) {
+	bits := t.Bits()
+	switch t.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if bits == 64 {
+			return 0, math.Nextafter(math.MaxUint64, 0) // 2^64 itself overflows
+		}
+		return 0, float64(uint64(1)<<bits - 1)
+	}
+	if bits == 64 {
+		return math.MinInt64, math.Nextafter(math.MaxInt64, 0)
+	}
+	return -float64(int64(1) << (bits - 1)), float64(int64(1)<<(bits-1) - 1)
+}
+
+func fitsInt(t reflect.Type, i int64) bool {
+	lo, hi := intRange(t)
+	return float64(i) >= lo && float64(i) <= hi
 }
 
 // MarshalEvent encodes an Event as a single JSON line (without newline).
@@ -260,6 +296,8 @@ func (l *EventList) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*l = (*l)[:0]
+	bad := 0
+	var first error
 	for _, r := range raws {
 		v, err := decodeTagged(r, eventTypes)
 		var unknown *UnknownTypeError
@@ -267,9 +305,16 @@ func (l *EventList) UnmarshalJSON(data []byte) error {
 			continue // a newer event type: skip it, keep the rest of the history
 		}
 		if err != nil {
-			return err
+			// One malformed entry must not lose the whole session.
+			if bad++; first == nil {
+				first = err
+			}
+			continue
 		}
 		*l = append(*l, v.(EventMsg))
+	}
+	if bad > 0 {
+		*l = append(*l, Warning{Message: fmt.Sprintf("skipped %d unreadable history %s (%v)", bad, plural(bad, "entry", "entries"), first)})
 	}
 	return nil
 }
@@ -281,4 +326,11 @@ func rawID(raw json.RawMessage) string {
 		return s
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

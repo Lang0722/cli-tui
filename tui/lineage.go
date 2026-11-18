@@ -112,8 +112,18 @@ func (m *model) forkSession(name string) tea.Cmd {
 }
 
 // hasUserTurn reports whether the current session has a prompt on screen.
-func (m *model) hasUserTurn() bool {
-	for _, c := range m.committed[min(m.sessionStart, len(m.committed)):] {
+func (m *model) hasUserTurn() bool { return m.mainConvo().hasUserTurn() }
+
+// mainConvo is the main conversation, whichever thread is on screen.
+func (m *model) mainConvo() *convo {
+	if t := m.agents.byID[""]; t != nil {
+		return t.convo
+	}
+	return m.convo
+}
+
+func (c *convo) hasUserTurn() bool {
+	for _, c := range c.committed[min(c.sessionStart, len(c.committed)):] {
 		if u, ok := c.(userCell); ok && !u.command {
 			return true
 		}

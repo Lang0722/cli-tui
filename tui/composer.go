@@ -14,10 +14,11 @@ type composer struct {
 	text   []rune
 	cursor int // index into text
 
-	history    []string
-	histPastes []map[string]string // paste and image placeholders per history entry
-	histIdx    int                 // len(history) when not browsing
-	histDraft  string
+	history     []string
+	histPastes  []map[string]string // paste and image placeholders per history entry
+	histIdx     int                 // len(history) when not browsing
+	histDraft   string
+	histDraftPH map[string]string // the draft's pastes and images, restored with it
 	// recalled is the text of the entry history navigation last put in the
 	// editor; Up/Down keep browsing only while the editor still holds it.
 	recalled   string
@@ -88,17 +89,23 @@ func (c *composer) insert(s string) {
 
 // Paste inserts pasted text; very large pastes collapse into a placeholder
 // that is expanded on submit (as in Codex).
-func (c *composer) Paste(s string) {
+// cleanInput makes outside text (a paste, the external editor's file, a
+// replayed prompt) safe for the editor. Tabs render as several cells (and
+// other controls as escapes), which would break the row layout: expand
+// tabs and drop control characters.
+func cleanInput(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
-	// Tabs render as several cells (and other controls as escapes), which
-	// would break the row layout: expand tabs and drop control characters.
-	s = strings.Map(func(r rune) rune {
+	return strings.Map(func(r rune) rune {
 		if r != '\n' && r != '\t' && (r < 0x20 || r == 0x7f || r >= 0x80 && r <= 0x9f) {
 			return -1
 		}
 		return r
 	}, expandTabs(s))
+}
+
+func (c *composer) Paste(s string) {
+	s = cleanInput(s)
 	if n := len([]rune(s)); n > 1000 {
 		c.pasteCount++
 		ph := fmt.Sprintf("[Pasted Content %d chars]", n)
@@ -281,6 +288,35 @@ func (c *composer) addHistory(text string, pastes map[string]string) {
 	c.histIdx = len(c.history)
 }
 
+// placeholderContents copies the paste and image contents behind the editor's
+// placeholders. Recalling history merges an entry's into them, and its
+// placeholder names can equal the draft's ("[Pasted Content 1500 chars]"),
+// so going back to the draft restores this copy.
+func (c *composer) placeholderContents() map[string]string {
+	out := make(map[string]string, len(c.pastes)+len(c.images))
+	for k, v := range c.pastes {
+		out[k] = v
+	}
+	for k, v := range c.images {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *composer) restorePlaceholders(ph map[string]string) {
+	if ph == nil {
+		return
+	}
+	c.pastes, c.images = map[string]string{}, map[string]string{}
+	for k, v := range ph {
+		if strings.HasPrefix(k, "[Image #") {
+			c.images[k] = v
+		} else {
+			c.pastes[k] = v
+		}
+	}
+}
+
 // recall loads history entry i into the editor, restoring its pastes and
 // images.
 func (c *composer) recall(i int) {
@@ -306,7 +342,7 @@ func (c *composer) historyPrev() bool {
 		return false
 	}
 	if c.histIdx == len(c.history) {
-		c.histDraft = string(c.text)
+		c.histDraft, c.histDraftPH = string(c.text), c.placeholderContents()
 	}
 	c.histIdx--
 	c.recall(c.histIdx)
@@ -320,6 +356,7 @@ func (c *composer) historyNext() bool {
 	c.histIdx++
 	if c.histIdx == len(c.history) {
 		c.Set(c.histDraft)
+		c.restorePlaceholders(c.histDraftPH)
 		c.isRecalled = false // past the newest: browsing ends
 	} else {
 		c.recall(c.histIdx)

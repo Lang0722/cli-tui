@@ -78,6 +78,7 @@ func (m *model) upsertThread(id string) *agentThread {
 	if h := m.agents.byID[""].convo.lastHeader; h != nil {
 		hc := *h
 		t.convo.lastHeader, t.convo.committed = &hc, []Cell{hc}
+		t.convo.edits++
 	}
 	return t
 }
@@ -121,6 +122,7 @@ func (m *model) observe(ev protocol.Event) (closedViewing string) {
 			t.convo.lastHeader = &h
 			if len(t.convo.committed) == 1 {
 				t.convo.committed[0] = h
+				t.convo.edits++
 			}
 		}
 	case protocol.ThreadClosed:

@@ -80,3 +80,26 @@ func TestMockChangeDirectory(t *testing.T) {
 		t.Fatalf("missing dir: %v", evs)
 	}
 }
+
+// A fresh session's id is announced up front (and again after /new), so
+// the UI can tell which listed task is the one on screen.
+func TestMockAnnouncesTheFreshSessionID(t *testing.T) {
+	b, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := lastConfigured(t, collect(b, configuredEv, 2*time.Second))
+	if first.SessionID == "" {
+		t.Fatal("startup session_configured has no session id")
+	}
+	b.Submit(context.Background(), protocol.UserInput{Text: "hello"})
+	collect(b, endOfTurn, 10*time.Second)
+	if got := b.session().Meta.ID; got != first.SessionID {
+		t.Errorf("the turn went to session %q, announced %q", got, first.SessionID)
+	}
+	b.Submit(context.Background(), protocol.SlashCommand{Name: "new"})
+	next := lastConfigured(t, collect(b, configuredEv, 2*time.Second))
+	if next.SessionID == "" || next.SessionID == first.SessionID {
+		t.Errorf("/new announced %q after %q", next.SessionID, first.SessionID)
+	}
+}

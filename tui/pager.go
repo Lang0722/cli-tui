@@ -24,11 +24,15 @@ type pager struct {
 	static []Line
 	st     *Styles
 
-	cells  int // committed cells already rendered into lines
-	width  int
-	lines  []Line
-	offset int
-	follow bool // stick to the bottom as content grows
+	cells int // committed cells already rendered into lines
+	// version identifies the cells rendered so far (conversation and
+	// edit count); when it changes they are rendered again.
+	version func() any
+	ver     any
+	width   int
+	lines   []Line
+	offset  int
+	follow  bool // stick to the bottom as content grows
 
 	backtrack *backtrackState // Esc Esc prompt browsing, nil otherwise
 	cellStart []int           // first line of each committed cell
@@ -43,6 +47,11 @@ type pager struct {
 
 func newTranscriptPager(source func() []Cell, live func(int) []Line, st *Styles) *pager {
 	return &pager{title: "T R A N S C R I P T", source: source, live: live, st: st, follow: true, offset: 1 << 30}
+}
+
+type pagerVersion struct {
+	c     *convo
+	edits int
 }
 
 func newStaticPager(title string, lines []Line, st *Styles) *pager {
@@ -87,11 +96,15 @@ func (p *pager) content(width int) pagerLines {
 		}
 		return pagerLines{base: p.lines}
 	}
-	if width != p.width {
-		p.width, p.cells, p.lines, p.cellStart = width, 0, nil, nil
-		p.lower, p.found = nil, pagerFound{}
+	var ver any
+	if p.version != nil {
+		ver = p.version()
 	}
 	cells := p.source()
+	if width != p.width || ver != p.ver || len(cells) < p.cells {
+		p.width, p.ver, p.cells, p.lines, p.cellStart = width, ver, 0, nil, nil
+		p.lower, p.found = nil, pagerFound{}
+	}
 	for ; p.cells < len(cells); p.cells++ {
 		if len(p.lines) > 0 {
 			p.lines = append(p.lines, Line{})

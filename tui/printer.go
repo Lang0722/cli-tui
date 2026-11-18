@@ -34,7 +34,11 @@ type printer struct {
 	held    holdReason
 	busy    bool // a line is being handed to the program
 	stopped bool
-	wake    chan struct{}
+	// resumeAt delays output after an alternate-screen view closes, until
+	// the frame that leaves the alt screen has been drawn: printed sooner,
+	// the lines would land in the alt buffer and vanish with it.
+	resumeAt time.Time
+	wake     chan struct{}
 }
 
 // holdReason says why output is paused; output flows when none is set.
@@ -45,6 +49,8 @@ const (
 	holdClear                         // the terminal is being cleared for a reflow
 	holdPicker                        // alt-screen resume picker is open
 	holdCenter                        // alt-screen agent command center is open
+
+	altHolds = holdPager | holdPicker | holdCenter
 )
 
 func newPrinter() *printer {
@@ -79,6 +85,9 @@ func (p *printer) hold(r holdReason, on bool) {
 	if on {
 		p.held |= r
 	} else {
+		if p.held&r&altHolds != 0 {
+			p.resumeAt = time.Now().Add(frameFlush)
+		}
 		p.held &^= r
 	}
 	p.mu.Unlock()
@@ -89,6 +98,9 @@ func (p *printer) hold(r holdReason, on bool) {
 // releaseAll resumes output regardless of reason (quitting).
 func (p *printer) releaseAll() {
 	p.mu.Lock()
+	if p.held&altHolds != 0 {
+		p.resumeAt = time.Now().Add(frameFlush)
+	}
 	p.held = 0
 	p.mu.Unlock()
 	p.signal()
@@ -140,7 +152,11 @@ func (p *printer) run(println func(...any), printed func()) {
 				p.cond.Broadcast()
 				break
 			}
-			if wait := settle - time.Since(p.queued[0]); wait > 0 {
+			wait := settle - time.Since(p.queued[0])
+			if w := time.Until(p.resumeAt); w > wait {
+				wait = w
+			}
+			if wait > 0 {
 				p.mu.Unlock()
 				flush()
 				time.Sleep(wait)

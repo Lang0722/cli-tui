@@ -211,6 +211,11 @@ type model struct {
 	forkedFrom                         string // session this one was forked from
 	sessionReady                       bool   // a session_configured arrived
 
+	// /hooks (hooks.go)
+	hooksView   *hooksBrowser
+	hooksWanted bool // a list_hooks is waiting for its answer
+	hooksGen    int
+
 	// /cd or /fork waiting for the backend (lineage.go)
 	lineage    *lineageOp
 	lineageGen int
@@ -307,6 +312,8 @@ type convo struct {
 	statusHidden bool
 
 	// tokens
+	hookRuns []*hookRun // hooks running (hooks.go)
+
 	tokensUsed, contextWindow int64
 	inputTokens, outputTokens int64
 	planDone, planTotal       int
@@ -970,6 +977,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composer.Set(strings.TrimRight(msg.text, "\n"))
 		}
 		return m, nil
+	case hooksTimeoutMsg:
+		m.onHooksTimeout(msg)
+		return m, nil
 	case lineageTimeoutMsg:
 		m.onLineageTimeout(msg)
 		return m, nil
@@ -992,7 +1002,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.hooksView == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -1019,6 +1029,9 @@ func (m *model) backendEvent(ev protocol.Event) tea.Cmd {
 
 func (m *model) needsTick() bool {
 	if m.running || m.awaitingList || m.awaitingResume || m.needsAction() || time.Now().Before(m.hintUntil) {
+		return true
+	}
+	if m.pruneHookRuns(time.Now()) {
 		return true
 	}
 	for _, c := range m.active {
@@ -1091,6 +1104,12 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		return m.onSessionUpdated(e)
 	case protocol.SlashCommands:
 		m.setBackendCommands(e.Commands)
+	case protocol.HooksList:
+		m.onHooksList(e)
+	case protocol.HookStarted:
+		m.onHookStarted(e)
+	case protocol.HookCompleted:
+		m.onHookCompleted(e)
 	case protocol.SkillsList:
 		m.onSkillsList(e)
 	case protocol.CollabToolCall:
@@ -1428,7 +1447,7 @@ func (m *model) keyContexts() []string {
 		return []string{"pager"}
 	case len(m.approvals) > 0:
 		return []string{"approval", "list", "global"}
-	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.skills.view != nil, m.agents.picker != nil:
+	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.skills.view != nil, m.hooksView != nil, m.agents.picker != nil:
 		return []string{"list"}
 	case m.awaitingList || m.awaitingResume, m.forking():
 		return nil
@@ -1521,6 +1540,9 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	}
 	if m.skills.view != nil {
 		return m.handleSkillsToggleKey(k, act)
+	}
+	if m.hooksView != nil {
+		return m.handleHooksKey(k, act)
 	}
 	if m.agents.picker != nil {
 		return m.handleAgentPickerKey(k, act)
@@ -2016,6 +2038,8 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return m.changeDirectory(args)
 	case "fork":
 		return m.forkSession(args)
+	case "hooks":
+		return m.openHooks()
 	case "statusline":
 		return m.surfaceCommand(surfaceStatus, args)
 	case "title":
@@ -2194,6 +2218,7 @@ func (m *model) View() tea.View {
 	if m.running && !m.statusHidden && !(m.stream.active && m.stream.emitted > 0) {
 		bottom = append(bottom, m.statusLines(w)...)
 	}
+	bottom = append(bottom, m.hookActivityLines(w)...)
 	queued := m.queuedLines(w)
 	if modal := len(m.approvals) > 0 || len(m.selections) > 0; modal && len(queued) > 3 {
 		// An open approval/question needs the room more than the preview.
@@ -2214,6 +2239,8 @@ func (m *model) View() tea.View {
 		bottom = append(bottom, m.surface.Lines(w, m.surfacePreview(), st)...)
 	} else if m.skills.view != nil {
 		bottom = append(bottom, m.skills.view.Lines(w, st)...)
+	} else if m.hooksView != nil {
+		bottom = append(bottom, m.hooksView.Lines(w, st)...)
 	} else if m.agents.picker != nil {
 		bottom = append(bottom, m.agentPickerLines(w)...)
 	} else if m.keymapUI != nil {
@@ -2324,6 +2351,9 @@ func (m *model) statusLines(w int) []Line {
 	l := L(S("• ", st.Dim))
 	l = append(l, st.Shimmer(header)...)
 	l = append(l, S(" ("+fmtElapsed(time.Since(m.turnStart))+" • ", st.Dim), S("esc", st.Dim.Bold(true)), S(" to interrupt)", st.Dim))
+	if h := m.hookStatus(); h != "" {
+		l = append(l, S(" · "+h, st.Dim)) // Codex appends the running hook's message
+	}
 	out := []Line{{}, l.Truncate(w)}
 	if m.statusDetail != "" {
 		out = append(out, Wrap(L(S(sanitize(m.statusDetail), st.Dim)), w, L(S("  └ ", st.Dim)), L(P("    ")))...)

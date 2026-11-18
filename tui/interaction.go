@@ -253,7 +253,7 @@ type restoreViewportMsg struct{}
 // overlayShown reports whether the bottom pane shows an overlay in place of
 // (or above) the composer.
 func (m *model) overlayShown() bool {
-	return len(m.approvals) > 0 || len(m.selections) > 0 || m.surface != nil || m.skills.view != nil || m.agents.picker != nil ||
+	return len(m.approvals) > 0 || len(m.selections) > 0 || m.surface != nil || m.skills.view != nil || m.hooksView != nil || m.agents.picker != nil ||
 		m.keymapUI != nil || m.shortcuts
 }
 

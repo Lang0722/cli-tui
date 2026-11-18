@@ -32,6 +32,7 @@ var DefaultCommands = []Command{
 	{Name: "model", Description: "choose what model and reasoning effort to use", DuringTask: true},
 	{Name: "approvals", Description: "choose what the agent can do without approval", DuringTask: true},
 	{Name: "skills", Description: "use skills to improve how the agent performs specific tasks", Local: true, DuringTask: true},
+	{Name: "hooks", Description: "view and manage lifecycle hooks", Local: true, DuringTask: true},
 	{Name: "new", Description: "start a new chat during a conversation"},
 	{Name: "fork", Description: "fork the current chat", Local: true},
 	{Name: "init", Description: "create an AGENTS.md file with instructions for the agent"},

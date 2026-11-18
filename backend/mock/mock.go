@@ -47,6 +47,7 @@ type Backend struct {
 	active    *turn                // the running turn, if any
 	agents    map[string]*subagent // open helper threads (agents.go)
 	cur       *sessionFile         // nil until the first message of a new session
+	hooks     []protocol.HookInfo  // /hooks (hooks.go)
 
 	// Submit only enqueues; ops run in order on the mock's own goroutine so
 	// the UI never waits on disk writes, sleeps or event-channel sends.
@@ -73,6 +74,7 @@ func New(dir string) (*Backend, error) {
 		effort:    effort,
 		access:    1,
 		opWake:    make(chan struct{}, 1),
+		hooks:     demoHooks(),
 	}
 	if list, err := b.store.list(); err == nil && len(list) == 0 {
 		if err := seedDemo(&b.store, cwd); err != nil {
@@ -337,6 +339,12 @@ func (b *Backend) handle(op protocol.Op) {
 		if err := b.setSkillEnabled(op.Path, op.Enabled); err != nil {
 			b.notice(protocol.Error{Message: "Failed to update skill config for " + op.Path + ": " + err.Error()})
 		}
+	case protocol.ListHooks:
+		b.notice(b.hooksList())
+	case protocol.SetHookEnabled:
+		b.setHookEnabled(op.Key, op.Enabled)
+	case protocol.TrustHooks:
+		b.trustHooks(op.Keys)
 	case protocol.ChangeDirectory:
 		b.changeDir(op.Cwd)
 	case protocol.ForkSession:

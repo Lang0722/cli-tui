@@ -89,6 +89,8 @@ func (t *turn) run(text string) {
 		ok = t.delegateDemo()
 	case containsAny(lower, "demo", "timeout", "fix", "edit", "refactor"):
 		ok = t.toolDemo(text)
+	case containsAny(lower, "hook"):
+		ok = t.hooksDemo()
 	case containsAny(lower, "markdown", "table"):
 		ok = t.markdownShowcase()
 	case containsAny(lower, "math", "latex", "formula", "equation"):

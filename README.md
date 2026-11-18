@@ -72,13 +72,15 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | `question` | a mid-turn question picker (choose, or type your own answer) |
 | `subagents` / `agents` | two helper agents: spawn, a worker's approval from its own thread, wait, close (watch them with Alt+←/→ or `/subagents`) |
 | `delegate` | a parent-owned `/root/reviewer` agent (activity rows, read-only view) |
+| `hooks` | lifecycle hooks around a command: a prompt hook that only adds context, a policy hook that blocks the command, and (once trusted in `/hooks`) a failing Stop hook |
 | `error` | an error event |
 | `!ls -la` | a real shell command you run ("You ran") |
 | `$` | the skill popup; pick one (e.g. `$repo-scout map the code`) and the agent reads its `SKILL.md` and follows it |
 | `/model`, `/approvals` | backend-driven pickers |
 
 Then try Ctrl+T (transcript), Esc Esc (rewind to an earlier prompt), Ctrl+R
-(history search), `/skills` (enable or disable the demo skills), `/export`,
+(history search), `/skills` (enable or disable the demo skills), `/hooks`
+(turn the demo hooks on or off, trust new ones), `/fork`, `/cd ..`, `/export`,
 and quitting followed by `./agenttui resume -last`.
 Sessions live in `$XDG_DATA_HOME/agenttui/mock-sessions` (by default
 `~/.local/share/agenttui/mock-sessions`). Use `-sessions DIR` to change that,
@@ -147,6 +149,10 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 | `list_sessions` / `resume_session{id}` | resume picker / chosen session (an empty id means the most recent). If the session can't be loaded, send an `error`. |
 | `list_skills{cwd,force_reload?}` | after each `session_configured` and directory change, and with `force_reload` when the Enable/Disable Skills view closes; reply with `skills_list` |
 | `set_skill_enabled{path,enabled}` | a skill toggled in `/skills`; persist it (report failures with `error`) |
+| `change_directory{cwd}` | `/cd [path]`: an existing directory, already resolved against the current one (`~` expanded). Answer with `session_configured` (`resumed:true`, the conversation in `initial_messages`, the new `cwd`), or just `session_updated{cwd}`; report failures with `error` |
+| `fork_session{name?}` | `/fork [name]`: copy the conversation into a new session and continue there. Answer with the new session's `session_configured` (`resumed:true`, `initial_messages`, `forked_from` = the parent's id, `forked_from_title`, and `title` = `name` if given) |
+| `list_hooks` | `/hooks`; reply with `hooks_list` |
+| `set_hook_enabled{key,enabled}` / `trust_hooks{keys}` | a hook toggled or trusted in `/hooks`; persist it (report failures with `error`, e.g. `Failed to update hook config: …`) |
 | `shutdown` | UI exit |
 
 `user_input`, `interrupt`, `shell_command`, the approvals and
@@ -177,6 +183,8 @@ Every event is optional. A turn is framed by `task_started` … `task_complete`
 | `selection_request{id,title,items,allow_freeform}` | a picker in place of the composer (digits, j/k, search when there are more than 9 items) |
 | `session_list` | the resume picker |
 | `skills_list{skills:[{name,display_name?,description?,short_description?,path,enabled,scope?}],errors?:[{path,message}]}` | the skills catalog for `$` mentions and `/skills` (disabled skills included; `plugin:skill` names show as `skill (plugin)`). New `errors` print `⚠ Skipped loading N skill(s) due to invalid SKILL.md files.` and one `⚠ path: message` line each. Reads of a listed `SKILL.md` show as `Read SKILL.md (name skill)`. Can also be sent unprompted. |
+| `hooks_list{hooks:[{key,event,matcher?,source?,source_path?,plugin_id?,handler?,command?,async?,timeout_sec?,context_limit?,status_message?,enabled,trust}],warnings?,errors?}` | the `/hooks` browser. `event` is a Codex hook event (`PreToolUse`, `Stop`, …); `trust` is `managed`, `trusted`, `untrusted` or `modified` (the last two need review before they run). |
+| `hook_started{run_id,event,status_message}` / `hook_completed{run_id,status,output:[{kind,text}]}` | a hook run: after 300 ms its message joins the status row (`· checking command policy`). A completed run whose output is only `context` leaves nothing; others print `• Blocked by hook` / `• Hook failed` / `• Hook stopped` with `  └ ` output lines, or `↳ Hook · warning`. `status` is `completed`, `failed`, `blocked` or `stopped`; `kind` is `warning`, `stop`, `feedback`, `context` or `error`. |
 | `token_count` | `N% context left` (or `NK used`) |
 | `error` / `warning` / `background_event` | `■` red, `⚠`, dim `•` |
 | `stream_error` | a transient detail line under the status row |
@@ -209,14 +217,14 @@ These are the defaults. Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+V / Alt+V and the
 the overlay shows ⇧enter or ⌃j accordingly.
 
 Local slash commands: `/status`, `/diff` (opens a pager), `/transcript`,
-`/resume`, `/copy`, `/export [file]`, `/clear`, `/pwd`, `/mention`,
-`/skills`, `/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. The other built-in
+`/resume`, `/copy`, `/export [file]`, `/clear`, `/cd [path]`, `/pwd`, `/fork [name]`,
+`/mention`, `/skills`, `/hooks`, `/statusline`, `/title`, `/keymap`, `/subagents`, `/quit`. The other built-in
 commands, and the ones the backend advertises, are sent as `slash_command`.
 An unknown `/name` is not sent: like Codex it prints
 `Unrecognized command '/name'` and keeps the draft (paths such as
 `/usr/bin/x` and text starting with a space are sent as prompts).
 While a task runs, `/model`, `/approvals`, `/diff`, `/status`, `/copy`,
-`/pwd`, `/mention`, `/skills`, `/transcript`, `/statusline`, `/title`,
+`/pwd`, `/mention`, `/skills`, `/hooks`, `/transcript`, `/statusline`, `/title`,
 `/subagents` and `/quit` still work; the rest wait for the turn to end.
 
 ## Skills
@@ -232,6 +240,26 @@ composer, and the mentioned skills are sent with the prompt in
 searchable `[x]` list where space or Enter toggles a skill
 (`set_skill_enabled`) and Esc closes it with a summary such as
 `Enabled 1 skill, disabled 1 skill`.
+
+## Directories, forks and hooks
+
+`/cd [path]` (default `~`) changes the session's working directory. The
+path is resolved against the current directory and checked first
+(`Cannot access directory …`, `Not a directory: …`); it needs an idle main
+session with nothing queued. The backend's answer redraws the conversation,
+then `• Working directory changed to: ~/dir`.
+
+`/fork [name]` continues the conversation in a copy. While the backend
+creates it, `Forking conversation…` replaces the composer; then the fork is
+redrawn from the top with `• Thread forked from <title> (<id>)` under the
+header and `• Fork created. You can continue here.` at the end. `/status`
+shows `Forked from:`. A session needs at least one prompt to be forked.
+
+`/hooks` lists the backend's lifecycle hooks per event (installed, active
+and needing review). Enter opens an event's hooks with their details;
+space or Enter turns one on or off, `t` trusts the selected hook (or, on
+the events page, all of them), Esc goes back. Managed hooks can't be
+changed, and new or modified hooks must be trusted before they can run.
 
 ## Subagents
 
@@ -457,7 +485,9 @@ snapshots.
     display formula stays in the live area until it closes.
   - Diffs with tints and highlighting.
 - **Terminal and session:** title, notifications, resume, `/copy`,
-  `/export`, `/clear`.
+  `/export`, `/clear`, `/cd`, `/fork`.
+- **Hooks:** the `/hooks` browser (enable, trust, details) and hook run
+  rows and cells.
 - **Subagents:** collab and activity rows, per-thread transcripts,
   `/subagents`, Alt+←/→, cross-thread approvals, parent-owned threads,
   the running-agents feed.
@@ -470,7 +500,7 @@ snapshots.
 - **Codex-specific:** login and onboarding, model catalog and rate-limit
   cards, MCP inventory and elicitation forms, plugins and apps, voice
   and realtime, agents command center and side conversations, worktrees,
-  goals, pets, hooks, Daybreak, update prompts. Generic equivalents are the
+  goals, pets, Daybreak, update prompts. Generic equivalents are the
   backend-driven `selection_request` and slash-command forwarding.
 - **Secondary, not done yet:**
   - The fullscreen "owned transcript" mode, with mouse selection and semantic
@@ -520,12 +550,12 @@ go test ./...
 ## Layout
 
 ```
-protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, wire.go)
+protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, lineage.go, hooks.go, wire.go)
 config/          settings file (TOML)
-backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, real "!" commands
+backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, /cd, /fork, hooks, real "!" commands
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
-                 approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills)
+                 approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills, lineage, hooks)
 cmd/agenttui     entry point
 e2e/             end-to-end tests: the real binary in tmux, driven by keystrokes
 examples/        echo_agent.py reference backend

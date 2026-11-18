@@ -72,8 +72,24 @@ func (d *draft) apply(k string, word string) {
 // Lines stay short so the arrows move between logical lines.
 func TestEditEarlierLinesRendersExactly(t *testing.T) {
 	t.Parallel()
-	r := rand.New(rand.NewSource(1))
 	s := start(t, opts{env: []string{"TERM=xterm-256color"}})
+	editDraft(t, s, rand.New(rand.NewSource(1)), 50)
+}
+
+// The same while a turn streams above the composer: the live area grows,
+// rows move into scrollback and the frame is redrawn around the edits.
+func TestEditDraftWhileStreamingRendersExactly(t *testing.T) {
+	t.Parallel()
+	s := start(t, opts{env: []string{"TERM=xterm-256color"}})
+	s.submit("investigate the failing build")
+	s.running()
+	editDraft(t, s, rand.New(rand.NewSource(2)), 100)
+}
+
+// editDraft types a three-line draft, then makes random edits on it,
+// checking the composer on screen after each key.
+func editDraft(t *testing.T, s *term, r *rand.Rand, steps int) {
+	t.Helper()
 	d := &draft{lines: []string{""}}
 	for i, l := range []string{"Please refactor the server handler", "Also add tests for the validaton path", "Finally update the README file"} {
 		if i > 0 {
@@ -87,7 +103,7 @@ func TestEditEarlierLinesRendersExactly(t *testing.T) {
 	words := []string{"x", "fix", " more", "typo", "ab"}
 	ops := []string{"Up", "Up", "Down", "Left", "Left", "Right", "Home", "End", "BSpace", "BSpace", "BSpace", "TYPE", "TYPE"}
 	var hist []string
-	for step := 0; step < 50; step++ {
+	for step := 0; step < steps; step++ {
 		k, word := ops[r.Intn(len(ops))], words[r.Intn(len(words))]
 		line := d.lines[d.row]
 		switch {
@@ -103,12 +119,16 @@ func TestEditEarlierLinesRendersExactly(t *testing.T) {
 		}
 		d.apply(k, word)
 		hist = append(hist, k)
+		var want []string
+		for _, l := range d.lines {
+			want = append(want, strings.TrimRight(l, " ")) // trailing spaces don't show
+		}
 		var got []string
 		var x, y, prompt int
 		var shown bool
 		ok := false
-		for try := 0; try < 20 && !ok; try++ {
-			time.Sleep(60 * time.Millisecond)
+		for try := 0; try < 30 && !ok; try++ {
+			time.Sleep(50 * time.Millisecond)
 			rows := strings.Split(s.screen(), "\n")
 			prompt, got = -1, nil
 			for i, row := range rows {
@@ -121,11 +141,17 @@ func TestEditEarlierLinesRendersExactly(t *testing.T) {
 				got = append(got, strings.TrimRight(row, " "))
 			}
 			x, y, shown = s.cursor()
-			ok = strings.Join(got, "\n") == strings.Join(d.lines, "\n") && shown && y == prompt+d.row && x == 2+d.col
+			ok = strings.Join(got, "\n") == strings.Join(want, "\n") && shown && y == prompt+d.row && x == 2+d.col
 		}
 		if !ok {
 			t.Fatalf("step %d after %v\nwant rows %q, cursor %d,%d\ngot  rows %q, cursor %d,%d (shown %v)\n%s",
-				step, hist[max(0, len(hist)-8):], d.lines, 2+d.col, prompt+d.row, got, x, y, shown, s.screen())
+				step, hist[max(0, len(hist)-8):], want, 2+d.col, prompt+d.row, got, x, y, shown, s.screen())
+		}
+	}
+	// No stale copy of the composer was left behind in scrollback.
+	if first := strings.TrimRight(d.lines[0], " "); len(first) >= 10 {
+		if c := strings.Count(s.all(), "› "+first); c != 1 {
+			t.Errorf("the draft's first line is on screen or in scrollback %d times", c)
 		}
 	}
 }

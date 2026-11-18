@@ -169,6 +169,7 @@ type streamState struct {
 	active     bool
 	width      int    // width the printed rows were wrapped at
 	base       int    // source offset incremental rendering starts at
+	prefix     string // rendered before src[base:]: the fence of a code block base is inside
 	baseRows   int    // rows rendered from src[:base] (all printed)
 	printed    []Line // the emitted rows
 	tailCache  tailCache
@@ -616,7 +617,7 @@ func (m *model) readyRows(md []mdLine, rows []Line, hold int) []Line {
 // streamSegment renders the source after base.
 func (m *model) streamSegment(src string) []Line {
 	defer m.st.extendHighlights()()
-	return m.segmentRows(src[m.stream.base:], m.stream.base == 0)
+	return m.segmentRows(m.stream.prefix+src[m.stream.base:], m.stream.base == 0)
 }
 
 func (m *model) streamDelta(d string) {
@@ -637,7 +638,7 @@ func (m *model) streamDelta(d string) {
 		return
 	}
 	done := m.st.extendHighlights()
-	md, split, hold := renderMarkdownSplit(src[m.stream.base:i], m.st, m.width-2)
+	md, split, hold := renderMarkdownSplit(m.stream.prefix+src[m.stream.base:i], m.st, m.width-2)
 	done()
 	rows := m.wrapSegment(md, m.stream.base == 0)
 	// A trailing paragraph stays in the live tail: a setext underline on
@@ -650,20 +651,76 @@ func (m *model) streamDelta(d string) {
 		m.stream.emitted = n
 	}
 	m.stream.emittedSrc = i
-	if split > 0 {
-		m.advanceStreamBase(src, i, split, rows)
+	base := m.stream.base
+	if split -= strings.Count(m.stream.prefix, "\n"); split > 0 {
+		k := m.stream.base
+		for n := 0; n < split; n++ {
+			k += strings.IndexByte(src[k:i], '\n') + 1
+		}
+		m.advanceStreamBase(src, i, k, "", rows)
+	}
+	if m.stream.base == base {
+		// Inside a long code block there is no block boundary to restart
+		// from, and every frame would render the whole block: restart
+		// a few lines before its end, behind a copy of its fence.
+		if k, fence, ok := fenceRestart(src, m.stream.base, i, m.stream.prefix); ok {
+			m.advanceStreamBase(src, i, k, fence, rows)
+		}
 	}
 }
 
-// advanceStreamBase moves base to the last block boundary in the emitted
-// source src[base:end] (as the renderer reports it) once rendering from
-// there reproduces the tail of the segment's rows.
-func (m *model) advanceStreamBase(src string, end int, line int, rows []Line) {
-	k := m.stream.base
-	for n := 0; n < line; n++ {
-		k += strings.IndexByte(src[k:end], '\n') + 1
+var noFenceRestart bool // tests: compare with and without restarts
+
+// fenceRestart finds where rendering of src[base:end] (behind prefix) may
+// restart inside a long code block that is still open: the start of a line
+// near the end, and the block's opening fence line to render before it.
+func fenceRestart(src string, base, end int, prefix string) (k int, fence string, ok bool) {
+	const minLines, keep = 48, 8
+	if noFenceRestart {
+		return 0, "", false
 	}
-	tail := m.segmentRows(src[k:end], false)
+	var marker string
+	if prefix != "" {
+		fence = strings.TrimSuffix(prefix, "\n")
+		marker = reFence.FindStringSubmatch(fence)[1]
+	}
+	var starts []int // line starts inside the open block
+	for at := base; at < end; {
+		nl := strings.IndexByte(src[at:end], '\n')
+		line := src[at:]
+		if nl >= 0 {
+			line = src[at : at+nl]
+		} else {
+			line = src[at:end]
+		}
+		switch {
+		case marker == "":
+			if f := reFence.FindStringSubmatch(line); f != nil {
+				marker, fence, starts = f[1], line, starts[:0]
+			}
+		case strings.TrimSpace(line) != "" && strings.Trim(strings.TrimSpace(line), marker[:1]) == "" &&
+			len(strings.TrimSpace(line)) >= len(marker) && len(line)-len(strings.TrimLeft(line, " ")) <= 3:
+			marker = "" // closed
+		default:
+			starts = append(starts, at)
+		}
+		if nl < 0 {
+			break
+		}
+		at += nl + 1
+	}
+	if marker == "" || len(starts) < minLines {
+		return 0, "", false
+	}
+	return starts[len(starts)-keep], fence + "\n", true
+}
+
+// advanceStreamBase moves base to k (a block boundary in the emitted
+// source src[base:end] as the renderer reports it, or a line inside a code
+// block rendered behind prefix) once rendering from there reproduces the
+// tail of the segment's rows.
+func (m *model) advanceStreamBase(src string, end, k int, prefix string, rows []Line) {
+	tail := m.segmentRows(prefix+src[k:end], false)
 	if len(tail) == 0 || len(tail) >= len(rows) || renderLines(tail) != renderLines(rows[len(rows)-len(tail):]) {
 		return // e.g. a fence just opened: wait for its first rendered row
 	}
@@ -671,7 +728,7 @@ func (m *model) advanceStreamBase(src string, end int, line int, rows []Line) {
 		return // rows before the new base are still held back (not printed)
 	}
 	m.stream.baseRows += len(rows) - len(tail)
-	m.stream.base = k
+	m.stream.base, m.stream.prefix = k, prefix
 }
 
 // streamTail is the not-yet-printed part of the answer (the live rows
@@ -705,7 +762,7 @@ func (m *model) rewrapStream() {
 		return
 	}
 	m.stream.width = m.width
-	m.stream.base, m.stream.baseRows = 0, 0
+	m.stream.base, m.stream.baseRows, m.stream.prefix = 0, 0, ""
 	m.stream.printed = nil
 	if m.stream.emitted > 0 {
 		md, _, hold := renderMarkdownSplit(m.stream.src.String()[:m.stream.emittedSrc], m.st, m.width-2)
@@ -2206,6 +2263,24 @@ func (m *model) openEditor() tea.Cmd {
 // ---------------------------------------------------------------------------
 // View
 
+// clipLines cuts rows wider than the terminal, as ratatui clips at the
+// buffer edge. A wider row would wrap, making the inline frame taller than
+// the model counted and pushing stale rows into scrollback. Views size
+// their rows to fit; this only catches the ones that don't.
+func clipLines(lines []Line, w int) []Line {
+	if noFrameClip {
+		return lines
+	}
+	for i, l := range lines {
+		if l.Width() > w {
+			lines[i] = l.Truncate(w)
+		}
+	}
+	return lines
+}
+
+var noFrameClip bool // tests: find rows that rely on clipLines
+
 func (m *model) View() tea.View {
 	if m.quitting {
 		return tea.NewView("")
@@ -2219,7 +2294,7 @@ func (m *model) View() tea.View {
 	if m.center != nil {
 		// Codex draws the command center over the whole screen.
 		m.center.refreshCurrent(m)
-		v := tea.NewView(renderLines(m.center.Lines(m.width, m.height, m.keys, m.st)))
+		v := tea.NewView(renderLines(clipLines(m.center.Lines(m.width, m.height, m.keys, m.st), m.width)))
 		v.AltScreen = true
 		v.WindowTitle = m.title()
 		return v
@@ -2231,7 +2306,7 @@ func (m *model) View() tea.View {
 		if len(lines) > m.height {
 			lines = lines[:m.height]
 		}
-		v := tea.NewView(renderLines(lines))
+		v := tea.NewView(renderLines(clipLines(lines, m.width)))
 		v.AltScreen = true
 		v.WindowTitle = m.title()
 		return v
@@ -2350,7 +2425,7 @@ func (m *model) View() tea.View {
 		bottom = bottom[over:]
 		cursorRow -= over
 	}
-	all := append(top, bottom...)
+	all := clipLines(append(top, bottom...), w)
 	content := renderLines(all)
 	if m.printSeq > 0 {
 		// Differs from every earlier frame but draws the same: Bubble
@@ -2416,7 +2491,7 @@ func (m *model) queuedLines(w int) []Line {
 		out = append(out, rows...)
 	}
 	if k := m.keys.primary("chat.edit_queued_message"); k != "" {
-		out = append(out, L(P("    "), S(k, st.Bold), S(" edit last queued message", st.Dim)))
+		out = append(out, L(P("    "), S(k, st.Bold), S(" edit last queued message", st.Dim)).Truncate(w))
 	}
 	return out
 }

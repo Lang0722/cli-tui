@@ -575,7 +575,7 @@ func (m *model) keymapLines(width, height int) []Line {
 		if u.query == "" {
 			out = append(out, L(P("  "), dim("Type to search shortcuts")))
 		} else {
-			out = append(out, L(P("  "), S(u.query, st.Plain)))
+			out = append(out, L(P("  "), S(tailWidth(u.query, width-2), st.Plain)))
 		}
 		out = append(out, Line{})
 		if u.isDebugTab() {

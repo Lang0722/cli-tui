@@ -182,10 +182,12 @@ func renderPatch(changes map[string]protocol.FileChange, cwd, verb string, width
 			}
 		}
 		// Long paths wrap under the verb rather than overflow the row.
-		out = append(out, Wrap(fileLabel(files[0]), width, L(bullet, P(" "), S(v+" ", st.Bold)), L(P("  ")))...)
+		// The verb is part of the text, not the prefix, so a narrow
+		// terminal wraps it instead of overflowing.
+		out = append(out, Wrap(append(L(S(v+" ", st.Bold)), fileLabel(files[0])...), width, L(bullet, P(" ")), L(P("  ")))...)
 	} else {
-		head := L(bullet, P(" "), S(verb+" ", st.Bold), S(fmt.Sprintf("%d files ", len(files)), st.Plain))
-		out = append(out, Wrap(counts(st, tadd, tdel), width, head, L(P("  ")))...)
+		head := L(S(verb+" ", st.Bold), S(fmt.Sprintf("%d files ", len(files)), st.Plain))
+		out = append(out, Wrap(append(head, counts(st, tadd, tdel)...), width, L(bullet, P(" ")), L(P("  ")))...)
 	}
 
 	budget := maxRows

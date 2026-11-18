@@ -230,6 +230,25 @@ func (l Line) Truncate(width int) Line {
 	return out
 }
 
+// tailWidth keeps the end of s that fits in w cells, marking a cut with
+// "…": an input field shows where the typing is.
+func tailWidth(s string, w int) string {
+	if strw(s) <= w {
+		return s
+	}
+	if w <= 1 {
+		return takeWidth("…", w)
+	}
+	g := strings.Split(s, "")
+	n := 1
+	i := len(g)
+	for i > 0 && n+strw(g[i-1]) <= w {
+		i--
+		n += strw(g[i])
+	}
+	return "…" + strings.Join(g[i:], "")
+}
+
 // strw is the display width of s, measured the way the renderer measures
 // the cells it draws, so layout (wrapping, padding, the composer's cursor)
 // matches what reaches the screen.

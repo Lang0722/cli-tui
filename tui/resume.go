@@ -108,7 +108,7 @@ func (p *resumePicker) handleKey(k tea.KeyPressMsg, page int, act string) (picke
 func (p *resumePicker) Lines(width, maxHeight int, cwd string, st *Styles) []Line {
 	out := []Line{{}, L(P("  "), S("Resume a previous session", st.Bold))}
 	if p.query != "" {
-		out = append(out, L(P("  "), S("Search: ", st.Dim), S(p.query, st.Accent)))
+		out = append(out, L(P("  "), S("Search: ", st.Dim), S(tailWidth(p.query, width-10), st.Accent)))
 	} else {
 		out = append(out, L(P("  "), S("Type to search", st.Dim)))
 	}

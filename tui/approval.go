@@ -125,9 +125,12 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 	if a.kind == approvePatch {
 		title = "Would you like to make the following edits?"
 	}
-	out = append(out, Line{}, L(P("  "), S(title, st.Bold)), Line{})
+	out = append(out, Line{})
+	out = append(out, Wrap(L(S(title, st.Bold)), width, L(P("  ")), L(P("  ")))...)
+	out = append(out, Line{})
 	if a.threadLabel != "" {
-		out = append(out, L(P("  "), S("Thread: "+sanitizeLine(a.threadLabel), st.Bold)), Line{})
+		out = append(out, Wrap(L(S("Thread: "+sanitizeLine(a.threadLabel), st.Bold)), width, L(P("  ")), L(P("  ")))...)
+		out = append(out, Line{})
 	}
 	if r := strings.TrimSpace(a.reason); r != "" {
 		out = append(out, Wrap(L(S("Reason: ", st.Plain), S(sanitize(r), st.Italic)), width, L(P("  ")), L(P("  ")))...)
@@ -171,7 +174,7 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 			hint = append(hint, S(" or ", st.Dim), S(o, st.Bold), S(" to open thread", st.Dim))
 		}
 	}
-	out = append(out, Line{}, hint)
+	out = append(out, Line{}, hint.Truncate(width))
 	return out
 }
 

@@ -191,7 +191,7 @@ func (p *surfacePicker) Lines(width int, preview Line, st *Styles) []Line {
 	if p.query == "" {
 		out = append(out, L(P("  "), S("Type to search", st.Dim)))
 	} else {
-		out = append(out, L(P("  "), S(p.query, st.Plain)))
+		out = append(out, L(P("  "), S(tailWidth(p.query, width-2), st.Plain)))
 	}
 	out = append(out, Line{})
 

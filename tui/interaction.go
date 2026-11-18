@@ -56,7 +56,7 @@ func (v *selectionView) Lines(width, maxH int, st *Styles) []Line {
 		if v.query == "" {
 			out = append(out, L(P("  "), S("Type to search", st.Dim)))
 		} else {
-			out = append(out, L(P("  "), S("Search: ", st.Dim), S(v.query, st.Accent)))
+			out = append(out, L(P("  "), S("Search: ", st.Dim), S(tailWidth(v.query, width-10), st.Accent)))
 		}
 	}
 	out = append(out, Line{})
@@ -112,7 +112,7 @@ func (v *selectionView) Lines(width, maxH int, st *Styles) []Line {
 	if v.searchable() {
 		hint = append(hint, S(" · type to search", st.Dim))
 	}
-	return append(out, Line{}, Line{}, hint)
+	return append(out, Line{}, Line{}, hint.Truncate(width))
 }
 
 type selAction int

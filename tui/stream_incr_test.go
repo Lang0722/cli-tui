@@ -136,3 +136,74 @@ func checkStreamIncremental(t *testing.T, r *rand.Rand, docs []string) {
 		}
 	}
 }
+
+// Long code blocks restart rendering behind a copy of their fence
+// (fenceRestart): the printed rows, colors included, match a whole render
+// even with block comments and raw strings that span the restart point.
+func TestStreamLongCodeBlockMatchesFullWithColors(t *testing.T) {
+	r := rand.New(rand.NewSource(4))
+	pool := []string{
+		"\tx := compute(a, b) // trailing comment", "func f() error {", "}", "", "/* a block", "comment */",
+		"\ts := `raw", "string`", "\tif err != nil { return err }", "\t\"quoted \\\" string\"",
+		"// line comment that is fairly long and wraps around the sixty column terminal width",
+		"\tfor i := 0; i < 10; i++ {", "\t}", "   ```", "~~~", "    ```go",
+	}
+	var docs []string
+	for i := 0; i < 60; i++ {
+		var b strings.Builder
+		b.WriteString("Intro paragraph.\n\n")
+		fence := []string{"```go", "````", "~~~python", "```"}[r.Intn(4)]
+		b.WriteString(fence + "\n")
+		for n := 50 + r.Intn(150); n > 0; n-- {
+			b.WriteString(pool[r.Intn(len(pool))] + "\n")
+		}
+		if r.Intn(3) > 0 {
+			b.WriteString(fence[:3] + "\n\nAfter the block.\n")
+		}
+		docs = append(docs, b.String())
+	}
+	stream := func(src string, width int, cuts []int, views []bool) (string, bool) {
+		m := newTestModel()
+		m.width, m.height = width, 40
+		ev(m, protocol.TaskStarted{})
+		m.out.takeQueued()
+		for c, j := range cuts[:len(cuts)-1] {
+			ev(m, protocol.AgentMessageDelta{Delta: src[j:cuts[c+1]]})
+			if views[c] {
+				m.View()
+			}
+		}
+		restarted := m.stream.prefix != ""
+		ev(m, protocol.AgentMessage{Message: src})
+		return strings.Join(m.out.takeQueued(), "\n"), restarted
+	}
+	restarts := 0
+	for di, src := range docs {
+		for _, width := range []int{60, 100} {
+			cuts, views := []int{0}, []bool{}
+			for j := 0; j < len(src); {
+				j = min(len(src), j+1+r.Intn(40))
+				cuts, views = append(cuts, j), append(views, r.Intn(3) == 0)
+			}
+			got, restarted := stream(src, width, cuts, views)
+			if restarted {
+				restarts++
+			}
+			noFenceRestart = true
+			want, _ := stream(src, width, cuts, views)
+			noFenceRestart = false
+			if got != want {
+				g, w := strings.Split(got, "\n"), strings.Split(want, "\n")
+				i := 0
+				for i < len(g) && i < len(w) && g[i] == w[i] {
+					i++
+				}
+				t.Fatalf("doc %d width %d: first difference at row %d\n--- got\n%q\n--- want\n%q\n--- src\n%q",
+					di, width, i, g[min(i, len(g)-1)], w[min(i, len(w)-1)], src)
+			}
+		}
+	}
+	if restarts < 20 {
+		t.Errorf("only %d streams restarted inside a code block", restarts)
+	}
+}

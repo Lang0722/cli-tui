@@ -568,7 +568,7 @@ func (v *skillsToggle) Lines(width int, st *Styles) []Line {
 	if v.query == "" {
 		out = append(out, L(P("  "), S("Type to search skills", st.Dim)))
 	} else {
-		out = append(out, L(P("  "), S(v.query, st.Plain)))
+		out = append(out, L(P("  "), S(tailWidth(v.query, width-2), st.Plain)))
 	}
 	out = append(out, Line{})
 	if len(v.visible) == 0 {

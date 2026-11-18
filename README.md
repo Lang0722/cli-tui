@@ -549,6 +549,11 @@ go test ./...
 - **Unit and model tests** (`tui/`, `protocol/`, `backend/`) feed events and
   keys straight into the UI model. They include randomized markdown
   streaming checks and benchmarks (`go test ./tui -run X -bench .`).
+- **Model fuzzer** (`TestModelFuzz`) drives the model with random keys,
+  pastes, resizes and backend events, and checks every frame for panics
+  and for rows wider or taller than the terminal. It runs 15 seeds by
+  default; `FUZZ_SEEDS=400 go test ./tui -run ModelFuzz` runs more, and
+  `FUZZ_SEED=n` replays one.
 - **End-to-end tests** (`e2e/`) build the real binary, run it in tmux (a
   real terminal emulator) with an isolated `$HOME`, type keys like a user
   and read the screen and scrollback back. They cover:

@@ -82,11 +82,14 @@ func New(dir string) (*Backend, error) {
 		opWake:   make(chan struct{}, 1),
 		hooks:    demoHooks(),
 	}
-	if list, err := b.store.list(); err == nil && len(list) == 0 {
+	if b.store.empty() {
 		if err := seedDemo(&b.store, cwd); err != nil {
 			return nil, fmt.Errorf("seed demo sessions in %s: %w", dir, err)
 		}
 	}
+	// Read the saved sessions' summaries now, so the command center's
+	// first list doesn't have to (store.head).
+	go func() { _, _ = b.store.list() }()
 	go b.opLoop()
 	// A fresh session: announce its id now, so the UI knows which listed
 	// task is the one on screen (command center, /status).

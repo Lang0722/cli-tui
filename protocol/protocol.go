@@ -7,7 +7,10 @@
 // event is optional except TaskStarted/TaskComplete framing a turn.
 package protocol
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Backend is implemented by your agent loop.
 type Backend interface {
@@ -176,6 +179,10 @@ type SessionConfigured struct {
 // TaskStarted marks the beginning of a turn.
 type TaskStarted struct {
 	ContextWindow int64 `json:"context_window,omitempty"`
+	// StartedAt is when the turn began (optional). A catch-up after
+	// attaching to a running session (sessions_live.go) sends it so the
+	// UI's elapsed time goes on from the real start instead of from zero.
+	StartedAt time.Time `json:"started_at,omitzero"`
 }
 
 // TaskComplete marks the end of a turn.

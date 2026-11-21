@@ -3,6 +3,7 @@ package tui
 import (
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"charm.land/lipgloss/v2"
 	"github.com/alecthomas/chroma/v2"
@@ -42,18 +43,42 @@ func (s *Styles) tokenStyle(t chroma.TokenType) (lipgloss.Style, bool) {
 }
 
 // lexerFor finds a lexer by fence language or file name; nil if unknown.
+// Lookups are cached: matching a file name tries every lexer's globs
+// (about 5 ms), and a resumed chat renders a diff for every edit in it.
 func lexerFor(lang, filename string) chroma.Lexer {
+	key := lexerKey{lang, filepath.Base(filename)}
+	if filename == "" {
+		key.file = ""
+	}
+	lexerCache.Lock()
+	defer lexerCache.Unlock()
+	if l, ok := lexerCache.m[key]; ok {
+		return l
+	}
 	var l chroma.Lexer
 	if lang != "" {
 		l = lexers.Get(lang)
 	}
-	if l == nil && filename != "" {
-		l = lexers.Match(filepath.Base(filename))
+	if l == nil && key.file != "" {
+		l = lexers.Match(key.file)
 	}
-	if l == nil {
-		return nil
+	if l != nil {
+		l = chroma.Coalesce(l)
 	}
-	return chroma.Coalesce(l)
+	if lexerCache.m == nil || len(lexerCache.m) >= maxLexerCache {
+		lexerCache.m = map[lexerKey]chroma.Lexer{}
+	}
+	lexerCache.m[key] = l
+	return l
+}
+
+type lexerKey struct{ lang, file string }
+
+const maxLexerCache = 4096
+
+var lexerCache struct {
+	sync.Mutex
+	m map[lexerKey]chroma.Lexer
 }
 
 // hlKey identifies a highlighted block: tokenizing is the costliest part

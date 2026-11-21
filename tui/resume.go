@@ -329,7 +329,7 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 		return cmd // lineageDone says what changed instead
 	}
 	m.commit(textCell{bullet: S("↻", m.st.Accent), body: L(S("Resumed session ", m.st.Dim), S(sanitizeLine(e.SessionID), m.st.Plain),
-		S(fmt.Sprintf(" · %d events · continue below", len(e.InitialMessages)), m.st.Dim))})
+		S(fmt.Sprintf(" · %s · continue below", plural(len(e.InitialMessages), "event")), m.st.Dim))})
 	return cmd
 }
 

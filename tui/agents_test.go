@@ -325,11 +325,24 @@ func TestSubagentViewShowsParentPrompts(t *testing.T) {
 	if n := strings.Count(queuedPlain(m), "› more"); n != 1 {
 		t.Fatalf("typed input drawn %d times", n)
 	}
-	// The main thread still draws live input only on submit.
+	// The main thread: the same for input typed there; a prompt it did
+	// not send (one that ran while the session was in the background) is
+	// drawn when it arrives.
 	m.Update(keyNamed("alt+left"))
 	m.out.takeQueued()
-	evIn(m, "", protocol.UserMessage{Message: "echo of main input"})
-	if out := queuedPlain(m); strings.Contains(out, "echo of main input") {
-		t.Fatalf("main thread drew a live user_message: %q", out)
+	for _, r := range "main input" {
+		m.Update(key(string(r)))
+	}
+	m.Update(key("enter"))
+	evIn(m, "", protocol.TaskStarted{})
+	evIn(m, "", protocol.UserMessage{Message: "main input"})
+	evIn(m, "", protocol.TaskComplete{})
+	evIn(m, "", protocol.UserMessage{Message: "queued before switching"})
+	out = queuedPlain(m)
+	if n := strings.Count(out, "› main input"); n != 1 {
+		t.Fatalf("main input drawn %d times:\n%s", n, out)
+	}
+	if !strings.Contains(out, "› queued before switching") {
+		t.Fatalf("a prompt the main thread did not send is not drawn:\n%s", out)
 	}
 }

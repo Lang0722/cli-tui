@@ -28,7 +28,9 @@ type live struct {
 
 	// While a turn or a shell command runs, log holds the main thread's
 	// events since then and cut is where they start in f.Events: attaching
-	// replays f.Events[:cut] as history and sends log as live events.
+	// replays f.Events[:cut] as history and sends log as live events. A
+	// turn's log starts at its prompt (the user message before its
+	// TaskStarted), so the prompt is shown with the turn it starts.
 	turnOn bool
 	busy   bool
 	cut    int
@@ -49,6 +51,8 @@ func (l *live) id() string { return l.f.Meta.ID }
 // before the event is recorded.
 func (l *live) track(m protocol.EventMsg) {
 	switch e := m.(type) {
+	case protocol.UserMessage:
+		l.begin() // the prompt of the turn about to start (or a steer: busy already)
 	case protocol.TaskStarted:
 		l.begin()
 		l.turnOn, l.failed = true, false

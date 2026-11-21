@@ -165,7 +165,8 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 ### Events (backend → UI)
 
 Every event is optional. A turn is framed by `task_started` … `task_complete`
-(or `turn_aborted`).
+(or `turn_aborted`). `task_started` may carry `started_at` (when the turn
+began), which the elapsed time counts from.
 
 | event | renders as |
 |---|---|
@@ -212,13 +213,16 @@ time can ignore it. The full rules are in `protocol/sessions_live.go`.
   `resume_session` (Enter) or `slash_command{name:"new"}` (`n`) while a turn
   runs; that turn, its approvals and its subagents go on in the background.
 - **Catch-up.** Answer the attach with `session_configured`
-  (`initial_messages` = the history up to the running turn's user message)
-  followed by live events that rebuild what a watcher would see now:
-  `task_started`, the turn's events so far (deltas may be merged, finished
+  (`initial_messages` = the history before the running turn) followed by
+  live events that rebuild what a watcher would see now: the turn's
+  `user_message`, `task_started` with `started_at` (the elapsed time goes
+  on from there), the turn's events so far (deltas may be merged, finished
   calls sent as begin + end), every request still waiting for an answer,
   and each open subagent's `thread_started` and events. After that, send
   each later event of the session exactly once. The mock does this by
-  recording and sending under the lock that attaching takes.
+  recording and sending under the lock that attaching takes. A live
+  `user_message` the UI didn't send itself (the catch-up's, or a message
+  queued before the switch that runs later) is drawn when it arrives.
 - **Ops name their session.** `user_input`, `shell_command`, `interrupt`,
   the approvals, `selection_response`, `rewind`, `slash_command`,
   `change_directory` and `fork_session` carry `session_id`: the session the
@@ -354,8 +358,9 @@ without one belong to the main conversation:
   spawned with and each later instruction from the parent. As in Codex,
   the thread's view shows them as `› …` prompts, so you can see what the
   helper was asked. Input you type into the thread is drawn when you send
-  it; its `user_message` echo is not drawn again. (In the main thread a
-  live `user_message` is still not drawn, only replayed history.)
+  it; its `user_message` echo is not drawn again. The main thread works the
+  same way: your input's echo is skipped, any other live `user_message` is
+  drawn.
 - `/subagents` lists main and the open threads (`(current)`,
   `(needs approval)` first). Alt+←/→ cycle through them with an empty
   composer. A closed thread drops out of both (Codex keeps it, dimmed); an
@@ -624,8 +629,9 @@ go test ./...
   - resume (picker and `-last`), resize reflow and subagents;
   - the agent command center (←, Esc back, Enter resumes);
   - background tasks: a turn that goes on while another task is open (back
-    after it finished and mid-turn, each message shown once), an approval
-    that waits in the background, and `x` stop;
+    after it finished and mid-turn, each message shown once), a queued
+    message that runs there after the switch and its turn's elapsed time,
+    an approval that waits in the background, and `x` stop;
   - skills: the `$` popup, mentions and Enable/Disable Skills;
   - layout: the composer stays on the last row after turns, approvals,
     `/resume` inside a session and closing `/keymap`;

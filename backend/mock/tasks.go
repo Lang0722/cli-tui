@@ -31,10 +31,10 @@ func (b *Backend) tasks(limit int) protocol.TaskList {
 		}
 		t := protocol.TaskSummary{ID: s.ID, Preview: s.Title, Cwd: s.Cwd, UpdatedAt: s.UpdatedAt,
 			Model: b.model, ReasoningEffort: b.effort, Status: protocol.TaskInactive}
-		if f, err := b.store.load(s.ID); err == nil {
-			t.Preview = firstPrompt(f)
-			if f.Meta.Title != t.Preview {
-				t.Title = f.Meta.Title
+		if h, ok := b.store.head(s.ID, nil); ok {
+			t.Preview = h.first
+			if h.meta.Title != t.Preview {
+				t.Title = h.meta.Title
 			}
 		}
 		out.Tasks = append(out.Tasks, t)

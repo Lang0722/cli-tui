@@ -296,8 +296,8 @@ type convo struct {
 	// arrived (Codex last_flushed_agent_message): that late final corrects
 	// the cell where the answer first appeared instead of adding a copy.
 	interrupted *interruptedAnswer
-	// sent is what the user typed into this subagent thread, drawn on
-	// submit; the backend's user_message echo of it is not drawn again.
+	// sent is what the user typed into this thread, drawn on submit; the
+	// backend's user_message echo of it is not drawn again (takeSent).
 	sent []string
 
 	// turn
@@ -1242,24 +1242,20 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.selections = append(m.selections, &selectionView{req: sanitizeSelection(e), thread: m.thread})
 		return m.notify(m.agent, e.Title)
 	case protocol.UserMessage:
-		// Live input is drawn when submitted; only history is rendered here.
-		// A subagent thread's prompts come from its parent agent (the task
-		// it was spawned with, later instructions): like Codex, its view
-		// shows them as user messages, live too.
-		switch {
-		case m.replaying:
-			m.finalizeStream("")
-			m.flushActive(true)
-			m.commit(userCell{text: e.Message, images: e.Images})
+		// Input typed here is drawn when submitted; the backend's echo of it
+		// is skipped. Any other prompt is drawn when it arrives: history, a
+		// subagent's task from its parent agent (Codex shows those as user
+		// messages, live too), and a session's own prompts that ran without
+		// the UI: messages queued before switching away, or the prompt of the
+		// turn a catch-up rebuilds (sessions.go).
+		if !m.replaying && m.takeSent(e.Message) {
+			break
+		}
+		m.finalizeStream("")
+		m.flushActive(true)
+		m.commit(userCell{text: e.Message, images: e.Images})
+		if m.replaying || m.convo.thread == "" {
 			m.composer.addHistory(cleanInput(e.Message), nil)
-		case m.convo.thread != "":
-			if len(m.sent) > 0 && m.sent[0] == e.Message {
-				m.sent = m.sent[1:] // typed here: already drawn
-				break
-			}
-			m.finalizeStream("")
-			m.flushActive(true)
-			m.commit(userCell{text: e.Message, images: e.Images})
 		}
 	case protocol.TaskStarted:
 		if m.replaying {
@@ -1272,6 +1268,9 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.interrupted = nil
 		m.hookRuns, m.ended = nil, nil // Codex clear_active_hook_cell: no orphaned rows
 		m.running, m.turnStart = true, time.Now()
+		if at := e.StartedAt; !at.IsZero() && at.Before(m.turnStart) && m.turnStart.Sub(at) < 24*time.Hour {
+			m.turnStart = at // a running turn rebuilt after switching back to it
+		}
 		m.statusHeader, m.statusDetail, m.hadTools = "Working", "", false
 		if e.ContextWindow > 0 {
 			m.contextWindow = e.ContextWindow
@@ -1564,10 +1563,31 @@ func (m *model) sendUser(text string) { m.sendInput(pendingInput{text: text}) }
 
 func (m *model) sendInput(in pendingInput) {
 	m.commit(userCell{text: in.text, images: in.images, steer: m.running})
-	if m.thread != "" {
-		m.sent = append(m.sent, in.text)
-	}
+	m.noteSent(in.text)
 	m.submit(protocol.UserInput{Text: in.text, Images: in.images, ThreadID: m.thread, Skills: m.skills.mentionedSkills(in.text)})
+}
+
+// maxSent bounds sent for a backend that never echoes input.
+const maxSent = 64
+
+func (m *model) noteSent(text string) {
+	if len(m.sent) >= maxSent {
+		m.sent = m.sent[1:]
+	}
+	m.sent = append(m.sent, text)
+}
+
+// takeSent reports whether msg is the echo of input typed here (and
+// forgets it with whatever was sent before it: an input the backend
+// dropped is never echoed).
+func (m *model) takeSent(msg string) bool {
+	for i, s := range m.sent {
+		if s == msg || strings.TrimSpace(s) == strings.TrimSpace(msg) {
+			m.sent = m.sent[i+1:]
+			return true
+		}
+	}
+	return false
 }
 
 func (m *model) flash(s string) {
@@ -1705,7 +1725,13 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 		case "ctrl+c", "ctrl+d":
 			return m.quit()
 		case "esc":
-			m.awaitingList, m.awaitingResume = false, false
+			if m.awaitingResume {
+				// The backend switches whatever the UI does next: waiting
+				// for it (or the timeout) beats jumping there after a
+				// "cancel".
+				return nil
+			}
+			m.awaitingList = false
 			m.resumeGen++ // invalidate the pending timeout
 			m.showPendingHeader()
 		}
@@ -2435,7 +2461,11 @@ func (m *model) View() tea.View {
 	} else if m.keymapUI != nil {
 		bottom = append(bottom, m.keymapLines(w, m.height-len(bottom)-2)...)
 	} else if m.awaitingList || m.awaitingResume {
-		bottom = append(bottom, Line{}, L(S("• ", st.Dim)).Append(st.Shimmer("Loading saved sessions")...))
+		what := "Loading saved sessions"
+		if m.awaitingResume {
+			what = "Loading session"
+		}
+		bottom = append(bottom, Line{}, L(S("• ", st.Dim)).Append(st.Shimmer(what)...))
 	} else if m.forking() {
 		bottom = append(bottom, m.lineagePendingLines()...)
 	} else {
@@ -2514,6 +2544,7 @@ func (m *model) View() tea.View {
 		cursorRow -= over
 	}
 	all := clipLines(append(top, bottom...), w)
+	m.out.noteFrame(len(all), m.width, m.height)
 	content := renderLines(all)
 	if m.printSeq > 0 {
 		// Differs from every earlier frame but draws the same: Bubble

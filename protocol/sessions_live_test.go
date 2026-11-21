@@ -110,3 +110,22 @@ func TestTaskUpdatedWire(t *testing.T) {
 		t.Fatal("Unscoped classifies wrongly")
 	}
 }
+
+// TaskStarted.started_at: omitted when unknown, lenient like other times.
+func TestTaskStartedAt(t *testing.T) {
+	b, _ := MarshalEvent(Event{Msg: TaskStarted{ContextWindow: 5}})
+	if strings.Contains(string(b), "started_at") {
+		t.Fatalf("zero start written: %s", b)
+	}
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	e := Event{Msg: TaskStarted{StartedAt: at}}
+	b, _ = MarshalEvent(e)
+	got, err := UnmarshalEvent(b)
+	if err != nil || !got.Msg.(TaskStarted).StartedAt.Equal(at) {
+		t.Fatalf("round trip %s: %#v %v", b, got, err)
+	}
+	got, err = UnmarshalEvent([]byte(`{"msg":{"type":"task_started","started_at":1767323045}}`))
+	if err != nil || !got.Msg.(TaskStarted).StartedAt.Equal(at) {
+		t.Fatalf("unix seconds: %#v %v", got, err)
+	}
+}

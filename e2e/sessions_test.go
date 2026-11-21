@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,15 +29,33 @@ func (s *term) selectTask(title string) {
 	s.t.Fatalf("no row %q to select:\n%s", title, s.screen())
 }
 
-// openTask opens the task titled title from the chat.
+// openTask opens the task titled title from the chat: done when the
+// footer names it (a running first turn has no history, so no "Resumed"
+// note).
 func (s *term) openTask(title string) {
 	s.t.Helper()
 	s.keys("Left")
 	s.waitScreen("Agent command center")
 	s.selectTask(title)
 	s.keys("Enter")
-	s.poll("the main screen", func() bool { return !s.altScreen() })
-	s.waitFor("↻ Resumed session")
+	s.waitFooter(title)
+}
+
+// waitFooter waits for the chat screen with title in its footer.
+func (s *term) waitFooter(title string) {
+	s.t.Helper()
+	s.poll("the footer to name "+title, func() bool {
+		if s.altScreen() {
+			return false
+		}
+		lines := strings.Split(strings.TrimRight(s.screen(), "\n "), "\n")
+		for _, l := range lines[max(0, len(lines)-3):] {
+			if strings.Contains(l, " · "+title) {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // The investigate turn goes on while another task is open: back on it,
@@ -123,13 +142,46 @@ func TestCenterStopsABackgroundTask(t *testing.T) {
 	s.waitScreen("Stopping investigate the flaky test…")
 	s.poll("the task to stop", func() bool { return !strings.Contains(s.screen(), "x stop") })
 	s.keys("Enter")
-	s.poll("the main screen", func() bool { return !s.altScreen() })
-	s.waitFor("↻ Resumed session")
+	s.waitFooter("investigate the flaky test")
 	s.waitScreen("› Ask Agent to do anything")
 	if s.busy() {
 		t.Error("the stopped task still runs")
 	}
 	if s.count("Why TestFetchRetries is flaky") != 0 {
 		t.Error("the stopped task finished anyway")
+	}
+}
+
+// A message queued behind the running turn goes with the task when another
+// one is opened; back on it before it runs, it shows (once) when it does.
+// The turn's elapsed time goes on from its real start.
+func TestQueuedMessageFollowsItsTask(t *testing.T) {
+	t.Parallel()
+	s := start(t, opts{reset: true})
+	s.submit("investigate the flaky test")
+	s.waitFor("I'll look for the test that times out")
+	s.submit("thanks, that helps")
+	s.waitScreen("Queued follow-up inputs")
+	time.Sleep(time.Second)
+	s.openTask("TestParseDuration fails")
+	s.openTask("investigate the flaky test")
+	s.waitScreen("esc to interrupt")
+	m := regexp.MustCompile(`\((\d+)s • esc to interrupt\)`).FindStringSubmatch(s.screen())
+	if m == nil {
+		t.Fatalf("no elapsed time:\n%s", s.screen())
+	}
+	if n, _ := strconv.Atoi(m[1]); n < 2 {
+		t.Errorf("elapsed time restarted: %ss", m[1])
+	}
+	s.waitFor("› thanks, that helps")
+	s.waitIdle()
+	if n := s.count("› thanks, that helps"); n != 1 {
+		t.Errorf("queued message shown %d times:\n%s", n, s.all())
+	}
+	if n := s.count("› investigate the flaky test"); n != 1 {
+		t.Errorf("prompt shown %d times", n)
+	}
+	if n := s.count(regexp.QuoteMeta("Why TestFetchRetries is flaky")); n != 1 {
+		t.Errorf("answer shown %d times", n)
 	}
 }

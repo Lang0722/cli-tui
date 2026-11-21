@@ -210,9 +210,9 @@ func rendered(sc protocol.SessionConfigured, live []protocol.Event) (msgs []stri
 	return
 }
 
-// Re-attaching mid-turn: history up to the turn's prompt, then TaskStarted
-// and the turn so far, then the rest live — every message and command
-// exactly once, as saved.
+// Re-attaching mid-turn: the history before the turn, then its prompt,
+// TaskStarted (with the turn's start time) and the turn so far, then the
+// rest live — every message and command exactly once, as saved.
 func TestLiveAttachMidTurnCatchesUp(t *testing.T) {
 	for _, wait := range []time.Duration{0, 300 * time.Millisecond, 1500 * time.Millisecond, 3 * time.Second} {
 		t.Run(wait.String(), func(t *testing.T) {
@@ -233,16 +233,22 @@ func TestLiveAttachMidTurnCatchesUp(t *testing.T) {
 			if !sc.Resumed {
 				t.Error("re-attach should be Resumed")
 			}
-			last := sc.InitialMessages[len(sc.InitialMessages)-1]
-			if u, ok := last.(protocol.UserMessage); !ok || u.Message != "investigate the flaky test" {
-				t.Fatalf("history should end with the running turn's prompt, ends with %#v", last)
+			for _, m := range sc.InitialMessages {
+				if u, ok := m.(protocol.UserMessage); ok && u.Message == "investigate the flaky test" {
+					t.Fatal("the running turn's prompt is in the history, not in its catch-up")
+				}
 			}
 			if !w.until(endOf(a), 20*time.Second) {
 				t.Fatal("turn did not finish")
 			}
 			live := w.since(i)
-			if !is[protocol.TaskStarted](live[0]) {
-				t.Errorf("catch-up should start with task_started, got %s", protocol.EventType(live[0].Msg))
+			if u, ok := live[0].Msg.(protocol.UserMessage); !ok || u.Message != "investigate the flaky test" {
+				t.Fatalf("catch-up should start with the turn's prompt, got %#v", live[0].Msg)
+			}
+			if ts, ok := live[1].Msg.(protocol.TaskStarted); !ok {
+				t.Errorf("then task_started, got %s", protocol.EventType(live[1].Msg))
+			} else if age := time.Since(ts.StartedAt); ts.StartedAt.IsZero() || age < wait {
+				t.Errorf("task_started should carry the turn's start (%v ago, left for %v)", age, wait)
 			}
 			msgs, begins, ends := rendered(sc, live)
 			want := agentMessages(w.saved(a).Events)

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"agenttui/protocol"
@@ -57,14 +58,73 @@ func (s *store) list() ([]protocol.SessionSummary, error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		f, err := s.load(strings.TrimSuffix(e.Name(), ".json"))
-		if err != nil || f.Meta.Messages == 0 {
+		h, ok := s.head(strings.TrimSuffix(e.Name(), ".json"), e)
+		if !ok || h.meta.Messages == 0 {
 			continue
 		}
-		out = append(out, f.Meta)
+		out = append(out, h.meta)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
 	return out, nil
+}
+
+// empty reports whether dir holds no conversation (the demo is seeded
+// then). It stops at the first one found.
+func (s *store) empty() bool {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if h, ok := s.head(strings.TrimSuffix(e.Name(), ".json"), e); ok && h.meta.Messages > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// sessionHead is what listing needs from a saved session.
+type sessionHead struct {
+	meta  protocol.SessionSummary
+	first string // the first prompt (firstPrompt)
+	mod   time.Time
+	size  int64
+}
+
+// heads caches sessionHead by file path, valid while the file's
+// modification time and size stay the same. Listing (the command center
+// asks on every open) would otherwise parse every saved session in full.
+var heads sync.Map // path -> sessionHead
+
+// head returns the listing data of session id; e is its directory entry
+// (nil: stat the file).
+func (s *store) head(id string, e os.DirEntry) (sessionHead, bool) {
+	path := s.path(filepath.Base(id))
+	var info os.FileInfo
+	var err error
+	if e != nil {
+		info, err = e.Info()
+	} else {
+		info, err = os.Stat(path)
+	}
+	if err != nil {
+		return sessionHead{}, false
+	}
+	if v, ok := heads.Load(path); ok {
+		if h := v.(sessionHead); h.mod.Equal(info.ModTime()) && h.size == info.Size() {
+			return h, true
+		}
+	}
+	f, err := s.load(id)
+	if err != nil {
+		return sessionHead{}, false
+	}
+	h := sessionHead{meta: f.Meta, first: firstPrompt(f), mod: info.ModTime(), size: info.Size()}
+	heads.Store(path, h)
+	return h, true
 }
 
 func (s *store) load(id string) (*sessionFile, error) {

@@ -62,7 +62,7 @@ func (m *model) dropLive() {
 	c.running, c.hadTools, c.turnHasAgent, c.statusHidden = false, false, false, false
 	c.statusHeader, c.statusDetail = "", ""
 	c.reasoning.Reset()
-	c.reasonParts, c.interrupted = nil, nil
+	c.reasonParts, c.interrupted, c.sent = nil, nil, nil
 	m.freeformID, m.freeformThread = "", ""
 }
 

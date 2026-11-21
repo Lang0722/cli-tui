@@ -20,15 +20,18 @@ package protocol
 //     (InitialMessages = its saved history), followed by the catch-up: the
 //     live events that rebuild what a watcher would see right now, in the
 //     order they first happened. For a session with a running turn that is
-//     TaskStarted, then the turn's events since its user message (deltas
-//     may be merged; finished calls may be sent as one Begin+End pair; an
-//     answered request is left out), then every request still waiting for
-//     an answer (ExecApprovalRequest, ApplyPatchApprovalRequest,
-//     SelectionRequest) and any partial answer as one AgentMessageDelta.
-//     Open subagent threads get ThreadStarted plus their own catch-up.
-//     InitialMessages must not hold the running turn's events (the UI
-//     replays it as finished history and would show its open commands as
-//     interrupted); the turn's user message stays in it.
+//     the turn's UserMessage, TaskStarted (with StartedAt, so the elapsed
+//     time goes on), then the turn's events so far (deltas may be merged;
+//     finished calls may be sent as one Begin+End pair; an answered
+//     request is left out), then every request still waiting for an answer
+//     (ExecApprovalRequest, ApplyPatchApprovalRequest, SelectionRequest)
+//     and any partial answer as one AgentMessageDelta. Open subagent
+//     threads get ThreadStarted plus their own catch-up. InitialMessages
+//     must not hold the running turn's events (the UI replays it as
+//     finished history and would show its open commands as interrupted).
+//     A UserMessage the UI did not send itself is drawn when it arrives,
+//     so the prompt shows with its turn, below the "resumed" note; so do
+//     messages that were queued for the session and run later.
 //   - After the SessionConfigured the backend sends every later event of
 //     the attached session exactly once, and none the catch-up covered.
 //     The simplest way: record each event and decide to send it under the

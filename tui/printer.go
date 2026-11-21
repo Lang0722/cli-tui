@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // printer feeds committed transcript lines into the terminal scrollback
@@ -18,7 +19,10 @@ import (
 //   - insertAbove scrolls the screen by the inserted height, so a multi-line
 //     insert taller than the free rows above a big live frame pushes frame
 //     rows into scrollback. One line per insert is always safe while the
-//     frame is shorter than the terminal (View clamps it).
+//     frame is shorter than the terminal (View clamps it); more fit when
+//     View has said how tall the frame and the terminal are (noteFrame).
+//     A resumed chat is thousands of lines: one insert (a scroll, an insert
+//     line and a write) per line made old VTEs crawl through it.
 //   - The frame buffer changes on every Update but reaches the terminal on
 //     the next frame tick; an insert in between is positioned with the new
 //     frame height over the old frame and leaves part of it behind (or a
@@ -39,6 +43,11 @@ type printer struct {
 	// the lines would land in the alt buffer and vanish with it.
 	resumeAt time.Time
 	wake     chan struct{}
+	// rows the live frame took in the last two frames, when that changed,
+	// and the terminal size (noteFrame); a batch must fit in the rows above
+	// the frame
+	frame, prevFrame, termRows, termCols int
+	frameAt                              time.Time
 }
 
 // holdReason says why output is paused; output flows when none is set.
@@ -107,6 +116,45 @@ func (p *printer) releaseAll() {
 	p.cond.Broadcast()
 }
 
+// noteFrame records the live frame's height in a terminal of termCols x
+// termRows cells (View calls it for every inline frame).
+func (p *printer) noteFrame(rows, termCols, termRows int) {
+	p.mu.Lock()
+	if rows != p.frame {
+		p.prevFrame, p.frame, p.frameAt = p.frame, rows, time.Now()
+	}
+	p.termCols, p.termRows = termCols, termRows
+	p.mu.Unlock()
+}
+
+// rowsLocked is how many terminal rows Bubble Tea's insert counts for line
+// (it adds one per full width a line overflows by).
+func (p *printer) rowsLocked(line string) int {
+	if w := p.termCols; w > 0 && len(line) > w {
+		if lw := ansi.StringWidth(line); lw > w {
+			return 1 + lw/w
+		}
+	}
+	return 1
+}
+
+// batchLocked is how many rows one insert may carry: the rows above the
+// frame, less one. Bubble Tea positions an insert with the frame on screen
+// when it gets there, which may not be the one View drew last: while the
+// frame is changing (streaming, popups) count the taller of the last two
+// and keep half the free rows spare for it growing meanwhile. A settled
+// frame (a resumed chat being printed) gets all of them.
+func (p *printer) batchLocked() int {
+	if time.Since(p.frameAt) < frameSettled {
+		return max(1, (p.termRows-max(p.frame, p.prevFrame)-1)/2)
+	}
+	return max(1, p.termRows-p.frame-1)
+}
+
+// frameSettled is how long a frame must stay the same height before
+// inserts use all the rows above it.
+const frameSettled = 250 * time.Millisecond
+
 // settle is how long a line waits after being queued: two frame ticks, so
 // the frame produced by the same Update has reached the terminal first.
 const settle = 35 * time.Millisecond
@@ -118,8 +166,9 @@ const settle = 35 * time.Millisecond
 // has then been drawn, and the inserted lines fill the rows that frame gave
 // up. Printed earlier, they would be inserted above the old, taller frame,
 // which then shrinks and leaves blank rows under the composer. Lines are
-// handed over one at a time so a hold (pager opening, terminal clearing) or
-// a reset takes effect between lines.
+// handed over a batch at a time (as many as fit above the frame), so a
+// hold (pager opening, terminal clearing) or a reset takes effect between
+// batches.
 //
 // printed is called after a run of lines, before waiting: Bubble Tea's
 // insert leaves the terminal cursor at the top of the live frame and only
@@ -162,15 +211,26 @@ func (p *printer) run(println func(...any), printed func()) {
 				time.Sleep(wait)
 				continue
 			}
-			line := p.queue[0]
-			p.queue, p.queued = p.queue[1:], p.queued[1:]
+			// The first line has settled: so have the ones queued with or
+			// before it. Take as many as fit above the frame.
+			n, rows, limit := 1, p.rowsLocked(p.queue[0]), p.batchLocked()
+			for n < len(p.queue) && time.Since(p.queued[n]) >= settle {
+				r := p.rowsLocked(p.queue[n])
+				if rows+r > limit {
+					break
+				}
+				n, rows = n+1, rows+r
+			}
+			lines := p.queue[:n]
+			p.queue, p.queued = p.queue[n:], p.queued[n:]
 			p.busy = true
 			p.mu.Unlock()
 
-			if line == "" {
-				line = " " // Bubble Tea drops empty prints
+			text := strings.Join(lines, "\n")
+			if text == "" {
+				text = " " // Bubble Tea drops empty prints
 			}
-			println(line)
+			println(text)
 			unsignaled = true
 		}
 	}

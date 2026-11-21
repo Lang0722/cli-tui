@@ -73,7 +73,7 @@ func (t *turn) addTokens(n int64) {
 
 func (t *turn) run(text string) {
 	defer close(t.done)
-	t.emit(protocol.TaskStarted{ContextWindow: contextWindow})
+	t.emit(protocol.TaskStarted{ContextWindow: contextWindow, StartedAt: time.Now()})
 	lower := strings.ToLower(text)
 	var ok bool
 	switch {

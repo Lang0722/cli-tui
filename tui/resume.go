@@ -290,7 +290,9 @@ func (m *model) onSessionConfigured(e protocol.SessionConfigured) tea.Cmd {
 	m.tokensUsed = 0
 	m.dropTurnPrompts() // pickers/approvals of the previous session are stale
 	var cmd tea.Cmd
-	if (e.Resumed || m.lineage != nil || switched && wasLive) && m.printedAny {
+	clearAsked := m.clearOnSwitch
+	m.clearOnSwitch = false
+	if (e.Resumed || m.lineage != nil || switched && (wasLive || clearAsked)) && m.printedAny {
 		// Switching to a resumed session from inside another one: like
 		// Codex (clear_for_thread_switch), clear the screen and scrollback
 		// and replay from the top, so the composer ends up below the

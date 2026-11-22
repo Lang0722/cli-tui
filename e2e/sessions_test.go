@@ -185,3 +185,37 @@ func TestQueuedMessageFollowsItsTask(t *testing.T) {
 		t.Errorf("answer shown %d times", n)
 	}
 }
+
+// n in the command center starts the new task on a cleared screen; the
+// center comes back on the tab and grouping it was left on, also after a
+// restart.
+func TestCenterNewClearsAndViewIsKept(t *testing.T) {
+	t.Parallel()
+	s := start(t, opts{reset: true})
+	s.turn("hello there", "")
+	s.waitIdle()
+	s.keys("Left")
+	s.waitScreen("Agent command center")
+	s.keys("Tab", "Tab", "g") // Working, grouped by directory
+	s.waitScreen("Group: Directory")
+	s.keys("n")
+	s.poll("the main screen", func() bool { return !s.altScreen() })
+	s.waitScreen("› Ask Agent to do anything")
+	s.waitFor(">_ ")
+	time.Sleep(300 * time.Millisecond)
+	if n := s.count("hello there"); n != 0 {
+		t.Errorf("the old chat is still there (%d times):\n%s", n, s.all())
+	}
+	if n := s.count(">_ Agent"); n != 1 {
+		t.Errorf("%d headers:\n%s", n, s.all())
+	}
+	s.keys("Left")
+	s.waitScreen("Group: Directory")
+	s.keys("Escape")
+	s.keys("C-c", "C-c")
+	s.waitExit()
+
+	s2 := start(t, opts{home: s.home})
+	s2.keys("Left")
+	s2.waitScreen("Group: Directory")
+}

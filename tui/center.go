@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"agenttui/config"
 	"agenttui/protocol"
 )
 
@@ -31,11 +32,13 @@ const (
 
 var groupLabels = [...]string{"Needs input", "Working", "Ready", "Inactive"}
 
-// centerFilters are the status tabs (TASK_FILTERS); -1 is All.
+// centerFilters are the status tabs (TASK_FILTERS); -1 is All. id is
+// the name in the config file (tui.agents_view.filter).
 var centerFilters = []struct {
-	label string
-	group int
-}{{"All", -1}, {"Needs you", groupNeedsYou}, {"Working", groupWorking}, {"Ready", groupReady}, {"Inactive", groupInactive}}
+	label, id string
+	group     int
+}{{"All", "all", -1}, {"Needs you", "needs_you", groupNeedsYou}, {"Working", "working", groupWorking},
+	{"Ready", "ready", groupReady}, {"Inactive", "inactive", groupInactive}}
 
 type centerGrouping int
 
@@ -47,6 +50,34 @@ const (
 )
 
 var groupingLabels = [...]string{"Project", "Directory", "Status", "Model"}
+
+// groupingIDs name the groupings in the config file (tui.agents_view.group).
+var groupingIDs = [...]string{"project", "directory", "status", "model"}
+
+// centerView is the command center's tab and grouping, kept while it is
+// closed and in the config file across runs.
+type centerView struct {
+	filter   int
+	grouping centerGrouping
+}
+
+func viewFromConfig(v *config.AgentsView) centerView {
+	var cv centerView
+	if v == nil {
+		return cv
+	}
+	for i, f := range centerFilters {
+		if f.id == v.Filter {
+			cv.filter = i
+		}
+	}
+	for i, id := range groupingIDs {
+		if id == v.Group {
+			cv.grouping = centerGrouping(i)
+		}
+	}
+	return cv
+}
 
 const (
 	centerPage      = 10 // rows per "Show more"
@@ -897,7 +928,8 @@ type centerTimeoutMsg struct{ gen int }
 // openCenter shows the command center and asks for the tasks.
 func (m *model) openCenter() tea.Cmd {
 	if m.center == nil {
-		m.center = &agentCenter{limit: centerPage}
+		// As it was last shown (this run, else the config file).
+		m.center = &agentCenter{limit: centerPage, filter: m.centerView.filter, grouping: m.centerView.grouping}
 	}
 	m.center.help, m.center.notice = false, ""
 	m.out.hold(holdCenter, true)
@@ -914,11 +946,27 @@ func (m *model) requestTasks() tea.Cmd {
 }
 
 func (m *model) closeCenter() {
-	if m.center != nil {
-		m.center.loading = false
+	if c := m.center; c != nil {
+		c.loading = false
+		m.keepCenterView(centerView{c.filter, c.grouping})
 	}
 	m.center = nil
 	m.out.hold(holdCenter, false)
+}
+
+// keepCenterView remembers the center's tab and grouping for its next
+// opening, and saves them when they changed.
+func (m *model) keepCenterView(v centerView) {
+	if v == m.centerView {
+		return
+	}
+	m.centerView = v
+	err := m.saveConfig(func(t *config.TUI) {
+		t.AgentsView = &config.AgentsView{Filter: centerFilters[v.filter].id, Group: groupingIDs[v.grouping]}
+	})
+	if err != nil {
+		m.commit(warningCell(m.st, "Could not save the command center view: "+err.Error()))
+	}
 }
 
 func (m *model) onCenterTimeout(msg centerTimeoutMsg) {
@@ -1008,6 +1056,7 @@ func (m *model) handleCenterKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	c.refreshCurrent(m) // act on the rows as they are now (x on a running task)
 	switch c.handleKey(k, act) {
 	case centerQuit:
+		m.keepCenterView(centerView{c.filter, c.grouping})
 		return m.quit()
 	case centerClose:
 		m.closeCenter()
@@ -1020,13 +1069,13 @@ func (m *model) handleCenterKey(k tea.KeyPressMsg, act string) tea.Cmd {
 			return nil
 		}
 		m.closeCenter()
-		if m.live() {
-			// The task on screen keeps running in the background
-			// (sessions.go); the screen is cleared for the new one.
-			m.submit(protocol.SlashCommand{Name: "new"})
-			return nil
-		}
-		return m.runCommand("new", "")
+		// Like opening a task: the screen is cleared for the new one, and
+		// the task on it keeps running in the background if it was busy
+		// (sessions.go). (/new typed in the composer keeps the old chat
+		// above, as in Codex.)
+		m.clearOnSwitch = true
+		m.submit(protocol.SlashCommand{Name: "new"})
+		return nil
 	case centerStop:
 		r, _ := c.selectedRow()
 		c.notice = m.stopTask(r)

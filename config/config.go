@@ -30,6 +30,17 @@ type TUI struct {
 	TerminalTitle *[]string `toml:"terminal_title,omitempty"`
 	// Keymap maps context → action → key bindings (see tui/keymap.go).
 	Keymap map[string]map[string]Bindings `toml:"keymap,omitempty"`
+	// AgentsView is how the agent command center was last shown: its
+	// status tab and its grouping. Saved when the center closes.
+	AgentsView *AgentsView `toml:"agents_view,omitempty"`
+}
+
+// AgentsView is the command center's view: Filter is "all", "needs_you",
+// "working", "ready" or "inactive"; Group is "project", "directory",
+// "status" or "model". Unknown values fall back to the defaults.
+type AgentsView struct {
+	Filter string `toml:"filter,omitempty"`
+	Group  string `toml:"group,omitempty"`
 }
 
 // Bindings is one action's keys. In TOML it is either a string or an

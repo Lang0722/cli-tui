@@ -217,8 +217,10 @@ type model struct {
 
 	// the agent command center (center.go) and the other sessions'
 	// last known rows (sessions.go)
-	center *agentCenter
-	tasks  map[string]protocol.TaskSummary
+	center        *agentCenter
+	centerView    centerView // its tab and grouping while closed
+	clearOnSwitch bool       // the next session switch clears the screen (center n)
+	tasks         map[string]protocol.TaskSummary
 
 	// /hooks (hooks.go)
 	hooksView   *hooksBrowser
@@ -405,6 +407,7 @@ func newModel(ctx context.Context, opts Options) *model {
 	m.st.Cwd = cwd
 	m.agents.init(m.convo)
 	m.applySurfaceConfig(opts.Config.TUI)
+	m.centerView = viewFromConfig(opts.Config.TUI.AgentsView)
 	if km, err := newKeymap(opts.Config.TUI.Keymap); err == nil {
 		m.setKeymap(km)
 	} else {

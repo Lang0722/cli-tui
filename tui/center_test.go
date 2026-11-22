@@ -1,12 +1,16 @@
 package tui
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/x/ansi"
 
+	"agenttui/config"
 	"agenttui/protocol"
 )
 
@@ -219,5 +223,51 @@ func TestCenterAddsTheUnlistedCurrentTask(t *testing.T) {
 	m.Update(centerTimeoutMsg{gen: m.center.gen})
 	if v := centerText(m); !strings.Contains(v, "Could not load tasks") {
 		t.Errorf("timeout without rows:\n%s", v)
+	}
+}
+
+// The center opens on the tab and grouping it was closed with, this run
+// and the next (tui.agents_view in the config file).
+func TestCenterRemembersItsView(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	m, _ := openCenterModel(t)
+	m.opts.ConfigPath = path
+	m.Update(key("tab"))
+	m.Update(key("tab")) // Working
+	m.Update(key("g"))   // Directory
+	if m.center.filter != 2 || m.center.grouping != groupByDirectory {
+		t.Fatalf("filter %d grouping %d", m.center.filter, m.center.grouping)
+	}
+	m.Update(keyNamed("esc"))
+	if m.center != nil {
+		t.Fatal("esc did not close the center")
+	}
+	m.Update(keyNamed("left"))
+	if v := centerText(m); m.center.filter != 2 || m.center.grouping != groupByDirectory || !strings.Contains(v, "Group: Directory") {
+		t.Errorf("reopened with filter %d grouping %d:\n%s", m.center.filter, m.center.grouping, v)
+	}
+	c, err := config.Load(path)
+	if err != nil || c.TUI.AgentsView == nil || *c.TUI.AgentsView != (config.AgentsView{Filter: "working", Group: "directory"}) {
+		t.Fatalf("saved %+v %v", c.TUI.AgentsView, err)
+	}
+	// The next run starts from the file.
+	be := &recBackend{ch: make(chan protocol.Event)}
+	m2 := newModel(context.Background(), Options{Backend: be, Commands: DefaultCommands, Config: c, ConfigPath: path})
+	m2.width, m2.height = 100, 24
+	evIn(m2, "", protocol.SessionConfigured{Model: "x", Cwd: "/tmp/project", SessionID: "s1"})
+	m2.Update(keyNamed("left"))
+	if m2.center == nil || m2.center.filter != 2 || m2.center.grouping != groupByDirectory {
+		t.Errorf("new run opened with %+v", m2.center)
+	}
+	// Unknown names (an edited file) fall back to the defaults.
+	if v := viewFromConfig(&config.AgentsView{Filter: "soon", Group: "planet"}); v != (centerView{}) {
+		t.Errorf("unknown names gave %+v", v)
+	}
+	// Closing without a change doesn't rewrite the file.
+	before, _ := os.Stat(path)
+	time.Sleep(10 * time.Millisecond)
+	m2.Update(keyNamed("esc"))
+	if after, _ := os.Stat(path); !after.ModTime().Equal(before.ModTime()) {
+		t.Error("the config was rewritten without a change")
 	}
 }

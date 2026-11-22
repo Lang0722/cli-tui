@@ -331,6 +331,11 @@ task, `x` stops a working or waiting task, `g` cycles the grouping
 more" loads ten more tasks. Codex' search, rename, fork, archive, hide,
 delete and pins are not ported yet.
 
+The center opens on the tab and grouping it was left on, also in the
+next run (saved as `tui.agents_view` in the settings file). `n` starts the
+new task on a cleared screen, as opening a task does; `/new` typed in the
+prompt keeps the old chat above the new header, as in Codex.
+
 Opening another task (or `n`) while a turn runs does not stop it: like
 Codex, the task goes on in the background, the messages queued behind it
 are sent to it, and its row updates live (Working, Needs input, then Ready
@@ -390,14 +395,19 @@ input is pending.
 ## Settings
 
 `$XDG_CONFIG_HOME/agenttui/config.toml` (or `-config FILE`). `/statusline`,
-`/title` and `/keymap` rewrite it; unknown keys or an invalid keymap stop the
-UI at startup with an error.
+`/title` and `/keymap` rewrite it, and so does the agent command center when
+its tab or grouping changed; unknown keys or an invalid keymap stop the UI
+at startup with an error.
 
 ```toml
 [tui]
 status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-remaining"]
 status_line_use_colors = true
 terminal_title = ["activity", "thread-name", "project-name"]
+
+[tui.agents_view]                   # the command center's last view
+filter = "working"                  # all, needs_you, working, ready, inactive
+group = "directory"                 # project, directory, status, model
 
 [tui.keymap.global]
 open_transcript = "f5"              # one key

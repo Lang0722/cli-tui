@@ -263,17 +263,40 @@ func TestCenterNewWhileRunning(t *testing.T) {
 	if tr := cellsText(m, m.committed); strings.Contains(tr, "first prompt") || strings.Contains(tr, "Half an answer") {
 		t.Errorf("old conversation kept:\n%s", tr)
 	}
-	// An idle session's /new keeps the old behaviour (transcript stays).
-	m2, _ := agentModel()
-	evS(m2, "a", "", protocol.SessionConfigured{Model: "x", Cwd: "/w", SessionID: "a"})
-	typeCommand(m2, "hello")
-	evS(m2, "a", "", protocol.TaskStarted{})
-	evS(m2, "a", "", protocol.TaskComplete{})
-	m2.Update(keyNamed("left"))
-	m2.Update(key("n"))
-	evS(m2, "b", "", protocol.SessionConfigured{Model: "x", Cwd: "/w", SessionID: "b"})
-	if tr := cellsText(m2, m2.committed); !strings.Contains(tr, "hello") || !strings.Contains(tr, "/new") {
-		t.Errorf("idle /new transcript:\n%s", tr)
+}
+
+// n in the command center clears the screen for the new task whether or
+// not the old one runs, like opening a task; /new typed in the composer
+// keeps the old chat above the new header (Codex).
+func TestCenterNewClearsTheScreen(t *testing.T) {
+	idle := func() *model {
+		m, _ := agentModel()
+		evS(m, "a", "", protocol.SessionConfigured{Model: "x", Cwd: "/w", SessionID: "a"})
+		typeCommand(m, "hello")
+		evS(m, "a", "", protocol.TaskStarted{})
+		evS(m, "a", "", protocol.TaskComplete{})
+		return m
+	}
+	m := idle()
+	m.Update(keyNamed("left"))
+	m.Update(key("n"))
+	evS(m, "b", "", protocol.SessionConfigured{Model: "x", Cwd: "/w", SessionID: "b"})
+	if m.out.held&holdClear == 0 {
+		t.Error("the screen was not cleared")
+	}
+	if tr := cellsText(m, m.committed); strings.Contains(tr, "hello") || strings.Contains(tr, "/new") || !strings.Contains(tr, ">_ ") {
+		t.Errorf("center n transcript:\n%s", tr)
+	}
+	// The next switch is not cleared because of it.
+	if m.clearOnSwitch {
+		t.Error("the clear request outlived its switch")
+	}
+
+	m = idle()
+	typeCommand(m, "/new")
+	evS(m, "b", "", protocol.SessionConfigured{Model: "x", Cwd: "/w", SessionID: "b"})
+	if tr := cellsText(m, m.committed); !strings.Contains(tr, "hello") || !strings.Contains(tr, "/new") {
+		t.Errorf("typed /new transcript:\n%s", tr)
 	}
 }
 

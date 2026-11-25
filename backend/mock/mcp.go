@@ -7,21 +7,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"agenttui/backend/mcp"
+	"agenttui/backend/mcpconn"
 	"agenttui/protocol"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// MCP: the mock runs real MCP servers with backend/mcp and maps them onto
-// the UI protocol (protocol/mcp.go). This file is the part a real backend
-// would copy:
+// MCP: the mock runs real MCP servers with the official Go SDK (connected
+// through backend/mcpconn) and maps them onto the UI protocol
+// (protocol/mcp.go). This file is the part a real backend would copy:
 //
 //   - Servers come from config.toml's [mcp_servers] (Options.McpServers),
 //     or the built-in demo servers (mcpdemo.go) when there are none.
@@ -35,14 +39,16 @@ import (
 //     first with an ElicitationRequest of kind tool_call, unless allowed
 //     for the session, always (mcp-approvals.json), or the approval mode
 //     is "never". The call is shown with ToolCallBegin/End.
-//   - A server's own elicitation/create during a tool call is forwarded to
-//     the conversation that made the call (the call's context carries the
-//     turn) and the user's answer goes back to the server.
+//   - A server's own elicitation during a tool call is forwarded to the
+//     conversation that made the call and the user's answer goes back to
+//     the server. On 2026-07-28 the SDK calls the handler with the call's
+//     context, which carries the turn; an older server's
+//     elicitation/create goes to the newest call in flight on it.
 
 // Options configures the mock backend.
 type Options struct {
 	// McpServers are the [mcp_servers] tables; nil uses the demo servers.
-	McpServers map[string]mcp.ServerConfig
+	McpServers map[string]mcpconn.ServerConfig
 	// McpLog receives MCP servers' stderr and protocol logs (nil: dropped).
 	McpLog io.Writer
 }
@@ -52,17 +58,18 @@ var mcpDelay = time.Millisecond
 
 type mcpServer struct {
 	name  string
-	cfg   mcp.ServerConfig
-	open  func() (mcp.Transport, error) // demo servers; nil: cfg.Open
-	oauth bool                          // demo github: "/mcp login" signs in
+	cfg   mcpconn.ServerConfig
+	open  func() (*mcpconn.Transport, error) // demo servers; nil: cfg.Transport
+	oauth bool                               // demo github: "/mcp login" signs in
 
 	status     string // protocol.McpServer*
 	authFailed bool   // the last start got 401/403
-	client     *mcp.Client
-	tools      []mcp.Tool
-	resources  []mcp.Resource
-	templates  []mcp.ResourceTemplate
-	gen        int // bumped by every (re)start; older attempts give up
+	client     *mcp.ClientSession
+	tools      []*mcp.Tool
+	resources  []*mcp.Resource
+	templates  []*mcp.ResourceTemplate
+	calls      []*turn // turns with a tool call in flight here, oldest first
+	gen        int     // bumped by every (re)start; older attempts give up
 }
 
 type mcpState struct {
@@ -179,38 +186,44 @@ func (b *Backend) connectMcp(s *mcpServer, gen int) {
 	cfg, open, name := s.cfg, s.open, s.name
 	b.mu.Unlock()
 	if open == nil {
-		open = func() (mcp.Transport, error) { return cfg.Open(b.mcp.log) }
+		open = func() (*mcpconn.Transport, error) { return cfg.Transport(b.mcp.log) }
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.StartupTimeout())
 	defer cancel()
-	var c *mcp.Client
-	var tools []mcp.Tool
-	var resources []mcp.Resource
-	var templates []mcp.ResourceTemplate
+	var c *mcp.ClientSession
+	var tools []*mcp.Tool
+	var resources []*mcp.Resource
+	var templates []*mcp.ResourceTemplate
 	t, err := open()
 	if err == nil {
-		c, err = mcp.Connect(ctx, t, mcp.ClientOptions{
-			Info:   mcp.Implementation{Name: "agenttui-mock", Version: version},
-			Elicit: b.mcpElicitFor(name),
-			OnNotification: func(method string, _ json.RawMessage) {
-				if method == "notifications/tools/list_changed" {
-					go b.refreshMcpTools(name)
-				}
+		client := mcp.NewClient(&mcp.Implementation{Name: "agenttui-mock", Version: version}, &mcp.ClientOptions{
+			ElicitationHandler: b.mcpElicitFor(name, t),
+			ToolListChangedHandler: func(context.Context, *mcp.ToolListChangedRequest) {
+				go b.refreshMcpTools(name)
 			},
-			Logf: b.mcpLogf,
+			LoggingMessageHandler: func(_ context.Context, r *mcp.LoggingMessageRequest) {
+				b.mcpLogf("mcp %s: [%s] %v", name, r.Params.Level, r.Params.Data)
+			},
+			Capabilities: &mcp.ClientCapabilities{}, // no roots (elicitation is added for the handler)
 		})
+		c, err = client.Connect(ctx, t, nil)
+		if err != nil {
+			err = t.Explain(err)
+		}
 	}
 	if err == nil {
-		tools, err = c.ListTools(ctx)
+		tools, err = collectAll(c.Tools(ctx, nil))
 	}
 	if err == nil {
 		// Resources are optional extras: a failure is logged, not fatal.
-		var rerr error
-		if resources, rerr = c.ListResources(ctx); rerr != nil {
-			b.mcpLogf("mcp %s: resources/list: %v", name, rerr)
-		}
-		if templates, rerr = c.ListResourceTemplates(ctx); rerr != nil {
-			b.mcpLogf("mcp %s: resources/templates/list: %v", name, rerr)
+		if caps := c.InitializeResult().Capabilities; caps != nil && caps.Resources != nil {
+			var rerr error
+			if resources, rerr = collectAll(c.Resources(ctx, nil)); rerr != nil {
+				b.mcpLogf("mcp %s: resources/list: %v", name, rerr)
+			}
+			if templates, rerr = collectAll(c.ResourceTemplates(ctx, nil)); rerr != nil {
+				b.mcpLogf("mcp %s: resources/templates/list: %v", name, rerr)
+			}
 		}
 	}
 	up := protocol.McpStartupUpdate{Server: name, Status: protocol.McpStartupReady}
@@ -222,7 +235,7 @@ func (b *Backend) connectMcp(s *mcpServer, gen int) {
 		}
 		return
 	}
-	s.authFailed = mcp.IsAuthError(err)
+	s.authFailed = mcpconn.IsAuthError(err)
 	if err != nil {
 		if c != nil {
 			c.Close()
@@ -239,25 +252,37 @@ func (b *Backend) connectMcp(s *mcpServer, gen int) {
 	b.mu.Unlock()
 	b.notice(up)
 	if err == nil {
-		go b.watchMcp(s, gen, c)
+		go b.watchMcp(s, gen, c, t)
 	}
 }
 
+// collectAll drains one of the SDK's paginated listings.
+func collectAll[T any](seq iter.Seq2[T, error]) ([]T, error) {
+	var out []T
+	for v, err := range seq {
+		if err != nil {
+			return out, err
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 // mcpStartupError words a failed start as Codex does.
-func mcpStartupError(name string, cfg mcp.ServerConfig, err error) string {
+func mcpStartupError(name string, cfg mcpconn.ServerConfig, err error) string {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		secs := strconv.FormatFloat(cfg.StartupTimeout().Seconds(), 'f', -1, 64)
 		return fmt.Sprintf("MCP client for `%s` timed out after %s seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.%s]\nstartup_timeout_sec = XX", name, secs, name)
-	case mcp.IsAuthError(err):
+	case mcpconn.IsAuthError(err):
 		return fmt.Sprintf("The `%s` MCP server is not logged in. Run `/mcp login %s`.", name, name)
 	}
 	return fmt.Sprintf("MCP client for `%s` failed to start: %v", name, err)
 }
 
 // watchMcp marks a server failed when its connection drops on its own.
-func (b *Backend) watchMcp(s *mcpServer, gen int, c *mcp.Client) {
-	<-c.Done()
+func (b *Backend) watchMcp(s *mcpServer, gen int, c *mcp.ClientSession, t *mcpconn.Transport) {
+	err := c.Wait()
 	b.mu.Lock()
 	current := s.gen == gen && s.client == c && !b.mcp.closed
 	if current {
@@ -265,7 +290,8 @@ func (b *Backend) watchMcp(s *mcpServer, gen int, c *mcp.Client) {
 	}
 	b.mu.Unlock()
 	if current {
-		b.notice(protocol.Warning{Message: fmt.Sprintf("MCP server `%s` stopped: %v", s.name, c.Err())})
+		err = t.Ended(err)
+		b.notice(protocol.Warning{Message: fmt.Sprintf("MCP server `%s` stopped: %v", s.name, err)})
 	}
 }
 
@@ -273,7 +299,7 @@ func (b *Backend) watchMcp(s *mcpServer, gen int, c *mcp.Client) {
 func (b *Backend) refreshMcpTools(name string) {
 	b.mu.Lock()
 	s := b.mcp.servers[name]
-	var c *mcp.Client
+	var c *mcp.ClientSession
 	if s != nil {
 		c = s.client
 	}
@@ -283,7 +309,7 @@ func (b *Backend) refreshMcpTools(name string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	tools, err := c.ListTools(ctx)
+	tools, err := collectAll(c.Tools(ctx, nil))
 	if err != nil {
 		b.mcpLogf("mcp %s: tools/list after list_changed: %v", name, err)
 		return
@@ -396,7 +422,7 @@ func (b *Backend) restartMcp() {
 func (b *Backend) closeMcp() {
 	b.mu.Lock()
 	b.mcp.closed = true
-	var clients []*mcp.Client
+	var clients []*mcp.ClientSession
 	for _, s := range b.mcp.servers {
 		if s.client != nil {
 			clients = append(clients, s.client)
@@ -467,29 +493,53 @@ func (b *Backend) resolveElicitation(op protocol.ResolveElicitation) {
 	b.refresh(l)
 }
 
-// mcpElicitFor answers server's elicitation/create: it asks the user in
-// the conversation whose tool call the request came with.
-func (b *Backend) mcpElicitFor(server string) func(context.Context, mcp.ElicitRequest) (mcp.ElicitResult, error) {
-	return func(ctx context.Context, req mcp.ElicitRequest) (mcp.ElicitResult, error) {
-		t, _ := ctx.Value(mcpTurnKey{}).(*turn)
+// mcpElicitFor answers server's elicitations: it asks the user in the
+// conversation whose tool call the request came with.
+func (b *Backend) mcpElicitFor(server string, tr *mcpconn.Transport) func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+	return func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		cancelled := &mcp.ElicitResult{Action: "cancel"}
+		t, _ := ctx.Value(mcpTurnKey{}).(*turn) // 2026-07-28: the call's context
 		if t == nil {
-			// Not during one of our tool calls: no conversation to ask in.
-			return mcp.ElicitResult{Action: mcp.ElicitCancel}, nil
+			t = b.mcpCaller(server) // an older server's elicitation/create
 		}
+		if t == nil || req.Params.Mode == "url" {
+			// Not during one of our tool calls: no conversation to ask in.
+			return cancelled, nil
+		}
+		// Ask until the server gives up or the turn ends.
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		defer context.AfterFunc(t.ctx, cancel)()
 		r, ok := b.elicit(ctx, t.l, "", protocol.ElicitationRequest{
 			ServerName: server, RequestID: b.nextMcpID("elicit"),
-			Message: req.Message, RequestedSchema: req.RequestedSchema,
+			Message: req.Params.Message, RequestedSchema: tr.OrderedSchema(req.Params.RequestedSchema),
 		})
 		switch {
 		case !ok:
-			return mcp.ElicitResult{Action: mcp.ElicitCancel}, nil
+			return cancelled, nil
 		case r.Action == protocol.ElicitationAccept:
-			return mcp.ElicitResult{Action: mcp.ElicitAccept, Content: r.Content}, nil
+			var content map[string]any
+			if len(r.Content) > 0 {
+				if err := json.Unmarshal(r.Content, &content); err != nil {
+					return nil, fmt.Errorf("elicitation answer: %w", err)
+				}
+			}
+			return &mcp.ElicitResult{Action: "accept", Content: content}, nil
 		case r.Action == protocol.ElicitationDecline:
-			return mcp.ElicitResult{Action: mcp.ElicitDecline}, nil
+			return &mcp.ElicitResult{Action: "decline"}, nil
 		}
-		return mcp.ElicitResult{Action: mcp.ElicitCancel}, nil
+		return cancelled, nil
 	}
+}
+
+// mcpCaller is the turn with the newest tool call in flight on server.
+func (b *Backend) mcpCaller(server string) *turn {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s := b.mcp.servers[server]; s != nil && len(s.calls) > 0 {
+		return s.calls[len(s.calls)-1]
+	}
+	return nil
 }
 
 // mcpOutcome is what a tool call came to.
@@ -508,15 +558,15 @@ func (t *turn) callMcp(server, tool string, args json.RawMessage) (mcpOutcome, b
 	}
 	b.mu.Lock()
 	s := b.mcp.servers[server]
-	var c *mcp.Client
+	var c *mcp.ClientSession
 	var def *mcp.Tool
-	var cfg mcp.ServerConfig
+	var cfg mcpconn.ServerConfig
 	status := ""
 	if s != nil {
 		c, cfg, status = s.client, s.cfg, s.status
-		for i := range s.tools {
-			if s.tools[i].Name == tool {
-				def = &s.tools[i]
+		for _, d := range s.tools {
+			if d.Name == tool {
+				def = d
 			}
 		}
 	}
@@ -531,12 +581,12 @@ func (t *turn) callMcp(server, tool string, args json.RawMessage) (mcpOutcome, b
 	case def == nil:
 		return mcpOutcome{text: "The `" + server + "` MCP server has no tool `" + tool + "`.", isError: true}, true
 	}
-	if !def.ReadOnly() && !allowed {
+	if !(def.Annotations != nil && def.Annotations.ReadOnlyHint) && !allowed {
 		r, ok := b.elicit(t.ctx, t.l, "", protocol.ElicitationRequest{
 			ServerName: server, RequestID: b.nextMcpID("tool"),
 			Message:    fmt.Sprintf("Allow the %s MCP server to run tool %q?", server, tool),
 			Kind:       protocol.ElicitationToolCall,
-			ToolParams: toolParams(*def, args),
+			ToolParams: toolParams(def, args),
 			Persist:    []string{protocol.PersistSession, protocol.PersistAlways},
 		})
 		if !ok {
@@ -563,16 +613,25 @@ func (t *turn) callMcp(server, tool string, args json.RawMessage) (mcpOutcome, b
 	id := b.nextMcpID("mcp")
 	t.emit(protocol.ToolCallBegin{CallID: id, Server: server, Tool: tool, Arguments: compact.String()})
 	start := time.Now()
+	b.mu.Lock()
+	s.calls = append(s.calls, t)
+	b.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.WithValue(t.ctx, mcpTurnKey{}, t), cfg.ToolTimeout())
-	res, err := c.CallTool(ctx, tool, args)
+	res, err := c.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	timedOut := ctx.Err() == context.DeadlineExceeded && t.ctx.Err() == nil
 	cancel()
+	b.mu.Lock()
+	if i := slices.Index(s.calls, t); i >= 0 {
+		s.calls = slices.Delete(s.calls, i, i+1)
+	}
+	b.mu.Unlock()
 	if t.ctx.Err() != nil {
 		t.emit(protocol.ToolCallEnd{CallID: id, Result: "interrupted", IsError: true, DurationMs: time.Since(start).Milliseconds()})
 		return mcpOutcome{}, false
 	}
 	out := mcpOutcome{}
 	switch {
-	case errors.Is(err, context.DeadlineExceeded):
+	case timedOut:
 		out = mcpOutcome{text: fmt.Sprintf("timed out after %s (tool_timeout_sec)", cfg.ToolTimeout()), isError: true}
 	case err != nil:
 		out = mcpOutcome{text: err.Error(), isError: true}
@@ -587,38 +646,43 @@ func (t *turn) callMcp(server, tool string, args json.RawMessage) (mcpOutcome, b
 func renderToolResult(r *mcp.CallToolResult) string {
 	var parts []string
 	for _, c := range r.Content {
-		switch c.Type {
-		case "text":
+		switch c := c.(type) {
+		case *mcp.TextContent:
 			parts = append(parts, c.Text)
-		case "image", "audio":
-			parts = append(parts, fmt.Sprintf("<%s %s, %d bytes base64>", c.Type, c.MimeType, len(c.Data)))
-		case "resource_link":
+		case *mcp.ImageContent:
+			parts = append(parts, fmt.Sprintf("<image %s, %d bytes>", c.MIMEType, len(c.Data)))
+		case *mcp.AudioContent:
+			parts = append(parts, fmt.Sprintf("<audio %s, %d bytes>", c.MIMEType, len(c.Data)))
+		case *mcp.ResourceLink:
 			parts = append(parts, "link: "+c.URI)
-		case "resource":
+		case *mcp.EmbeddedResource:
 			if c.Resource != nil && c.Resource.Text != "" {
 				parts = append(parts, c.Resource.Text)
 			} else if c.Resource != nil {
 				parts = append(parts, "<resource "+c.Resource.URI+">")
 			}
 		default:
-			parts = append(parts, "<"+c.Type+" content>")
+			parts = append(parts, fmt.Sprintf("<%T>", c))
 		}
 	}
-	if len(parts) == 0 && len(r.StructuredContent) > 0 {
-		return string(r.StructuredContent)
+	if len(parts) == 0 && r.StructuredContent != nil {
+		data, _ := json.Marshal(r.StructuredContent)
+		return string(data)
 	}
 	return strings.Join(parts, "\n")
 }
 
 // toolParams are a call's arguments in their order, named by the input
 // schema's property titles.
-func toolParams(t mcp.Tool, args json.RawMessage) []protocol.ElicitationParam {
+func toolParams(t *mcp.Tool, args json.RawMessage) []protocol.ElicitationParam {
 	var schema struct {
 		Properties map[string]struct {
 			Title string `json:"title"`
 		} `json:"properties"`
 	}
-	_ = json.Unmarshal(t.InputSchema, &schema)
+	if raw, err := json.Marshal(t.InputSchema); err == nil {
+		_ = json.Unmarshal(raw, &schema)
+	}
 	dec := json.NewDecoder(bytes.NewReader(args))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return nil
@@ -712,7 +776,7 @@ func clip(s string, lines int) string {
 func (t *turn) mcpReadTurn(uri string) bool {
 	t.b.mu.Lock()
 	var server string
-	var c *mcp.Client
+	var c *mcp.ClientSession
 	names := make([]string, 0, len(t.b.mcp.servers))
 	for n := range t.b.mcp.servers {
 		names = append(names, n)
@@ -742,7 +806,7 @@ func (t *turn) mcpReadTurn(uri string) bool {
 	}
 	ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 	defer cancel()
-	r, err := c.ReadResource(ctx, uri)
+	r, err := c.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
 	if t.ctx.Err() != nil {
 		return false
 	}
@@ -754,7 +818,7 @@ func (t *turn) mcpReadTurn(uri string) bool {
 		if rc.Text != "" {
 			body = append(body, rc.Text)
 		} else {
-			body = append(body, fmt.Sprintf("<%s, %d bytes base64>", rc.MimeType, len(rc.Blob)))
+			body = append(body, fmt.Sprintf("<%s, %d bytes>", rc.MIMEType, len(rc.Blob)))
 		}
 	}
 	return t.say("`" + uri + "` (from `" + server + "`):\n\n```\n" + clip(strings.Join(body, "\n"), 40) + "\n```")

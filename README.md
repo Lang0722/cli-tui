@@ -9,8 +9,8 @@ a small event protocol.
 16k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
 streaming, composer, approvals, pickers, transcript pager, resume and
 backtrack, subagent threads, MCP (the `/mcp` inventory, startup status and
-elicitation forms, plus a real MCP client in `backend/mcp` for your backend
-to use), the configurable status line and window title,
+elicitation forms, with the mock running real servers through the official
+Go SDK), the configurable status line and window title,
 and the remappable keymap. Much of the rest of Codex depends on Codex's own services (login,
 model catalog, MCP OAuth, plugins, voice, cloud tasks, the agents dashboard),
 and that part is out of scope. The [parity table](#parity-with-codex) at the
@@ -136,8 +136,8 @@ tui.Run(ctx, tui.Options{Backend: myLoop})
   It keeps no history, so it answers `list_sessions` with an empty list and
   `resume_session` with an `error`.
 - `backend/mock` shows realistic event ordering, session storage, rewind and pickers.
-- `backend/mcp` is a complete MCP client (and server) your backend can use
-  as is or read as a reference; see [MCP servers](#mcp-servers).
+- `backend/mcpconn` and `backend/mock/mcp.go` show how a backend connects to
+  MCP servers with the official Go SDK; see [MCP servers](#mcp-servers).
 
 ```
 stdin  ← {"type":"user_input","text":"fix the tests","images":["/tmp/a.png"]}
@@ -342,55 +342,53 @@ Two deliberate differences from current Codex: the startup row shows even
 when no turn is running, and startup warnings are transcript cells (Codex
 now collects them in its warnings view).
 
-### The MCP client (`backend/mcp`)
+### Connecting to servers (the official SDK)
 
-The servers themselves are the backend's job. `backend/mcp` is a real
-implementation of the MCP spec (2025-06-18; it also accepts 2025-03-26 and
-2024-11-05) in the standard library only, for your backend to use or to
-port. The mock backend runs on it.
+The servers themselves are the backend's job. The mock connects to them
+with the official Go SDK, `github.com/modelcontextprotocol/go-sdk` (v1.8.0,
+vendored), which does the protocol: the handshake and version negotiation
+(2026-07-28 down to 2024-11-05), paging, tools, resources, cancellation,
+notifications, and the stdio and streamable HTTP transports.
+`backend/mcpconn` adds what the SDK leaves to the application:
 
 ```go
-cfg := mcp.ServerConfig{Command: "npx", Args: []string{"-y", "@modelcontextprotocol/server-everything"}}
-t, err := cfg.Open(logFile)                // stdio subprocess, or streamable HTTP with url
+cfg := mcpconn.ServerConfig{Command: "npx", Args: []string{"-y", "@modelcontextprotocol/server-everything"}}
+t, err := cfg.Transport(logFile)          // stdio subprocess, or streamable HTTP with url
+client := mcp.NewClient(&mcp.Implementation{Name: "my-agent", Version: "1.0"},
+	&mcp.ClientOptions{ElicitationHandler: askTheUser})
 start, cancel := context.WithTimeout(ctx, cfg.StartupTimeout())
-c, err := mcp.Connect(start, t, mcp.ClientOptions{
-	Info:   mcp.Implementation{Name: "my-agent", Version: "1.0"},
-	Elicit: askTheUser,                     // func(ctx, mcp.ElicitRequest) (mcp.ElicitResult, error)
-})
+cs, err := client.Connect(start, t, nil)
 cancel()
-tools, err := c.ListTools(ctx)             // paginated; also ListResources, ListResourceTemplates, ReadResource
-res, err := c.CallTool(ctx, "echo", json.RawMessage(`{"message":"hi"}`))
-defer c.Close()
+if err != nil {
+	return t.Explain(err)                 // "server exited with exit status 1: <last stderr line>", *AuthError, ...
+}
+defer cs.Close()
+for tool, err := range cs.Tools(ctx, nil) { ... }   // pages for you; also Resources, ResourceTemplates
+res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "echo", Arguments: map[string]any{"message": "hi"}})
 ```
 
-- **Protocol:** JSON-RPC 2.0 with the `initialize` handshake and version
-  negotiation, `ping` both ways, cursor pagination, `tools/call` results
-  (`content` blocks, `isError`, `structuredContent`), resources and
-  templates, `notifications/tools/list_changed` (`OnNotification`) and
-  server logging (`Logf`). Cancelling a call's context sends
-  `notifications/cancelled`.
-- **Transports:** `StartStdio` (newline-delimited JSON, the server in its own
-  process group; Close closes stdin, then SIGTERM, then SIGKILL; a server
-  that dies reports `server exited with exit status 1: <its last stderr
-  line>`), `NewHTTPTransport` (streamable HTTP: POST with JSON or SSE
-  replies, `Mcp-Session-Id`, `MCP-Protocol-Version`, the GET stream for
-  server-initiated messages, DELETE on Close; 401/403 is an `*AuthError`,
-  an expired session `ErrSessionExpired`), `InProcess` and
-  `NewStreamTransport`.
-- **Elicitation:** a server's `elicitation/create` calls `Elicit` with the
-  context of the tool call that caused it, so put your turn (or session) on
-  the context you pass to `CallTool` and route the question to it. The
-  mock does that and turns the request into an `elicitation_request` for
-  the UI.
 - **Config:** `ServerConfig` reads Codex's `[mcp_servers.<name>]` keys:
   `command`, `args`, `env`, `env_vars`, `cwd`, `url`,
   `bearer_token_env_var`, `http_headers`, `env_http_headers`, `enabled`,
   `startup_timeout_sec` (10), `tool_timeout_sec` (60), `enabled_tools`,
   `disabled_tools`. Stdio servers get only `HOME`, `PATH`, `USER`, `LANG`
   and a few more from your environment, plus `env_vars` and `env`.
-- **Server:** `mcp.NewServer` with `AddTool`, `AddResource`, `Elicit` from a
-  tool handler, `ServeStream` (stdio) and `HTTPHandler` (streamable HTTP),
-  used by the tests and the mock's demo servers.
+- **Transports:** a stdio server runs in its own process group (Unix) and
+  stops the spec's way (close stdin, then SIGTERM, then SIGKILL), with its
+  stderr kept. HTTP requests carry the configured headers and token.
+- **Errors:** `Explain` (a failed connect) and `Ended` (what
+  `cs.Wait()` returned) give the exit status and last stderr line of a
+  stdio server, or an `*AuthError` for a 401/403, which the SDK reports
+  only as text.
+- **Form order:** the SDK decodes an elicitation's `requestedSchema` into a
+  map and loses its property order; `t.OrderedSchema(schema)` gives the
+  server's bytes back, so the form asks in the server's order.
+- **Which conversation asks:** a server on 2026-07-28 returns a form inside
+  the tool call's result, and the SDK calls your handler with `CallTool`'s
+  context; put your turn on it. An older server sends `elicitation/create`
+  on its own, with no call context: route it to the call in flight on that
+  server. The mock does both and turns the request into an
+  `elicitation_request` for the UI.
 
 ### The mock's servers
 
@@ -788,7 +786,7 @@ go test ./...
 protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, lineage.go, hooks.go, tasks.go, mcp.go, wire.go)
 config/          settings file (TOML)
 backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, /cd, /fork, hooks, tasks, MCP servers, real "!" commands
-backend/mcp      MCP client and server: JSON-RPC, stdio and streamable HTTP, elicitation, [mcp_servers] config
+backend/mcpconn  [mcp_servers] config, stdio and HTTP transports and error reasons for the official MCP Go SDK
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
                  approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills, lineage, hooks, center, mcp)

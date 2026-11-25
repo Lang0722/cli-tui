@@ -11,39 +11,42 @@ import (
 	"testing"
 	"time"
 
-	"agenttui/backend/mcp"
+	"agenttui/backend/mcpconn"
 	"agenttui/protocol"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// TestMain doubles as a configured stdio MCP server (MOCK_MCP_SERVER).
+// TestMain doubles as a configured stdio MCP server (MOCK_MCP_SERVER), an
+// SDK server on its stdin and stdout.
 func TestMain(m *testing.M) {
 	switch os.Getenv("MOCK_MCP_SERVER") {
 	case "serve":
-		s := mcp.NewServer("ext", "1.0")
-		s.AddTool(mcp.Tool{Name: "echo", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: boolp(true)}},
-			func(ctx context.Context, r *mcp.ToolRequest) (*mcp.CallToolResult, error) {
-				var a struct{ Text string }
-				_ = json.Unmarshal(r.Arguments, &a)
-				return textResult("echo: " + a.Text), nil
-			})
-		s.AddTool(mcp.Tool{Name: "write"}, func(ctx context.Context, r *mcp.ToolRequest) (*mcp.CallToolResult, error) {
+		s := mcp.NewServer(&mcp.Implementation{Name: "ext", Version: "1.0"}, nil)
+		add := func(name string, ro bool, h mcp.ToolHandler) {
+			s.AddTool(&mcp.Tool{Name: name, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: ro}, InputSchema: noArgs}, h)
+		}
+		add("echo", true, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			var a struct{ Text string }
+			_ = json.Unmarshal(r.Params.Arguments, &a)
+			return textResult("echo: " + a.Text), nil
+		})
+		add("write", false, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return textResult("written"), nil
 		})
-		s.AddTool(mcp.Tool{Name: "secret"}, func(ctx context.Context, r *mcp.ToolRequest) (*mcp.CallToolResult, error) {
+		add("secret", false, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return textResult("should be filtered"), nil
 		})
-		s.AddTool(mcp.Tool{Name: "slow", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: boolp(true)}},
-			func(ctx context.Context, r *mcp.ToolRequest) (*mcp.CallToolResult, error) {
-				<-ctx.Done()
-				return nil, ctx.Err()
-			})
-		s.AddTool(mcp.Tool{Name: "die", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: boolp(true)}},
-			func(ctx context.Context, r *mcp.ToolRequest) (*mcp.CallToolResult, error) {
-				os.Stderr.WriteString("ext: crashing on purpose\n")
-				os.Exit(1)
-				return nil, nil
-			})
-		_ = s.ServeStream(context.Background(), os.Stdin, os.Stdout)
+		add("slow", true, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		add("die", true, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			os.Stderr.WriteString("ext: crashing on purpose\n")
+			os.Exit(1)
+			return nil, nil
+		})
+		_ = s.Run(context.Background(), &mcp.StdioTransport{})
 		os.Exit(0)
 	case "hang":
 		time.Sleep(time.Minute)
@@ -52,12 +55,12 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func extServer(t *testing.T, mode string) mcp.ServerConfig {
+func extServer(t *testing.T, mode string) mcpconn.ServerConfig {
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return mcp.ServerConfig{Command: exe, Env: map[string]string{"MOCK_MCP_SERVER": mode}}
+	return mcpconn.ServerConfig{Command: exe, Env: map[string]string{"MOCK_MCP_SERVER": mode}}
 }
 
 // startupOutcome matches the outcome of server's startup.
@@ -137,7 +140,7 @@ func TestMockMcpStartupAndLogin(t *testing.T) {
 	}
 	// The inventory is what the real servers listed.
 	s := w.mcpServers()
-	if d := s["docs"]; d.Status != protocol.McpServerConnected || toolNames(d) != "search,fetch_page" ||
+	if d := s["docs"]; d.Status != protocol.McpServerConnected || toolNames(d) != "fetch_page,search" ||
 		len(d.Resources) != 1 || d.Resources[0].URI != "docs://go/std" || d.Resources[0].Title != "Go standard library" ||
 		len(d.ResourceTemplates) != 1 || d.ResourceTemplates[0].URITemplate != "docs://go/{package}" || d.Auth != protocol.McpAuthUnsupported {
 		t.Errorf("docs: %+v", d)
@@ -172,7 +175,7 @@ func TestMockMcpStartupAndLogin(t *testing.T) {
 		t.Errorf("login round: %v %+v", starts, outcomes)
 	}
 	if g := w.mcpServers()["github"]; g.Status != protocol.McpServerConnected || g.Auth != protocol.McpAuthOAuth ||
-		toolNames(g) != "get_pull_request,list_pull_requests,create_review" {
+		toolNames(g) != "create_review,get_pull_request,list_pull_requests" {
 		t.Errorf("github after login: %+v", g)
 	}
 
@@ -470,7 +473,7 @@ func TestMockMcpElicitationCatchUpAndInterrupt(t *testing.T) {
 	}
 }
 
-func newConfigured(t *testing.T, servers map[string]mcp.ServerConfig) *watcher {
+func newConfigured(t *testing.T, servers map[string]mcpconn.ServerConfig) *watcher {
 	t.Helper()
 	b, err := NewWithOptions(t.TempDir(), Options{McpServers: servers})
 	if err != nil {
@@ -497,7 +500,7 @@ func TestMockMcpConfiguredServers(t *testing.T) {
 	hang.StartupTimeoutSec = &quick
 	off := extServer(t, "serve")
 	off.Enabled = boolp(false)
-	w := newConfigured(t, map[string]mcp.ServerConfig{
+	w := newConfigured(t, map[string]mcpconn.ServerConfig{
 		"ext": ext, "hang": hang, "off": off,
 		"missing": {Command: "/nonexistent/mcp-server"},
 	})
@@ -518,7 +521,7 @@ func TestMockMcpConfiguredServers(t *testing.T) {
 		t.Errorf("missing: %q", errs["missing"])
 	}
 	s := w.mcpServers()
-	if toolNames(s["ext"]) != "echo,write,slow,die" || s["off"].Status != protocol.McpServerDisabled || s["hang"].Status != protocol.McpServerFailed {
+	if toolNames(s["ext"]) != "die,echo,slow,write" || s["off"].Status != protocol.McpServerDisabled || s["hang"].Status != protocol.McpServerFailed {
 		t.Errorf("inventory: %+v", s)
 	}
 	if _, demo := s["docs"]; demo {
@@ -571,7 +574,7 @@ func TestMockMcpConfiguredServers(t *testing.T) {
 	i = w.mark()
 	w.submit(protocol.UserInput{Text: "mcp"})
 	w.until(endOf(a), 5*time.Second)
-	if msg := w.turnMessages(i); !strings.Contains(msg, "**ext** (connected): `echo`, `write`, `slow`, `die`") || !strings.Contains(msg, "**hang** (failed)") {
+	if msg := w.turnMessages(i); !strings.Contains(msg, "**ext** (connected): `die`, `echo`, `slow`, `write`") || !strings.Contains(msg, "**hang** (failed)") {
 		t.Errorf("help: %s", msg)
 	}
 	// The server dies: the call fails, a warning follows, the status is failed.
@@ -612,11 +615,11 @@ func TestMockMcpConfiguredServers(t *testing.T) {
 
 // An HTTP server from config that needs a token: login can't help.
 func TestMockMcpConfiguredHTTPAuth(t *testing.T) {
-	s := mcp.NewServer("remote", "1")
-	s.Authorize = func(*http.Request) bool { return false }
-	srv := httptest.NewServer(s.HTTPHandler())
+	s := mcp.NewServer(&mcp.Implementation{Name: "remote", Version: "1"}, nil)
+	d := &demoMcp{validToken: "never sent"}
+	srv := httptest.NewServer(d.requireToken(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil)))
 	t.Cleanup(srv.Close)
-	w := newConfigured(t, map[string]mcp.ServerConfig{"remote": {URL: srv.URL}})
+	w := newConfigured(t, map[string]mcpconn.ServerConfig{"remote": {URL: srv.URL}})
 	w.startedAll(0, "remote")
 	_, outcomes := startups(w.evs)
 	if len(outcomes) != 1 || outcomes[0].Error != "The `remote` MCP server is not logged in. Run `/mcp login remote`." {

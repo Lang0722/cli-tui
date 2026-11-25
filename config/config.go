@@ -13,15 +13,15 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"agenttui/backend/mcp"
+	"agenttui/backend/mcpconn"
 )
 
 // Config is the whole file.
 type Config struct {
 	TUI TUI `toml:"tui"`
 	// McpServers are the MCP servers ([mcp_servers.<name>], Codex's
-	// layout) for the built-in mock backend; see backend/mcp.ServerConfig.
-	McpServers map[string]mcp.ServerConfig `toml:"mcp_servers,omitempty"`
+	// layout) for the built-in mock backend; see backend/mcpconn.ServerConfig.
+	McpServers map[string]mcpconn.ServerConfig `toml:"mcp_servers,omitempty"`
 }
 
 // TUI holds the UI settings.

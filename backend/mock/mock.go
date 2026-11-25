@@ -41,6 +41,7 @@ type Backend struct {
 	turn    atomic.Int64
 	saveErr bool                // a save failure was already reported
 	hooks   []protocol.HookInfo // /hooks (hooks.go)
+	mcp     mcpState            // MCP servers (mcp.go)
 	answers map[string]answerWait
 
 	// sessions are the loaded sessions (live.go); attached is the one the
@@ -81,6 +82,7 @@ func New(dir string) (*Backend, error) {
 		access:   1,
 		opWake:   make(chan struct{}, 1),
 		hooks:    demoHooks(),
+		mcp:      mcpState{servers: demoMcpServers(), allowed: map[string]bool{}},
 	}
 	if b.store.empty() {
 		if err := seedDemo(&b.store, cwd); err != nil {
@@ -95,6 +97,7 @@ func New(dir string) (*Backend, error) {
 	// task is the one on screen (command center, /status).
 	b.attach(b.fresh(), false)
 	b.notice(protocol.SlashCommands{Commands: mockCommands})
+	b.startMcp("docs", "tracker")
 	return b, nil
 }
 
@@ -367,6 +370,10 @@ func (b *Backend) handle(op protocol.Op) {
 		}
 	case protocol.ListTasks:
 		b.notice(b.tasks(op.Limit))
+	case protocol.ListMcpServers:
+		b.notice(b.mcpList())
+	case protocol.ResolveElicitation:
+		b.resolveElicitation(op)
 	case protocol.ListHooks:
 		b.notice(b.hooksList())
 	case protocol.SetHookEnabled:
@@ -523,6 +530,10 @@ func (b *Backend) slash(op protocol.SlashCommand) {
 				b.notice(protocol.SessionUpdated{Permissions: m.permissions, ApprovalMode: m.approval})
 			}
 		}()
+	case "mcp":
+		b.mcpSlash(op.Args)
+	case "reload-mcp":
+		b.restartMcp()
 	case "standup":
 		b.notice(protocol.BackgroundEvent{Message: "(mock) /standup is a command the backend advertised with slash_commands"})
 	default:
@@ -541,6 +552,7 @@ var accessModes = []struct{ name, desc, permissions, approval string }{
 // backend adds its own commands to the "/" popup.
 var mockCommands = []protocol.CommandInfo{
 	{Name: "standup", Description: "(mock) a command the backend advertised", AvailableDuringTask: true},
+	{Name: "reload-mcp", Description: "(mock) restart the MCP servers; postgres fails to start"},
 }
 
 // ask sends a SelectionRequest and waits for the answer. l is the session

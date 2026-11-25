@@ -713,7 +713,7 @@ func (m *model) keymapLines(width, height int) []Line {
 		if !u.haveKey && time.Since(u.debugAt) > 3*time.Second {
 			out = append(out, Wrap(L(dim("Still waiting? If nothing changes when you press a key, your terminal is not sending that key. Only received keys can be assigned as shortcuts.")), width, L(P("  ")), L(P("  ")))...)
 		} else {
-			out = append(out, L(P("  "), dim("Tip: only keys your terminal sends can be inspected.")))
+			out = append(out, L(P("  "), dim("Tip: only keys your terminal sends can be inspected.")).Truncate(width))
 		}
 		out = append(out, Line{})
 		if !u.haveKey {

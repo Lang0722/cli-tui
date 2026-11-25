@@ -215,6 +215,11 @@ func (m *model) routeEvent(ev protocol.Event) tea.Cmd {
 		m.agents.init(main)
 		return tea.Batch(cmd, m.handleEvent(ev))
 	}
+	switch ev.Msg.(type) {
+	case protocol.McpStartupUpdate, protocol.McpServerList:
+		// About the backend: handled by the conversation on screen.
+		return m.handleEvent(ev)
+	}
 	closed := m.observe(ev)
 	t := m.agents.byID[ev.Thread]
 	if t == nil || m.replaying {
@@ -229,7 +234,7 @@ func (m *model) routeEvent(ev protocol.Event) tea.Cmd {
 		cmd = m.handleEvent(ev)
 		m.convo, m.bg = saved, false
 		switch ev.Msg.(type) {
-		case protocol.ExecApprovalRequest, protocol.ApplyPatchApprovalRequest, protocol.SelectionRequest:
+		case protocol.ExecApprovalRequest, protocol.ApplyPatchApprovalRequest, protocol.SelectionRequest, protocol.ElicitationRequest:
 			// keep the notification
 		default:
 			cmd = nil
@@ -616,6 +621,11 @@ func (m *model) pendingApproval(id string) bool {
 	}
 	for _, s := range m.selections {
 		if s.thread == id {
+			return true
+		}
+	}
+	for _, e := range m.elicits {
+		if e.thread == id {
 			return true
 		}
 	}

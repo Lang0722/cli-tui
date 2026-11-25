@@ -83,6 +83,8 @@ func (t *turn) run(text string) {
 		if ok = t.sleep(400 * time.Millisecond); ok {
 			t.emit(protocol.Error{Message: "stream disconnected before completion: mock error requested"})
 		}
+	case containsAny(lower, "mcp"):
+		ok = t.mcpDemo()
 	case containsAny(lower, "subagent", "agents", "helpers"):
 		ok = t.agentsDemo()
 	case containsAny(lower, "delegate", "reviewer"):
@@ -150,6 +152,7 @@ const tryList = "- **chat** about anything: I answer with markdown\n" +
 	"- `!ls` runs a shell command (\"You ran\"); `/model` opens a picker\n" +
 	"- **Esc Esc** to rewind to an earlier prompt, **Ctrl+T** for the transcript\n" +
 	"- say **demo** (or *fix*, *edit*): explore files, propose a patch, ask to run tests\n" +
+	"- say **mcp**: an MCP server asks to run a tool, then for a form; `/mcp` lists the servers\n" +
 	"- say **error** to see an error\n" +
 	"- `/resume` to switch to a saved conversation, `/new` to start over\n" +
 	"- quit and run `agenttui resume --last` to come back to this one"

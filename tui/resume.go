@@ -386,6 +386,7 @@ func (m *model) replay(msgs []protocol.EventMsg) {
 	m.replaying = false
 	m.running = false
 	m.approvals = nil
+	m.elicits = nil
 }
 
 // abortActive marks running commands/tools as failed (used on interrupt).

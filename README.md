@@ -8,9 +8,10 @@ a small event protocol.
 **Scope, honestly:** Codex's TUI is about 335k lines of Rust. This is about
 16k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
 streaming, composer, approvals, pickers, transcript pager, resume and
-backtrack, subagent threads, the configurable status line and window title,
+backtrack, subagent threads, MCP (the `/mcp` inventory, startup status and
+elicitation forms), the configurable status line and window title,
 and the remappable keymap. Much of the rest of Codex depends on Codex's own services (login,
-model catalog, MCP setup, plugins, voice, cloud tasks, the agents dashboard),
+model catalog, MCP server configuration and OAuth, plugins, voice, cloud tasks, the agents dashboard),
 and that part is out of scope. The [parity table](#parity-with-codex) at the
 end lists each area.
 
@@ -73,6 +74,7 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | `subagents` / `agents` | two helper agents: spawn, a worker's approval from its own thread, wait, close (watch them with Alt+←/→ or `/subagents`) |
 | `delegate` | a parent-owned `/root/reviewer` agent (activity rows, read-only view) |
 | `hooks` | lifecycle hooks around a command: a prompt hook that only adds context, a policy hook that blocks the command, and (once trusted in `/hooks`) a failing Stop hook |
+| `mcp` | the `docs` MCP server asks to run its `search` tool (allow once, for the session, always, or cancel), then `tracker` asks for an issue form (text, choice and yes/no fields) and files it |
 | `error` | an error event |
 | `!ls -la` | a real shell command you run ("You ran") |
 | `$` | the skill popup; pick one (e.g. `$repo-scout map the code`) and the agent reads its `SKILL.md` and follows it |
@@ -81,7 +83,9 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 Then try ← on an empty prompt (the agent command center: every saved
 conversation with its status; Enter opens one), Ctrl+T (transcript), Esc Esc (rewind to an earlier prompt), Ctrl+R
 (history search), `/skills` (enable or disable the demo skills), `/hooks`
-(turn the demo hooks on or off, trust new ones), `/fork`, `/cd ..`, `/export`,
+(turn the demo hooks on or off, trust new ones), `/mcp` and `/mcp verbose`
+(the MCP servers), `/mcp login github`, `/reload-mcp` (restart the servers
+while you type; `postgres` fails), `/fork`, `/cd ..`, `/export`,
 and quitting followed by `./agenttui resume -last`.
 Sessions live in `$XDG_DATA_HOME/agenttui/mock-sessions` (by default
 `~/.local/share/agenttui/mock-sessions`). Use `-sessions DIR` to change that,
@@ -154,6 +158,8 @@ stdout → {"id":"1","msg":{"type":"agent_message_delta","delta":"Sure"}}
 | `fork_session{name?}` | `/fork [name]`: copy the conversation into a new session and continue there. Answer with the new session's `session_configured` (`resumed:true`, `initial_messages`, `forked_from` = the parent's id, `forked_from_title`, and `title` = `name` if given) |
 | `list_hooks` | `/hooks`; reply with `hooks_list` |
 | `list_tasks{limit}` | the agent command center opens (← on an empty prompt, or `/agents`), and again with 10 more for each "Show more"; reply with `task_list`. Enter on a task sends `resume_session`. |
+| `list_mcp_servers` | `/mcp` or `/mcp verbose`; reply with `mcp_server_list` (the UI waits 10 s). `/mcp login <name>` is sent as `slash_command{name:"mcp",args:"login <name>"}`. |
+| `resolve_elicitation{server_name,request_id,action,content?,persist?}` | answers an `elicitation_request`: `action` is `accept`, `decline` or `cancel` (Esc). `content` is the accepted form's answers by property name, in the schema's order (strings and booleans); `persist` is `session` or `always` for "Allow for this session" / "Always allow". |
 | `set_hook_enabled{key,enabled}` / `trust_hooks{keys}` | a hook toggled or trusted in `/hooks`; persist it (report failures with `error`, e.g. `Failed to update hook config: …`) |
 | `shutdown` | UI exit |
 
@@ -191,6 +197,9 @@ began), which the elapsed time counts from.
 | `hook_started{run_id,event,status_message}` / `hook_completed{run_id,status,output:[{kind,text}]}` | a hook run: after 300 ms its message joins the status row (`· checking command policy`). A completed run whose output is only `context` leaves nothing; others print `• Blocked by hook` / `• Hook failed` / `• Hook stopped` with `  └ ` output lines, or `↳ Hook · warning`. `status` is `completed`, `failed`, `blocked` or `stopped`; `kind` is `warning`, `stop`, `feedback`, `context` or `error`. |
 | `task_list{tasks:[{id,title?,preview?,cwd?,status?,updated_at,unread?,model?,reasoning_effort?}],has_more?}` | the agent command center, newest first. `status` is `needs_input`, `error`, `working`, `ready` or `inactive` (the default); `preview` is the first prompt (shown when there is no `title`). The conversation on screen shows its live state whatever the backend says. |
 | `task_updated{task}` | one task's row changed (same fields as in `task_list`); sent unasked. Updates the command center in place and the footer's `N background tasks need input`; a task that starts waiting while in the background also sends a desktop notification. |
+| `mcp_server_list{servers:[{name,status?,auth?,tools?:[{name,title?,description?}],resources?:[{name,title?,uri}],resource_templates?:[{name,title?,uri_template}]}]}` | the `/mcp` output (`🔌  MCP Tools`, one `• name: status (N tools)` row each, sorted by name; `/mcp verbose` adds auth, tools, resources and templates). `status` is `connected`, `starting`, `auth_required`, `failed`, `not_started`, `disabled` or `cancelled`; `auth` is `unsupported`, `not_logged_in`, `bearer_token`, `oauth` or `unknown`. |
+| `mcp_startup_update{server,status,error?}` | MCP server startup (`starting`, then `ready`, `failed` or `cancelled`): `Booting MCP server: x` / `Starting MCP servers (1/3): y, z` in the status row. Messages typed meanwhile are queued until every server finished. Failures print `⚠ error`; at the end `⚠ MCP startup incomplete (failed: …)` and, for cancelled ones, `⚠ MCP startup interrupted. The following servers were not initialized: …`. Not tied to a session. |
+| `elicitation_request{server_name,request_id,message,requested_schema?,kind?,tool_params?,persist?}` | an MCP server asks the user; see [MCP servers](#mcp-servers). Belongs in the attach catch-up while pending. |
 | `token_count` | `N% context left` (or `NK used`) |
 | `error` / `warning` / `background_event` | `■` red, `⚠`, dim `•` |
 | `stream_error` | a transient detail line under the status row |
@@ -293,6 +302,41 @@ composer, and the mentioned skills are sent with the prompt in
 searchable `[x]` list where space or Enter toggles a skill
 (`set_skill_enabled`) and Esc closes it with a summary such as
 `Enabled 1 skill, disabled 1 skill`.
+
+## MCP servers
+
+The MCP servers belong to the backend; the UI shows them and answers them,
+as Codex does.
+
+- `/mcp` lists the servers with their status and tool count; `/mcp verbose`
+  adds authentication, tools, resources and resource templates.
+  `/mcp login <name>` asks the backend to sign in.
+- While servers start (`mcp_startup_update`), the status row reads
+  `Booting MCP server: docs` or `Starting MCP servers (1/3): postgres,
+  tracker`, even with no turn running, and the window title spins. Messages
+  you send are queued (with their preview) until the round is over.
+  Failures and the round's summary print as `⚠` warnings.
+- An `elicitation_request` with a `requested_schema` opens a form in place
+  of the composer, one field at a time (`Field 1/4 (1 required
+  unanswered)`): `string` properties take text, `boolean` ones are
+  True/False, and `enum` (with `enumNames`) or `oneOf` `{const,title}`
+  properties are a single choice; `title`, `description`, `default` and
+  `required` are honored. Enter answers and moves on (submitting on the last
+  field, or jumping to the first unanswered required one with "Answer
+  required fields before submitting."), ←/→ or ⌃p/⌃n change field in
+  choices (⌃p/⌃n and PgUp/PgDn in text), digits pick, Esc cancels and Ctrl+C
+  clears the text first.
+- Without a schema (or with an empty object) it asks for permission: Allow,
+  Deny or Cancel, or with `kind:"tool_call"` Allow or Cancel under the
+  first three `tool_params` (`query: …`). `persist:["session","always"]`
+  adds "Allow for this session" and "Always allow".
+- A schema the form can't show (numbers, multi-select) falls back to the
+  approval modal: "Yes, provide the requested info", "No, but continue
+  without it" and "Cancel this request".
+
+Two deliberate differences from current Codex: the startup row shows even
+when no turn is running, and startup warnings are transcript cells (Codex
+now collects them in its warnings view).
 
 ## Directories, forks and hooks
 
@@ -579,6 +623,9 @@ snapshots.
 - **Agent command center:** ← / `/agents`, status tabs, grouping, details
   pane, "Show more", tasks that keep running in the background, `x` stop
   (search, rename and the other task actions not yet).
+- **MCP:** `/mcp` and `/mcp verbose`, the startup status row with held
+  input and its warnings, elicitation forms and tool-call approvals
+  (including the remembered answers), and the approval fallback.
 - **Hooks:** the `/hooks` browser (enable, trust, details) and hook run
   rows and cells.
 - **Subagents:** collab and activity rows, per-thread transcripts,
@@ -591,7 +638,8 @@ snapshots.
 **Not ported**
 
 - **Codex-specific:** login and onboarding, model catalog and rate-limit
-  cards, MCP inventory and elicitation forms, plugins and apps, voice
+  cards, MCP server configuration and the OAuth flow (the backend's: `/mcp
+  login` is forwarded), plugins and apps, voice
   and realtime, side conversations, worktrees,
   goals, pets, Daybreak, update prompts. Generic equivalents are the
   backend-driven `selection_request` and slash-command forwarding.
@@ -643,6 +691,9 @@ go test ./...
     message that runs there after the switch and its turn's elapsed time,
     an approval that waits in the background, and `x` stop;
   - skills: the `$` popup, mentions and Enable/Disable Skills;
+  - MCP: `/mcp` and `/mcp verbose`, `/mcp login`, a tool approval for the
+    session, the issue form with its validation, Esc cancel, and messages
+    held during `/reload-mcp`;
   - layout: the composer stays on the last row after turns, approvals,
     `/resume` inside a session and closing `/keymap`;
   - the stdio backend (`examples/echo_agent.py`).
@@ -653,12 +704,12 @@ go test ./...
 ## Layout
 
 ```
-protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, lineage.go, hooks.go, tasks.go, wire.go)
+protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, lineage.go, hooks.go, tasks.go, mcp.go, wire.go)
 config/          settings file (TOML)
-backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, /cd, /fork, hooks, tasks, real "!" commands
+backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, /cd, /fork, hooks, tasks, MCP servers, real "!" commands
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
-                 approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills, lineage, hooks, center)
+                 approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills, lineage, hooks, center, mcp)
 cmd/agenttui     entry point
 e2e/             end-to-end tests: the real binary in tmux, driven by keystrokes
 examples/        echo_agent.py reference backend

@@ -424,7 +424,8 @@ func (m *model) titleFor(ids []string, actionNeeded bool) string {
 	for _, id := range ids {
 		var v string
 		if id == "activity" {
-			if !m.running {
+			// Codex spins while MCP servers start, too.
+			if !m.running && !m.mcpHolding() {
 				continue
 			}
 			v = spinnerFrame()

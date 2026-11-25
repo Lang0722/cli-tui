@@ -11,6 +11,7 @@ type approvalKind int
 const (
 	approveExec approvalKind = iota
 	approvePatch
+	approveElicit // an MCP form the UI can't show (mcp.go)
 )
 
 type approvalOption struct {
@@ -22,17 +23,21 @@ type approvalOption struct {
 // approval is the modal that replaces the composer while the agent waits
 // for a decision (Codex' ApprovalOverlay).
 type approval struct {
-	kind     approvalKind
-	callID   string
-	command  []string
-	prefix   []string // ExecApprovalRequest.ProposedPrefix
-	cwd      string
-	reason   string
-	changes  map[string]protocol.FileChange
-	options  []approvalOption
-	selected int
-	km       *keymap // for the key hints
-	thread   string  // the thread that asked ("" = main)
+	kind    approvalKind
+	callID  string
+	command []string
+	prefix  []string // ExecApprovalRequest.ProposedPrefix
+	cwd     string
+	reason  string
+	changes map[string]protocol.FileChange
+	// server and requestID name an elicitation (approveElicit); reason
+	// holds its message.
+	server    string
+	requestID string
+	options   []approvalOption
+	selected  int
+	km        *keymap // for the key hints
+	thread    string  // the thread that asked ("" = main)
 	// threadLabel is set while the request is shown in another thread's
 	// view (Codex' cross-thread prompt: "Thread: …", "o to open thread").
 	threadLabel string
@@ -96,6 +101,16 @@ func newPatchApproval(ev protocol.ApplyPatchApprovalRequest, agent string) *appr
 }
 
 func (a *approval) op(d protocol.ReviewDecision) protocol.Op {
+	if a.kind == approveElicit {
+		action := protocol.ElicitationCancel
+		switch d {
+		case protocol.DecisionApproved:
+			action = protocol.ElicitationAccept
+		case protocol.DecisionDenied:
+			action = protocol.ElicitationDecline
+		}
+		return protocol.ResolveElicitation{ServerName: a.server, RequestID: a.requestID, Action: action, ThreadID: a.thread}
+	}
 	if a.kind == approveExec {
 		op := protocol.ExecApproval{CallID: a.callID, Decision: d, ThreadID: a.thread}
 		if d == protocol.DecisionApprovedForPrefix {
@@ -122,8 +137,11 @@ func (a *approval) byAction(action string) (approvalOption, bool) {
 func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Line {
 	var out []Line
 	title := "Would you like to run the following command?"
-	if a.kind == approvePatch {
+	switch a.kind {
+	case approvePatch:
 		title = "Would you like to make the following edits?"
+	case approveElicit:
+		title = sanitizeLine(a.server) + " needs your approval."
 	}
 	out = append(out, Line{})
 	out = append(out, Wrap(L(S(title, st.Bold)), width, L(P("  ")), L(P("  ")))...)
@@ -132,7 +150,7 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 		out = append(out, Wrap(L(S("Thread: "+sanitizeLine(a.threadLabel), st.Bold)), width, L(P("  ")), L(P("  ")))...)
 		out = append(out, Line{})
 	}
-	if r := strings.TrimSpace(a.reason); r != "" {
+	if r := strings.TrimSpace(a.reason); r != "" && a.kind != approveElicit {
 		out = append(out, Wrap(L(S("Reason: ", st.Plain), S(sanitize(r), st.Italic)), width, L(P("  ")), L(P("  ")))...)
 		out = append(out, Line{})
 	}
@@ -156,7 +174,7 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 	for i, o := range a.options {
 		num := itoa(i+1) + ". "
 		var key Span
-		if h := a.keyHint("approval." + o.action); h != "" {
+		if h := a.optionHint(o); h != "" {
 			key = S(" ("+h+")", st.Dim)
 		}
 		var l Line
@@ -178,9 +196,37 @@ func (a *approval) Lines(width int, maxHeight int, cwd string, st *Styles) []Lin
 	return out
 }
 
+// optionHint is the key shown next to an option. An elicitation's Esc
+// always cancels (Codex keeps it off "continue without it").
+func (a *approval) optionHint(o approvalOption) string {
+	if a.kind != approveElicit {
+		return a.keyHint("approval." + o.action)
+	}
+	if o.decision == protocol.DecisionAbort {
+		return "esc"
+	}
+	km := a.km
+	if km == nil {
+		km = defaultKeymap()
+	}
+	for _, k := range km.raw["approval."+o.action] {
+		if k != "esc" {
+			return k
+		}
+	}
+	return ""
+}
+
 // body is the command or proposed diff shown in the modal (unclipped).
 func (a *approval) body(width int, cwd string, st *Styles) []Line {
 	var body []Line
+	if a.kind == approveElicit {
+		body = append(body, L(P("  Server: "), S(sanitizeLine(a.server), st.Bold)), Line{})
+		for _, para := range strings.Split(sanitize(a.reason), "\n") {
+			body = append(body, Wrap(L(P(para)), width, L(P("  ")), L(P("  ")))...)
+		}
+		return body
+	}
 	if a.kind == approveExec {
 		for i, l := range strings.Split(displayCommand(a.command), "\n") {
 			pre := L(P("  ")) // Codex continues multi-line commands at 2 spaces
@@ -202,8 +248,11 @@ func (a *approval) body(width int, cwd string, st *Styles) []Line {
 }
 
 func (a *approval) pagerTitle() string {
-	if a.kind == approveExec {
+	switch a.kind {
+	case approveExec:
 		return "exec"
+	case approveElicit:
+		return "mcp"
 	}
 	return "patch"
 }

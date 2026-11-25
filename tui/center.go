@@ -1021,7 +1021,7 @@ func (m *model) centerRow(t protocol.TaskSummary) centerRow {
 		// even while a subagent thread is on screen.
 		r.current = true
 		switch {
-		case len(m.approvals) > 0 || len(m.selections) > 0:
+		case len(m.approvals) > 0 || len(m.elicits) > 0 || len(m.selections) > 0:
 			r.Status = protocol.TaskNeedsInput
 		case m.mainConvo().running:
 			r.Status = protocol.TaskWorking

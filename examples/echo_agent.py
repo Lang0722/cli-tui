@@ -159,6 +159,8 @@ def handle(op):
         emit("session_list", sessions=[])
     elif kind == "resume_session":
         emit("error", message="the echo agent does not save sessions")
+    elif kind == "list_mcp_servers":
+        emit("mcp_server_list", servers=[])  # /mcp: no MCP servers
     elif kind == "selection_response":
         pass
     elif kind == "slash_command":

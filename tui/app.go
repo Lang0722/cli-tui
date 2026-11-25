@@ -262,9 +262,16 @@ type model struct {
 
 	composer  *composer
 	approvals []*approval
-	files     []string
-	filesBusy bool
-	shortcuts bool
+	elicits   []*elicitation // MCP elicitation forms (mcp.go)
+
+	// MCP (mcp.go)
+	mcp        mcpStartup
+	mcpWanted  bool // /mcp is waiting for McpServerList
+	mcpVerbose bool
+	mcpGen     int
+	files      []string
+	filesBusy  bool
+	shortcuts  bool
 
 	hint       string
 	hintUntil  time.Time
@@ -1078,6 +1085,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case hooksTimeoutMsg:
 		m.onHooksTimeout(msg)
 		return m, nil
+	case mcpTimeoutMsg:
+		m.onMcpTimeout(msg)
+		return m, nil
 	case centerTimeoutMsg:
 		m.onCenterTimeout(msg)
 		return m, nil
@@ -1095,6 +1105,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.PasteMsg:
+		if len(m.elicits) > 0 && len(m.approvals) == 0 && m.pager == nil && m.center == nil && !m.elicits[0].isSelect() {
+			m.elicits[0].input.insert(cleanInput(msg.Content))
+			m.elicits[0].answer().committed = false
+			return m, nil
+		}
 		if v := m.skills.view; v != nil && m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 {
 			// Codex: a paste goes into the skills search (one line).
 			if q := strings.Join(strings.Fields(msg.Content), " "); q != "" {
@@ -1103,7 +1118,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if m.pager == nil && len(m.approvals) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.hooksView == nil && m.center == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume && !m.forking() {
+		if m.pager == nil && len(m.approvals) == 0 && len(m.elicits) == 0 && len(m.selections) == 0 && m.picker == nil && m.surface == nil && m.skills.view == nil && m.hooksView == nil && m.center == nil && m.keymapUI == nil && m.agents.picker == nil && !m.awaitingList && !m.awaitingResume && !m.forking() {
 			if p, ok := pastedImagePath(msg.Content); ok {
 				m.composer.AttachImage(p)
 			} else {
@@ -1132,7 +1147,7 @@ func (m *model) backendEvent(ev protocol.Event) tea.Cmd {
 }
 
 func (m *model) needsTick() bool {
-	if m.running || m.awaitingList || m.awaitingResume || m.needsAction() || time.Now().Before(m.hintUntil) {
+	if m.running || m.mcpHolding() || m.mcpWanted || m.awaitingList || m.awaitingResume || m.needsAction() || time.Now().Before(m.hintUntil) {
 		return true
 	}
 	if m.pruneHookRuns(time.Now()) {
@@ -1184,7 +1199,7 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 	switch ev.Msg.(type) {
 	case protocol.TaskStarted, protocol.ExecCommandBegin, protocol.ToolCallBegin, protocol.PatchApplyBegin,
 		protocol.StreamError, protocol.AgentReasoningDelta, protocol.CollabToolCall,
-		protocol.ExecApprovalRequest, protocol.ApplyPatchApprovalRequest:
+		protocol.ExecApprovalRequest, protocol.ApplyPatchApprovalRequest, protocol.ElicitationRequest:
 		m.statusHidden = false // Codex: ensure_status_indicator when work resumes
 	}
 	switch e := ev.Msg.(type) {
@@ -1210,6 +1225,15 @@ func (m *model) handleEvent(ev protocol.Event) tea.Cmd {
 		m.setBackendCommands(e.Commands)
 	case protocol.HooksList:
 		m.onHooksList(e)
+	case protocol.McpServerList:
+		m.onMcpServerList(e)
+	case protocol.McpStartupUpdate:
+		m.onMcpStartupUpdate(e)
+	case protocol.ElicitationRequest:
+		if m.replaying {
+			break
+		}
+		return m.onElicitationRequest(e)
 	case protocol.TaskList:
 		m.noteTaskList(e)
 		m.onTaskList(e)
@@ -1480,8 +1504,9 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 		m.flushActive(true)
 		// A picker still open when the turn completes did not block it (e.g.
 		// the effort step of /model used during the turn), so it stays;
-		// approvals always belong to the turn.
+		// approvals (and MCP requests) always belong to the turn.
 		m.dropTurnApprovals()
+		m.dropTurnElicits()
 		if m.replaying {
 			return nil
 		}
@@ -1530,6 +1555,7 @@ func (m *model) endTurn(aborted bool, last string) tea.Cmd {
 // to a turn that has ended.
 func (m *model) dropTurnPrompts() {
 	m.dropTurnApprovals()
+	m.dropTurnElicits()
 	var keepS []*selectionView
 	for _, v := range m.selections {
 		if v.thread != m.thread {
@@ -1611,6 +1637,11 @@ func (m *model) keyContexts() []string {
 		return []string{"list"}
 	case len(m.approvals) > 0:
 		return []string{"approval", "list", "global"}
+	case len(m.elicits) > 0:
+		if m.elicits[0].isSelect() {
+			return []string{"list"}
+		}
+		return []string{"editor"}
 	case len(m.selections) > 0, m.picker != nil, m.surface != nil, m.skills.view != nil, m.hooksView != nil, m.agents.picker != nil:
 		return []string{"list"}
 	case m.awaitingList || m.awaitingResume, m.forking():
@@ -1695,6 +1726,9 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	}
 	if len(m.approvals) > 0 {
 		return m.handleApprovalKey(key, act)
+	}
+	if len(m.elicits) > 0 {
+		return m.handleElicitKey(k, act)
 	}
 	if len(m.selections) > 0 {
 		return m.handleSelectionKey(k, act)
@@ -1967,11 +2001,11 @@ func (m *model) dispatchKey(k tea.KeyPressMsg, act string) tea.Cmd {
 	case "composer.submit":
 		return m.submitComposer()
 	case "composer.queue":
-		if m.freeformID != "" || !m.running && !m.composer.Empty() {
+		if m.freeformID != "" || !m.running && !m.mcpHolding() && !m.composer.Empty() {
 			// Codex: Tab submits when idle (and for a typed answer).
 			return m.submitComposer()
 		}
-		if m.running && !m.composer.Empty() && !m.composer.shell {
+		if (m.running || m.mcpHolding()) && !m.composer.Empty() && !m.composer.shell {
 			full, images := m.composer.SubmitWithImages()
 			m.queued = append(m.queued, pendingInput{strings.TrimSpace(full), images})
 			return nil
@@ -2044,6 +2078,9 @@ func (m *model) submitComposer() tea.Cmd {
 	full, images := m.composer.SubmitWithImages()
 	in := pendingInput{strings.TrimSpace(full), images}
 	switch {
+	case m.mcpHolding():
+		// Codex holds input until MCP startup is over (mcp.go).
+		m.queued = append(m.queued, in)
 	case !m.running, m.opts.SteerWhileRunning:
 		m.sendInput(in)
 	default:
@@ -2056,7 +2093,7 @@ func (m *model) handleApprovalKey(key, act string) tea.Cmd {
 	a := m.approvals[0]
 	decide := func(o approvalOption) {
 		m.submit(a.op(o.decision))
-		if a.thread == m.thread {
+		if a.thread == m.thread && a.kind != approveElicit {
 			// Codex writes no decision row for another thread's request.
 			m.commit(decisionCell(a, o.decision, m.agent, m.st))
 		}
@@ -2085,6 +2122,11 @@ func (m *model) handleApprovalKey(key, act string) tea.Cmd {
 		m.openPager()
 		return nil
 	case "list.cancel":
+		decide(approvalOption{decision: protocol.DecisionAbort})
+		return nil
+	}
+	if a.kind == approveElicit && key == "esc" {
+		// Esc always cancels an elicitation, never "continue without it".
 		decide(approvalOption{decision: protocol.DecisionAbort})
 		return nil
 	}
@@ -2218,6 +2260,8 @@ func (m *model) runCommand(name, args string) tea.Cmd {
 		return m.forkSession(args)
 	case "hooks":
 		return m.openHooks()
+	case "mcp":
+		return m.mcpCommand(args)
 	case "agents":
 		return m.openCenter()
 	case "statusline":
@@ -2433,12 +2477,12 @@ func (m *model) View() tea.View {
 
 	// Codex hides the status row while the answer streams into the
 	// transcript (a one-line partial answer keeps "Working").
-	if m.running && !m.statusHidden && !(m.stream.active && m.stream.emitted > 0) {
+	if m.running && !m.statusHidden && !(m.stream.active && m.stream.emitted > 0) || !m.running && m.mcpStartupHeader() != "" {
 		bottom = append(bottom, m.statusLines(w)...)
 	}
 	bottom = append(bottom, m.hookActivityLines(w)...)
 	queued := m.queuedLines(w)
-	if modal := len(m.approvals) > 0 || len(m.selections) > 0; modal && len(queued) > 3 {
+	if modal := len(m.approvals) > 0 || len(m.elicits) > 0 || len(m.selections) > 0; modal && len(queued) > 3 {
 		// An open approval/question needs the room more than the preview.
 		queued = append(queued[:2], L(P("  "), S(fmt.Sprintf("↳ … %d queued", len(m.queued)), st.Dim)))
 	}
@@ -2451,6 +2495,12 @@ func (m *model) View() tea.View {
 			a.threadLabel = m.threadLabel(a.thread)
 		}
 		bottom = append(bottom, a.Lines(w, maxH, m.cwd, st)...)
+	} else if len(m.elicits) > 0 {
+		lines, r, c := m.elicitLines(w, max(6, m.height-len(bottom)-2))
+		if r >= 0 {
+			cursorRow, cursorCol = len(bottom)+r, c
+		}
+		bottom = append(bottom, lines...)
 	} else if len(m.selections) > 0 {
 		bottom = append(bottom, m.selections[0].Lines(w, m.height-len(bottom)-2, st)...)
 	} else if m.surface != nil {
@@ -2527,6 +2577,12 @@ func (m *model) View() tea.View {
 		}
 		top = append(top, c.Lines(w, st)...)
 	}
+	if l := m.mcpLoadingLines(); len(l) > 0 {
+		if len(top) > 0 {
+			top = append(top, Line{})
+		}
+		top = append(top, l...)
+	}
 	if tail := m.streamTail(); len(tail) > 0 {
 		if len(top) > 0 {
 			top = append(top, Line{})
@@ -2573,9 +2629,16 @@ func (m *model) statusLines(w int) []Line {
 	if header == "" {
 		header = "Working"
 	}
+	if h := m.mcpStartupHeader(); h != "" {
+		header = h // Codex: startup owns the header while servers start
+	}
 	l := L(S("• ", st.Dim))
 	l = append(l, st.Shimmer(header)...)
-	l = append(l, S(" ("+fmtElapsed(time.Since(m.turnStart))+" • ", st.Dim), S("esc", st.Dim.Bold(true)), S(" to interrupt)", st.Dim))
+	if m.running {
+		l = append(l, S(" ("+fmtElapsed(time.Since(m.turnStart))+" • ", st.Dim), S("esc", st.Dim.Bold(true)), S(" to interrupt)", st.Dim))
+	} else {
+		l = append(l, S(" ("+fmtElapsed(time.Since(m.mcp.since))+")", st.Dim))
+	}
 	if h := m.hookStatus(); h != "" {
 		l = append(l, S(" · "+h, st.Dim)) // Codex appends the running hook's message
 	}
@@ -2639,7 +2702,7 @@ func (m *model) footerLine(w int, showContext bool) Line {
 		left = L(P("  "), d(m.hint))
 	case m.composer.shell:
 		left = L(P("  "), S("Shell mode", st.Accent), d(" · "), k("esc"), d(" to exit"))
-	case m.running && !m.composer.Empty():
+	case (m.running || m.mcpHolding()) && !m.composer.Empty():
 		if q := m.keys.primary("composer.queue"); q != "" {
 			left = L(P("  "), k(q), d(" to queue message"))
 		}

@@ -24,7 +24,8 @@ package protocol
 //     time goes on), then the turn's events so far (deltas may be merged;
 //     finished calls may be sent as one Begin+End pair; an answered
 //     request is left out), then every request still waiting for an answer
-//     (ExecApprovalRequest, ApplyPatchApprovalRequest, SelectionRequest)
+//     (ExecApprovalRequest, ApplyPatchApprovalRequest, SelectionRequest,
+//     ElicitationRequest)
 //     and any partial answer as one AgentMessageDelta. Open subagent
 //     threads get ThreadStarted plus their own catch-up. InitialMessages
 //     must not hold the running turn's events (the UI replays it as
@@ -45,7 +46,8 @@ package protocol
 //     catch-up on attach, because the UI keeps no state for sessions it
 //     isn't showing. Events about the backend itself (SessionList,
 //     TaskList, TaskUpdated, SlashCommands, SkillsList, HooksList,
-//     ShutdownComplete) carry no session and are never dropped.
+//     McpServerList, McpStartupUpdate, ShutdownComplete) carry no session
+//     and are never dropped.
 //   - A SessionConfigured is always accepted: it is what attaches.
 //
 // Ops
@@ -98,6 +100,8 @@ func OpSession(op Op) string {
 		return o.SessionID
 	case SelectionResponse:
 		return o.SessionID
+	case ResolveElicitation:
+		return o.SessionID
 	case Rewind:
 		return o.SessionID
 	case SlashCommand:
@@ -135,6 +139,9 @@ func ForSession(op Op, id string) Op {
 	case SelectionResponse:
 		o.SessionID = id
 		return o
+	case ResolveElicitation:
+		o.SessionID = id
+		return o
 	case Rewind:
 		o.SessionID = id
 		return o
@@ -155,7 +162,7 @@ func ForSession(op Op, id string) Op {
 // session, so the UI never drops it for carrying another session's id.
 func Unscoped(m EventMsg) bool {
 	switch m.(type) {
-	case SessionConfigured, SessionList, TaskList, TaskUpdated, SlashCommands, SkillsList, HooksList, ShutdownComplete:
+	case SessionConfigured, SessionList, TaskList, TaskUpdated, SlashCommands, SkillsList, HooksList, McpServerList, McpStartupUpdate, ShutdownComplete:
 		return true
 	}
 	return false

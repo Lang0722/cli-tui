@@ -67,7 +67,7 @@ func (w *watcher) see(e protocol.Event) {
 		w.t.Errorf("event %s of session %s arrived while %s is attached", protocol.EventType(e.Msg), e.Session, w.attached)
 	} else if e.Session == "" && !protocol.Unscoped(e.Msg) {
 		switch e.Msg.(type) {
-		case protocol.Warning, protocol.Error, protocol.SelectionRequest, protocol.SessionUpdated:
+		case protocol.Warning, protocol.Error, protocol.BackgroundEvent, protocol.SelectionRequest, protocol.SessionUpdated:
 			// backend notices and pickers
 		default:
 			w.t.Errorf("session event %s without a session id", protocol.EventType(e.Msg))

@@ -52,6 +52,7 @@ var DefaultCommands = []Command{
 	{Name: "statusline", Description: "configure which items appear in the status line", Local: true, DuringTask: true},
 	{Name: "title", Description: "configure which items appear in the terminal title", Local: true, DuringTask: true},
 	{Name: "keymap", Description: "remap TUI shortcuts", Local: true},
+	{Name: "mcp", Description: "list MCP tools; /mcp verbose or /mcp login <name>", Local: true, DuringTask: true},
 	{Name: "subagents", Description: "switch between this session's subagents", Local: true, DuringTask: true},
 	{Name: "quit", Description: "exit the app", Local: true, DuringTask: true},
 	{Name: "exit", Description: "exit the app", Local: true, Alias: true, DuringTask: true},

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -54,7 +55,7 @@ var fuzzTexts = []string{
 	"hello", "run the tests", "/", "/agents", "/hooks", "/cd /tmp", "/cd ..", "/fork",
 	"/resume", "/skills", "/keymap", "/statusline", "/title", "/model", "/review",
 	"/diff", "/status", "/copy", "/export", "/clear", "/pwd", "/new", "/compact",
-	"/agent", "/mention", "/approvals", "/init", "/quit", "$", "$sk", "@", "@READ",
+	"/agent", "/mention", "/approvals", "/init", "/quit", "/mcp", "/mcp verbose", "$", "$sk", "@", "@READ",
 	"!ls", "!", "?", "line one\nline two", strings.Repeat("long words wrap ", 30),
 	"tabs\there", "wide 界界界界界界", "emoji 🙂🙂👩‍👩‍👧", "\x1b[31mred\x1b[m", "\u200bzero",
 }
@@ -96,7 +97,7 @@ func (f *fuzzer) event() (protocol.Event, string) {
 	}
 	cmd := []string{"bash", "-lc", f.pick([]string{"ls -la", "go test ./...", "cat README.md", "rg foo", "echo " + f.pick(fuzzTexts)})}
 	var e protocol.EventMsg
-	switch r.Intn(35) {
+	switch r.Intn(38) {
 	case 0:
 		e = protocol.SessionConfigured{Model: f.pick([]string{"gpt-5", "o3", ""}), Cwd: "/home/u/p", SessionID: f.id("s"), Resumed: r.Intn(4) == 0,
 			InitialMessages: []protocol.EventMsg{protocol.UserMessage{Message: "earlier"}, protocol.AgentMessage{Message: f.pick(fuzzMarkdown)}}}
@@ -203,6 +204,23 @@ func (f *fuzzer) event() (protocol.Event, string) {
 	case 33:
 		e = protocol.TaskUpdated{Task: protocol.TaskSummary{ID: f.id("s"), Title: f.pick(fuzzTexts),
 			Status: f.pick([]string{protocol.TaskNeedsInput, protocol.TaskWorking, protocol.TaskReady, protocol.TaskError, ""}), Unread: r.Intn(2) == 0}}
+	case 34:
+		var servers []protocol.McpServerStatus
+		for i := r.Intn(4); i > 0; i-- {
+			servers = append(servers, protocol.McpServerStatus{Name: f.id("mcp"), Status: f.pick([]string{protocol.McpServerConnected, protocol.McpServerFailed, ""}),
+				Auth: f.pick([]string{protocol.McpAuthOAuth, protocol.McpAuthNotLoggedIn, ""}), Tools: []protocol.McpTool{{Name: f.pick(fuzzTexts)}}})
+		}
+		e = protocol.McpServerList{Servers: servers}
+	case 35:
+		e = protocol.McpStartupUpdate{Server: f.id("mcp"), Status: f.pick([]string{protocol.McpStartupStarting, protocol.McpStartupStarting,
+			protocol.McpStartupReady, protocol.McpStartupFailed, protocol.McpStartupCancelled, "bogus"}), Error: f.pick(fuzzTexts)}
+	case 36:
+		schema := f.pick([]string{"", `{"type":"object","properties":{}}`,
+			`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"boolean"},"c":{"type":"string","enum":["x","y"]}},"required":["a","b"]}`,
+			`{"type":"object","properties":{"n":{"type":"number"}}}`, `{"type":"object","properties":{"o":{"type":"string","oneOf":[{"const":"1","title":"One"}],"default":"1"}}}`})
+		e = protocol.ElicitationRequest{ServerName: f.id("mcp"), RequestID: f.id("e"), Message: f.pick(fuzzTexts), RequestedSchema: json.RawMessage(schema),
+			Kind: f.pick([]string{"", protocol.ElicitationToolCall}), ToolParams: []protocol.ElicitationParam{{Name: "q", Value: json.RawMessage(`"` + "x" + `"`)}},
+			Persist: []string{protocol.PersistSession}}
 	default:
 		e = protocol.UserMessage{Message: f.pick(fuzzTexts)}
 	}

@@ -21,6 +21,8 @@ import (
 var eventTypes = map[string]reflect.Type{}
 var opTypes = map[string]reflect.Type{}
 
+var rawType = reflect.TypeOf(json.RawMessage(nil))
+
 func init() {
 	for _, m := range []EventMsg{
 		SessionConfigured{}, TaskStarted{}, TaskComplete{}, TurnAborted{},
@@ -31,10 +33,11 @@ func init() {
 		PlanUpdate{}, TokenCount{}, BackgroundEvent{}, Warning{}, Error{},
 		StreamError{}, ShutdownComplete{}, SessionList{}, SessionTitle{}, UserMessage{}, SelectionRequest{},
 		ThreadStarted{}, ThreadClosed{}, CollabToolCall{}, SubAgentActivity{}, SessionUpdated{}, SlashCommands{}, SkillsList{}, HooksList{}, HookStarted{}, HookCompleted{}, TaskList{}, TaskUpdated{},
+		McpServerList{}, McpStartupUpdate{}, ElicitationRequest{},
 	} {
 		eventTypes[m.eventType()] = reflect.TypeOf(m)
 	}
-	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}, ListSkills{}, SetSkillEnabled{}, ChangeDirectory{}, ForkSession{}, ListHooks{}, SetHookEnabled{}, TrustHooks{}, ListTasks{}} {
+	for _, o := range []Op{UserInput{}, Interrupt{}, ExecApproval{}, PatchApproval{}, SlashCommand{}, Shutdown{}, ListSessions{}, ResumeSession{}, ShellCommand{}, SelectionResponse{}, Rewind{}, ListSkills{}, SetSkillEnabled{}, ChangeDirectory{}, ForkSession{}, ListHooks{}, SetHookEnabled{}, TrustHooks{}, ListTasks{}, ListMcpServers{}, ResolveElicitation{}} {
 		opTypes[o.opType()] = reflect.TypeOf(o)
 	}
 }
@@ -71,13 +74,7 @@ func decodeTagged(data []byte, table map[string]reflect.Type) (any, error) {
 	}
 	// Otherwise be lenient about what other languages send (see
 	// normalize), then decode strictly into the Go type.
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	var generic any
-	if err := dec.Decode(&generic); err != nil {
-		return nil, err
-	}
-	fixed, err := json.Marshal(normalize(generic, t, ""))
+	fixed, err := normalizeRaw(data, t, "")
 	if err != nil {
 		return nil, err
 	}
@@ -95,6 +92,73 @@ type UnknownTypeError struct{ Type string }
 func (e *UnknownTypeError) Error() string { return fmt.Sprintf("unknown type %q", e.Type) }
 
 var timeType = reflect.TypeOf(time.Time{})
+
+// normalizeRaw applies normalize to data while walking structs, slices and
+// maps as raw JSON, so json.RawMessage fields keep their bytes as they came
+// (an elicitation schema's property order is its form's field order).
+func normalizeRaw(data json.RawMessage, t reflect.Type, field string) (json.RawMessage, error) {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t == rawType {
+		return data, nil
+	}
+	switch {
+	case t.Kind() == reflect.Struct && t != timeType:
+		var m map[string]json.RawMessage
+		if json.Unmarshal(data, &m) != nil || m == nil {
+			break
+		}
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			name := strings.Split(f.Tag.Get("json"), ",")[0]
+			if name == "" || name == "-" {
+				continue
+			}
+			if val, ok := m[name]; ok {
+				fixed, err := normalizeRaw(val, f.Type, name)
+				if err != nil {
+					return nil, err
+				}
+				m[name] = fixed
+			}
+		}
+		return json.Marshal(m)
+	case t.Kind() == reflect.Slice && t != reflect.TypeOf(EventList(nil)):
+		var arr []json.RawMessage
+		if json.Unmarshal(data, &arr) != nil || arr == nil {
+			break
+		}
+		for i := range arr {
+			fixed, err := normalizeRaw(arr[i], t.Elem(), field)
+			if err != nil {
+				return nil, err
+			}
+			arr[i] = fixed
+		}
+		return json.Marshal(arr)
+	case t.Kind() == reflect.Map:
+		var m map[string]json.RawMessage
+		if json.Unmarshal(data, &m) != nil || m == nil {
+			break
+		}
+		for k := range m {
+			fixed, err := normalizeRaw(m[k], t.Elem(), field)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = fixed
+		}
+		return json.Marshal(m)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var generic any
+	if err := dec.Decode(&generic); err != nil {
+		return nil, err
+	}
+	return json.Marshal(normalize(generic, t, field))
+}
 
 // normalize coerces loosely typed JSON into the shapes the Go structs
 // expect: whole-number floats ("12.0", 1e3) and numeric strings for
@@ -146,6 +210,9 @@ func normalize(v any, t reflect.Type, field string) any {
 		}
 		return m
 	case reflect.Slice:
+		if t == rawType {
+			return v // any JSON value, kept as it came
+		}
 		if t == reflect.TypeOf(EventList(nil)) {
 			return v // decoded element by element by EventList.UnmarshalJSON
 		}

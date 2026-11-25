@@ -46,7 +46,7 @@ func main() {
 	showReasoning := fs.Bool("show-reasoning", false, "print reasoning summaries into the transcript")
 	steer := fs.Bool("steer", false, "send input typed while a turn runs immediately instead of queueing it")
 	notify := fs.Bool("notify", true, "bell + OSC 777 notification when a turn ends while unfocused")
-	logPath := fs.String("log", "", "file for backend stderr (default: discard)")
+	logPath := fs.String("log", "", "file for the -- backend's stderr, or the mock's MCP server logs (default: discard)")
 	sessionsDir := fs.String("sessions", mock.DefaultDir(), "mock backend: directory with saved sessions")
 	resetDemo := fs.Bool("reset-demo", false, "mock backend: delete saved sessions and restore the demo history")
 	noReflow := fs.Bool("no-reflow", false, "don't clear and re-emit the transcript when the terminal width changes")
@@ -73,8 +73,6 @@ func main() {
 		usageErr(fs, "use either -last or -id, not both")
 	case len(backendArgv) > 0 && (*resetDemo || flagSet(fs, "sessions")):
 		usageErr(fs, "-reset-demo and -sessions apply to the built-in mock backend, not to a -- backend")
-	case len(backendArgv) == 0 && *logPath != "":
-		usageErr(fs, "-log captures a -- backend's stderr; the mock backend has none")
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -91,17 +89,17 @@ func main() {
 
 	var be protocol.Backend
 	var child *stdio.Backend
-	if rest := backendArgv; len(rest) > 0 {
-		var logw io.Writer = io.Discard
-		if *logPath != "" {
-			f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			defer f.Close()
-			logw = f
+	var logw io.Writer = io.Discard
+	if *logPath != "" {
+		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
+		defer f.Close()
+		logw = f
+	}
+	if rest := backendArgv; len(rest) > 0 {
 		b, err := stdio.Start(ctx, logw, rest[0], rest[1:]...)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "start backend:", err)
@@ -115,7 +113,8 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		b, err := mock.New(*sessionsDir)
+		// MCP servers: config.toml's [mcp_servers], or the demo ones.
+		b, err := mock.NewWithOptions(*sessionsDir, mock.Options{McpServers: cfg.McpServers, McpLog: logw})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

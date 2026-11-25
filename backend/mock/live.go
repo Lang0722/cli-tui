@@ -23,6 +23,7 @@ type live struct {
 	pending    []protocol.UserInput // input received while a turn was running
 	approvals  map[string]chan protocol.ReviewDecision
 	elicits    map[string]chan protocol.ResolveElicitation // by elicitKey (mcp.go)
+	mcpAllowed map[string]bool                             // "server/tool" allowed for this session
 	agents     map[string]*subagent                        // open helper threads (agents.go)
 	agentOrder []string
 	shells     map[string]bool // "!" commands still running
@@ -43,7 +44,7 @@ type live struct {
 }
 
 func newLive(f *sessionFile) *live {
-	return &live{f: f, approvals: map[string]chan protocol.ReviewDecision{}, elicits: map[string]chan protocol.ResolveElicitation{}, agents: map[string]*subagent{}, shells: map[string]bool{}}
+	return &live{f: f, approvals: map[string]chan protocol.ReviewDecision{}, elicits: map[string]chan protocol.ResolveElicitation{}, mcpAllowed: map[string]bool{}, agents: map[string]*subagent{}, shells: map[string]bool{}}
 }
 
 func (l *live) id() string { return l.f.Meta.ID }

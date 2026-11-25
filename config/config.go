@@ -12,11 +12,16 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"agenttui/backend/mcp"
 )
 
 // Config is the whole file.
 type Config struct {
 	TUI TUI `toml:"tui"`
+	// McpServers are the MCP servers ([mcp_servers.<name>], Codex's
+	// layout) for the built-in mock backend; see backend/mcp.ServerConfig.
+	McpServers map[string]mcp.ServerConfig `toml:"mcp_servers,omitempty"`
 }
 
 // TUI holds the UI settings.
@@ -93,6 +98,11 @@ func Load(path string) (Config, error) {
 	}
 	if und := md.Undecoded(); len(und) > 0 {
 		return c, fmt.Errorf("%s: unknown setting %q", path, und[0].String())
+	}
+	for name, s := range c.McpServers {
+		if err := s.Validate(); err != nil {
+			return c, fmt.Errorf("%s: [mcp_servers.%s]: %w", path, name, err)
+		}
 	}
 	return c, nil
 }

@@ -65,8 +65,12 @@ type answerWait struct {
 }
 
 // New creates a mock backend that keeps sessions in dir (DefaultDir() if
-// empty). The demo history is written there if it holds no sessions yet.
-func New(dir string) (*Backend, error) {
+// empty), with the demo MCP servers. The demo history is written there if
+// it holds no sessions yet.
+func New(dir string) (*Backend, error) { return NewWithOptions(dir, Options{}) }
+
+// NewWithOptions is New with MCP servers from config (see Options).
+func NewWithOptions(dir string, opts Options) (*Backend, error) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
@@ -82,7 +86,9 @@ func New(dir string) (*Backend, error) {
 		access:   1,
 		opWake:   make(chan struct{}, 1),
 		hooks:    demoHooks(),
-		mcp:      mcpState{servers: demoMcpServers(), allowed: map[string]bool{}},
+	}
+	if err := b.initMcp(opts); err != nil {
+		return nil, err
 	}
 	if b.store.empty() {
 		if err := seedDemo(&b.store, cwd); err != nil {
@@ -97,7 +103,7 @@ func New(dir string) (*Backend, error) {
 	// task is the one on screen (command center, /status).
 	b.attach(b.fresh(), false)
 	b.notice(protocol.SlashCommands{Commands: mockCommands})
-	b.startMcp("docs", "tracker")
+	b.startMcp(b.startableMcp()...)
 	return b, nil
 }
 
@@ -391,6 +397,7 @@ func (b *Backend) handle(op protocol.Op) {
 	case protocol.SlashCommand:
 		b.slash(op)
 	case protocol.Shutdown:
+		b.closeMcp()
 		b.notice(protocol.ShutdownComplete{})
 	}
 }
@@ -552,7 +559,7 @@ var accessModes = []struct{ name, desc, permissions, approval string }{
 // backend adds its own commands to the "/" popup.
 var mockCommands = []protocol.CommandInfo{
 	{Name: "standup", Description: "(mock) a command the backend advertised", AvailableDuringTask: true},
-	{Name: "reload-mcp", Description: "(mock) restart the MCP servers; postgres fails to start"},
+	{Name: "reload-mcp", Description: "(mock) restart the MCP servers (the demo enables postgres, which fails)"},
 }
 
 // ask sends a SelectionRequest and waits for the answer. l is the session

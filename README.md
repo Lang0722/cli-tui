@@ -9,9 +9,10 @@ a small event protocol.
 16k lines of Go (tests included). It covers Codex's backend-agnostic chat UI: transcript cells,
 streaming, composer, approvals, pickers, transcript pager, resume and
 backtrack, subagent threads, MCP (the `/mcp` inventory, startup status and
-elicitation forms), the configurable status line and window title,
+elicitation forms, plus a real MCP client in `backend/mcp` for your backend
+to use), the configurable status line and window title,
 and the remappable keymap. Much of the rest of Codex depends on Codex's own services (login,
-model catalog, MCP server configuration and OAuth, plugins, voice, cloud tasks, the agents dashboard),
+model catalog, MCP OAuth, plugins, voice, cloud tasks, the agents dashboard),
 and that part is out of scope. The [parity table](#parity-with-codex) at the
 end lists each area.
 
@@ -74,7 +75,8 @@ and you keep chatting. The built-in mock agent reacts to keywords:
 | `subagents` / `agents` | two helper agents: spawn, a worker's approval from its own thread, wait, close (watch them with Alt+←/→ or `/subagents`) |
 | `delegate` | a parent-owned `/root/reviewer` agent (activity rows, read-only view) |
 | `hooks` | lifecycle hooks around a command: a prompt hook that only adds context, a policy hook that blocks the command, and (once trusted in `/hooks`) a failing Stop hook |
-| `mcp` | the `docs` MCP server asks to run its `search` tool (allow once, for the session, always, or cancel), then `tracker` asks for an issue form (text, choice and yes/no fields) and files it |
+| `mcp` | real MCP servers: `docs` runs its read-only `search` tool, then `tracker.create_issue` asks for approval (allow once, for the session, always, or cancel) and, while it runs, the tracker server asks for an issue form (text, choice and yes/no fields) and files it |
+| `mcp call docs.search {"query":"ctx"}`, `mcp read docs://go/std` | call any MCP tool (JSON arguments) or read a resource |
 | `error` | an error event |
 | `!ls -la` | a real shell command you run ("You ran") |
 | `$` | the skill popup; pick one (e.g. `$repo-scout map the code`) and the agent reads its `SKILL.md` and follows it |
@@ -134,6 +136,8 @@ tui.Run(ctx, tui.Options{Backend: myLoop})
   It keeps no history, so it answers `list_sessions` with an empty list and
   `resume_session` with an `error`.
 - `backend/mock` shows realistic event ordering, session storage, rewind and pickers.
+- `backend/mcp` is a complete MCP client (and server) your backend can use
+  as is or read as a reference; see [MCP servers](#mcp-servers).
 
 ```
 stdin  ← {"type":"user_input","text":"fix the tests","images":["/tmp/a.png"]}
@@ -337,6 +341,82 @@ as Codex does.
 Two deliberate differences from current Codex: the startup row shows even
 when no turn is running, and startup warnings are transcript cells (Codex
 now collects them in its warnings view).
+
+### The MCP client (`backend/mcp`)
+
+The servers themselves are the backend's job. `backend/mcp` is a real
+implementation of the MCP spec (2025-06-18; it also accepts 2025-03-26 and
+2024-11-05) in the standard library only, for your backend to use or to
+port. The mock backend runs on it.
+
+```go
+cfg := mcp.ServerConfig{Command: "npx", Args: []string{"-y", "@modelcontextprotocol/server-everything"}}
+t, err := cfg.Open(logFile)                // stdio subprocess, or streamable HTTP with url
+start, cancel := context.WithTimeout(ctx, cfg.StartupTimeout())
+c, err := mcp.Connect(start, t, mcp.ClientOptions{
+	Info:   mcp.Implementation{Name: "my-agent", Version: "1.0"},
+	Elicit: askTheUser,                     // func(ctx, mcp.ElicitRequest) (mcp.ElicitResult, error)
+})
+cancel()
+tools, err := c.ListTools(ctx)             // paginated; also ListResources, ListResourceTemplates, ReadResource
+res, err := c.CallTool(ctx, "echo", json.RawMessage(`{"message":"hi"}`))
+defer c.Close()
+```
+
+- **Protocol:** JSON-RPC 2.0 with the `initialize` handshake and version
+  negotiation, `ping` both ways, cursor pagination, `tools/call` results
+  (`content` blocks, `isError`, `structuredContent`), resources and
+  templates, `notifications/tools/list_changed` (`OnNotification`) and
+  server logging (`Logf`). Cancelling a call's context sends
+  `notifications/cancelled`.
+- **Transports:** `StartStdio` (newline-delimited JSON, the server in its own
+  process group; Close closes stdin, then SIGTERM, then SIGKILL; a server
+  that dies reports `server exited with exit status 1: <its last stderr
+  line>`), `NewHTTPTransport` (streamable HTTP: POST with JSON or SSE
+  replies, `Mcp-Session-Id`, `MCP-Protocol-Version`, the GET stream for
+  server-initiated messages, DELETE on Close; 401/403 is an `*AuthError`,
+  an expired session `ErrSessionExpired`), `InProcess` and
+  `NewStreamTransport`.
+- **Elicitation:** a server's `elicitation/create` calls `Elicit` with the
+  context of the tool call that caused it, so put your turn (or session) on
+  the context you pass to `CallTool` and route the question to it. The
+  mock does that and turns the request into an `elicitation_request` for
+  the UI.
+- **Config:** `ServerConfig` reads Codex's `[mcp_servers.<name>]` keys:
+  `command`, `args`, `env`, `env_vars`, `cwd`, `url`,
+  `bearer_token_env_var`, `http_headers`, `env_http_headers`, `enabled`,
+  `startup_timeout_sec` (10), `tool_timeout_sec` (60), `enabled_tools`,
+  `disabled_tools`. Stdio servers get only `HOME`, `PATH`, `USER`, `LANG`
+  and a few more from your environment, plus `env_vars` and `env`.
+- **Server:** `mcp.NewServer` with `AddTool`, `AddResource`, `Elicit` from a
+  tool handler, `ServeStream` (stdio) and `HTTPHandler` (streamable HTTP),
+  used by the tests and the mock's demo servers.
+
+### The mock's servers
+
+With no `[mcp_servers]` in config.toml the mock starts its demo servers,
+all real ones: `docs` and `tracker` (in-process), `github` (streamable HTTP
+on 127.0.0.1, which answers 401 until `/mcp login github`) and `postgres`
+(a subprocess that fails; `/reload-mcp` enables it). With `[mcp_servers]` it
+starts those instead (`-log FILE` collects their stderr):
+
+```toml
+[mcp_servers.notes]
+command = "python3"
+args = ["/path/to/examples/mcp_server.py"]   # a stdio server in ~140 lines
+tool_timeout_sec = 30
+
+[mcp_servers.remote]
+url = "https://example.com/mcp"
+bearer_token_env_var = "REMOTE_MCP_TOKEN"
+```
+
+Then `/mcp`, `mcp call notes.add {"a": 2, "b": 3}` or `mcp call notes.greet`
+(which asks for your name). The mock asks before running any tool not
+annotated `readOnlyHint: true`; "Always allow" is kept in
+`mcp-approvals.json` in the sessions directory. Startup errors use Codex's
+wording: ``MCP client for `x` timed out after 10 seconds. Add or adjust
+`startup_timeout_sec` …``, ``The `x` MCP server is not logged in.``
 
 ## Directories, forks and hooks
 
@@ -638,8 +718,8 @@ snapshots.
 **Not ported**
 
 - **Codex-specific:** login and onboarding, model catalog and rate-limit
-  cards, MCP server configuration and the OAuth flow (the backend's: `/mcp
-  login` is forwarded), plugins and apps, voice
+  cards, the MCP OAuth flow (the backend's: `/mcp login` is forwarded; the
+  mock fakes it for its demo server), plugins and apps, voice
   and realtime, side conversations, worktrees,
   goals, pets, Daybreak, update prompts. Generic equivalents are the
   backend-driven `selection_request` and slash-command forwarding.
@@ -692,8 +772,9 @@ go test ./...
     an approval that waits in the background, and `x` stop;
   - skills: the `$` popup, mentions and Enable/Disable Skills;
   - MCP: `/mcp` and `/mcp verbose`, `/mcp login`, a tool approval for the
-    session, the issue form with its validation, Esc cancel, and messages
-    held during `/reload-mcp`;
+    session, the issue form with its validation, Esc cancel, messages
+    held during `/reload-mcp`, and `examples/mcp_server.py` configured in
+    config.toml;
   - layout: the composer stays on the last row after turns, approvals,
     `/resume` inside a session and closing `/keymap`;
   - the stdio backend (`examples/echo_agent.py`).
@@ -707,10 +788,11 @@ go test ./...
 protocol/        backend contract + JSONL codec (protocol.go, sessions.go, interaction.go, skills.go, lineage.go, hooks.go, tasks.go, mcp.go, wire.go)
 config/          settings file (TOML)
 backend/mock     scripted demo agent: sessions, demo history, pickers, rewind, skills, /cd, /fork, hooks, tasks, MCP servers, real "!" commands
+backend/mcp      MCP client and server: JSON-RPC, stdio and streamable HTTP, elicitation, [mcp_servers] config
 backend/stdio    subprocess adapter (any language)
 tui/             the UI (app, cells, exec, diff, markdown, highlight, composer, popups,
                  approval, interaction, pager, printer, resume, surfaces, keymap, agents, skills, lineage, hooks, center, mcp)
 cmd/agenttui     entry point
 e2e/             end-to-end tests: the real binary in tmux, driven by keystrokes
-examples/        echo_agent.py reference backend
+examples/        echo_agent.py reference backend, mcp_server.py stdio MCP server
 ```
